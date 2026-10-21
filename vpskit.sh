@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # VPSKIT_SINGLE_FILE - MIT License - Copyright (c) 2026 VPSKit contributors
-# VPSKit 1.5.0 | Debian 12+, Ubuntu 18.04+, systemd, amd64/arm64, Bash 4.4+.
+# VPSKit 1.6.0 | Debian 12+, Ubuntu 18.04+, systemd, amd64/arm64, Bash 4.4+.
 # 单文件交付；运行配置/上游程序/证书在 /opt/vpskit；不创建系统账户。
 # 使用: sudo bash vpskit.sh ; 安装后: sudo vpskit
 # 上传为 biao169/V2ray_deploy/main/vpskit.sh 后:
 # bash <(curl -fsSL https://raw.githubusercontent.com/biao169/V2ray_deploy/main/vpskit.sh)
 # Root安装及服务运行。现有外部程序不接管、不卸载；防火墙仅按用户菜单选择修改。
-# 支持: VLESS REALITY/Vision、VMess/VLESS/Trojan WS+TLS或TCP+TLS、Shadowsocks AEAD/2022。
+# 支持: VLESS XHTTP H2/Cloudflare H3、VLESS REALITY/Vision、VMess/VLESS/Trojan WS+TLS或TCP+TLS、Shadowsocks AEAD/2022。
 # 不声称支持Xray所有实验协议、传输或客户端。配置修改可能重启Xray并中断连接。
 # 完整卸载删除本工具资料；系统共享依赖仅在检查无其他依赖后可选移除。
 # 真实域名ACME、防火墙实际规则、云安全组及网络吞吐必须在目标VPS验收。
@@ -17,7 +17,7 @@ set -Eeuo pipefail
 umask 077
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export LC_ALL=C
-VERSION='1.5.0'
+VERSION='1.6.0'
 XRAY_TESTED_VERSION='v26.3.27'
 ROOT='/opt/vpskit'
 ENTRY='/usr/local/bin/vpskit'
@@ -238,7 +238,7 @@ plan_needs_site() { [[ $(get .scheme) == B || $(get '.wizard.website != false') 
 plan_nodes() {
     jq -r --arg enabled "${1:-all}" '. as $s | .nodes[] | select(($enabled!="enabled" or .enabled) and
       (if $s.scheme=="A" then (.protocol=="vless" and .mode=="reality" and .host==$s.host)
-       else (.mode=="ws" and .domain==($s.wizard.domain // $s.preferences.domain // "")) end)) | .id' "$STATE"
+       else ((.mode=="ws" or .mode=="xhttp") and .domain==($s.wizard.domain // $s.preferences.domain // "")) end)) | .id' "$STATE"
 }
 certificate_good() {
     local d=$1
@@ -806,15 +806,23 @@ validate_state() {
         credential=$(jq -r .credential <<< "$n")
         valid_host "$(jq -r .host <<< "$n")" || die '节点连接地址不合法。'
         if ! valid_name "$id" || ! valid_port "$p"; then die '节点名称或端口无效。'; fi
-        case "$proto:$mode" in vless:reality|vless:ws|vless:tls|vmess:ws|vmess:ws-plain|vmess:tls|trojan:ws|trojan:tls|shadowsocks:ss) ;; *) die "不支持的协议组合: $proto/$mode";; esac
+        case "$proto:$mode" in vless:reality|vless:xhttp|vless:ws|vless:tls|vmess:ws|vmess:ws-plain|vmess:tls|trojan:ws|trojan:tls|shadowsocks:ss) ;; *) die "不支持的协议组合: $proto/$mode";; esac
         if [[ $proto == vless || $proto == vmess ]]; then valid_uuid "$credential" || die 'UUID不合法。'; fi
-        if [[ $mode == ws || $mode == tls ]]; then
+        if [[ $mode == ws || $mode == xhttp || $mode == tls ]]; then
             d=$(jq -r .domain <<< "$n"); valid_domain "$d" || die '节点域名不合法。'
             jq -e --arg d "$d" '.sites[]|select(.domain==$d and .issued)' "$STATE" >/dev/null || die "节点引用了无有效证书的网站: $d"
         fi
-        if [[ $mode == ws || $mode == ws-plain ]]; then valid_ws_path "$(jq -r .path <<< "$n")" || die 'WebSocket路径非法。'; fi
+        if [[ $mode == ws || $mode == xhttp || $mode == ws-plain ]]; then valid_ws_path "$(jq -r .path <<< "$n")" || die '代理路径非法。'; fi
+        if [[ $mode == xhttp ]]; then
+            valid_choice "$(jq -r '.http_version // "h2"' <<< "$n")" 'h2 h3' || die 'XHTTP HTTP版本无效。'
+            if [[ $(jq -r '.http_version // "h2"' <<< "$n") == h3 ]]; then
+                jq -e --arg d "$d" '.sites[]|select(.domain==$d and .access=="cloudflare")' "$STATE" >/dev/null || die 'H3节点需要Cloudflare网站；请先把节点改为H2。'
+                [[ $(jq -r .host <<< "$n") == "$d" ]] || die 'H3经Cloudflare必须使用本站域名连接，不支持源站IP直连。'
+            fi
+        fi
     done < <(jq -c '.nodes[]' "$STATE")
     jq -e '[.nodes|group_by(.entry)[] | (map(del(.id,.credential,.enabled))|unique|length)==1] | all' "$STATE" >/dev/null || die '共享入口参数不一致。'
+    jq -e '[.nodes[]|select(.mode=="ws" or .mode=="xhttp")]|group_by([.domain,.path])|map(map(.entry)|unique|length==1)|all' "$STATE" >/dev/null || die '网站代理路径被不同入口重复使用。'
     jq -e '[.nodes|group_by(.entry)[]|.[0].port] | length==(unique|length)' "$STATE" >/dev/null || die '不同入口的端口重复。'
 }
 render_xray() {
@@ -823,16 +831,17 @@ render_xray() {
       {log:{access:"none",error:($root+"/logs/xray.log"),loglevel:"warning"},
        inbounds: ([.nodes[]|select(.enabled)] | group_by(.entry) | map(
          . as $g | .[0] as $n |
-         {tag:$n.entry,listen:(if $n.mode=="ws" then "127.0.0.1" else $n.listen end),port:$n.port,protocol:$n.protocol,
+         {tag:$n.entry,listen:(if ($n.mode=="ws" or $n.mode=="xhttp") then "127.0.0.1" else $n.listen end),port:$n.port,protocol:$n.protocol,
           settings:(if $n.protocol=="vless" then {decryption:"none",clients:($g|map({id:.credential,email:.id,flow:(if .mode=="reality" then "xtls-rprx-vision" else "" end)}))}
             elif $n.protocol=="vmess" then {clients:($g|map({id:.credential,email:.id})),disableInsecureEncryption:true}
             elif $n.protocol=="trojan" then {clients:($g|map({password:.credential,email:.id}))}
             else {method:$n.method,password:$n.credential,network:"tcp,udp"} end)} +
           (if $n.mode=="ss" then {} else
-            {streamSettings:({network:(if ($n.mode=="ws" or $n.mode=="ws-plain") then "ws" else "tcp" end),
-             security:(if ($n.mode=="ws" or $n.mode=="ws-plain") then "none" elif $n.mode=="reality" then "reality" else "tls" end)} +
+            {streamSettings:({network:(if ($n.mode=="ws" or $n.mode=="ws-plain") then "ws" elif $n.mode=="xhttp" then "xhttp" else "tcp" end),
+             security:(if ($n.mode=="ws" or $n.mode=="xhttp" or $n.mode=="ws-plain") then "none" elif $n.mode=="reality" then "reality" else "tls" end)} +
              (if $n.mode=="reality" then {realitySettings:{show:false,target:$n.target,xver:0,serverNames:[$n.sni],privateKey:$n.privateKey,shortIds:[$n.shortId]}}
               elif $n.mode=="tls" then {tlsSettings:{minVersion:"1.2",certificates:[{certificateFile:($root+"/certs/"+$n.domain+"/current/fullchain.pem"),keyFile:($root+"/certs/"+$n.domain+"/current/key.pem")}]}}
+              elif $n.mode=="xhttp" then {xhttpSettings:{path:($n.path+"/"),mode:"packet-up"}}
               else {wsSettings:{path:$n.path}} end))} end))),
        outbounds:[{tag:"direct",protocol:"freedom"},{tag:"blocked",protocol:"blackhole"}],
        routing:{domainStrategy:"IPIfNonMatch",rules:[
@@ -969,8 +978,14 @@ edge_robots_content() {
 }
 
 render_nginx() {
-    local dest=$1 site domain issued upstream kind template redirect n path port ipv6='' protocols gzip settings ttl bots robots
+    local dest=$1 site domain issued upstream kind template redirect n path port ipv6='' protocols gzip settings ttl bots robots h2=false h2modern=false nginx_version
     protocols=$(nginx_tls_protocols)
+    if jq -e '.nodes[]|select(.enabled and .mode=="xhttp")' "$STATE" >/dev/null; then
+        xhttp_require_nginx
+        h2=true
+        nginx_version=$("$NGINX" -v 2>&1 | sed -n 's@.*nginx/\([0-9.]*\).*@\1@p')
+        if dpkg --compare-versions "${nginx_version:-0}" ge 1.25.1; then h2modern=true; fi
+    fi
     [[ ! -f /proc/sys/net/ipv6/conf/all/disable_ipv6 || $(cat /proc/sys/net/ipv6/conf/all/disable_ipv6) != 0 ]] || ipv6=yes
     mkdir -p "$ROOT/run/nginx"/{client,proxy,fastcgi,uwsgi,scgi}
     {
@@ -989,7 +1004,7 @@ http {
     tcp_nodelay on;
     tcp_nopush on;
     keepalive_timeout 30;
-    keepalive_requests 256;
+    keepalive_requests 1000;
     client_header_timeout 15s;
     client_body_timeout 15s;
     send_timeout 30s;
@@ -1027,8 +1042,14 @@ EOF_NGINX
                 edge_origin_guard "$settings"
                 [[ $bots == off ]] || printf '            if ($vpskit_bot_%s) { return 403; }\n' "$bots"
                 printf '            return 301 https://%s$request_uri;\n        }\n    }\n' "$domain"
-                printf '    server {\n        listen 443 ssl;\n'
-                [[ -z $ipv6 ]] || printf '        listen [::]:443 ssl;\n'
+                if [[ $h2 == true && $h2modern == false ]]; then
+                    printf '    server {\n        listen 443 ssl http2;\n'
+                    [[ -z $ipv6 ]] || printf '        listen [::]:443 ssl http2;\n'
+                else
+                    printf '    server {\n        listen 443 ssl;\n'
+                    [[ -z $ipv6 ]] || printf '        listen [::]:443 ssl;\n'
+                    [[ $h2 != true ]] || printf '        http2 on;\n'
+                fi
                 printf '        server_name %s;\n        ssl_certificate %s/certs/%s/current/fullchain.pem;\n        ssl_certificate_key %s/certs/%s/current/key.pem;\n' "$domain" "$ROOT" "$domain" "$ROOT" "$domain"
                 edge_server_config "$site" true
                 printf '        location ^~ /.well-known/acme-challenge/ { root %s/www/acme; default_type text/plain; }\n' "$ROOT"
@@ -1037,6 +1058,29 @@ EOF_NGINX
             if [[ $kind == template ]]; then printf '        index vpskit-%s.html index.html;\n' "$template"; else printf '        index index.html;\n'; fi
             printf '        location ~ /\\. { deny all; }\n'
             if [[ $issued == true ]]; then
+                while IFS= read -r n; do
+                    path=$(jq -r .path <<< "$n"); port=$(jq -r .port <<< "$n")
+                    printf '        location ^~ %s/ {\n' "$path"
+                    edge_origin_guard "$settings"
+                    cat <<EOF_XHTTP
+            proxy_pass http://127.0.0.1:$port;
+            proxy_http_version 1.1;
+            proxy_set_header Host \$host;
+            proxy_set_header Connection "";
+            proxy_set_header Upgrade "";
+            proxy_set_header X-Forwarded-For \$remote_addr;
+            proxy_buffering off;
+            proxy_request_buffering off;
+            proxy_cache off;
+            proxy_max_temp_file_size 0;
+            client_max_body_size 2m;
+            gzip off;
+            add_header Cache-Control "no-store" always;
+            proxy_read_timeout 3600s;
+            proxy_send_timeout 3600s;
+        }
+EOF_XHTTP
+                done < <(jq -c --arg d "$domain" '[.nodes[]|select(.enabled and .mode=="xhttp" and .domain==$d)]|unique_by(.entry)[]' "$STATE")
                 while IFS= read -r n; do
                     path=$(jq -r .path <<< "$n"); port=$(jq -r .port <<< "$n")
                     printf '        location = %s {\n' "$path"
@@ -1168,7 +1212,7 @@ edge_profile() {
     local domain site cf=false
     ensure_component nginx; edge_site domain; site=$(edge_get_site "$domain")
     info '均衡预设：拦截声明身份的AI爬虫；网站5请求/秒、突发30、每IP20并发；静态资源缓存1小时、轻量gzip。'
-    info '仅网站应用上述限制；WS、ACME不套用。已有robots.txt保留。不会自动启用回源限制或AOP。'
+    info '仅网站应用上述限制；WS/XHTTP、ACME不套用。已有robots.txt保留。不会自动启用回源限制或AOP。'
     confirm "应用到 $domain" || return 0
     if [[ $(jq -r '.access // "direct"' <<< "$site") == cloudflare ]] && ! edge_cf_ready; then edge_fetch_assets; cf=true; fi
     begin_tx
@@ -1180,7 +1224,7 @@ edge_profile() {
 edge_bots() {
     local domain site policy
     ensure_component nginx; edge_site domain; site=$(edge_get_site "$domain")
-    panel_title '网站爬虫策略（WS与ACME不应用）'
+    panel_title '网站爬虫策略（WS/XHTTP与ACME不应用）'
     menu_item 1 '仅AI爬虫 ai' '拒绝匹配已知AI User-Agent；普通搜索爬虫保留'
     menu_item 2 'AI + 常见采集器 common' '增加Ahrefs、Semrush等采集器；通常不拦Googlebot/Bingbot'
     menu_item 3 '广泛拒绝声明爬虫 all' '包括搜索爬虫、curl/wget等；影响SEO和网站API/监控，请慎选'
@@ -1196,7 +1240,7 @@ edge_bots() {
 edge_limits() {
     local domain site settings rate burst connections kbps cf=false
     ensure_component nginx; edge_site domain; site=$(edge_get_site "$domain"); settings=$(edge_settings "$site")
-    info '按访客IP限制普通网站请求；同一NAT出口会共享额度。WS、证书验证不受这些限额约束。'
+    info '按访客IP限制普通网站请求；同一NAT出口会共享额度。WS/XHTTP、证书验证不受这些限额约束。'
     ask_valid rate '每IP每秒请求数，0关闭，最高100' "$(jq -r .rate <<< "$settings")" valid_edge_number '请输入0～100的整数。' 0 100
     ask_valid burst '允许突发请求数' "$(jq -r .burst <<< "$settings")" valid_edge_number '请输入1～200的整数。' 1 200
     ask_valid connections '每IP网站并发请求数，0关闭' "$(jq -r .connections <<< "$settings")" valid_edge_number '请输入0～200的整数。' 0 200
@@ -1222,12 +1266,12 @@ edge_cache() {
 edge_origin() {
     local domain site choice cf=false
     ensure_component nginx; edge_site domain; site=$(edge_get_site "$domain")
-    ask_valid choice '仅允许Cloudflare网段访问此网站和WS？yes/no' "$(jq -r 'if .protection.origin==true then "yes" else "no" end' <<< "$site")" valid_choice '请输入yes或no。' 'yes no'
+    ask_valid choice '仅允许Cloudflare网段访问此网站和WS/XHTTP？yes/no' "$(jq -r 'if .protection.origin==true then "yes" else "no" end' <<< "$site")" valid_choice '请输入yes或no。' 'yes no'
     if [[ $choice == yes ]]; then
         [[ $(jq -r '.access // "direct"' <<< "$site") == cloudflare ]] || die '请先在网站设置中选择Cloudflare访问方式并完成控制台橙云配置。'
-        warn '启用后源站IP直连网站/WS会被拒绝；该限制在Nginx层，不替代云防火墙，也不影响SSH。HTTP证书验证路径保持可用。'
+        warn '启用后源站IP直连网站/WS/XHTTP会被拒绝；该限制在Nginx层，不替代云防火墙，也不影响SSH。HTTP证书验证路径保持可用。'
         warn 'Cloudflare网段和公共AOP都不能证明请求属于你的账户；其他直连代理端口仍可能暴露源站。'
-        confirm '已确认网站与WS能通过Cloudflare正常访问，现在启用限制' || return 0
+        confirm '已确认网站与WS/XHTTP能通过Cloudflare正常访问，现在启用限制' || return 0
         if ! edge_cf_ready; then edge_fetch_assets; cf=true; fi
     fi
     begin_tx
@@ -1280,7 +1324,7 @@ edge_reset() {
 edge_status() {
     panel_title '方案B · 网站防护与流量'
     jq -r '.sites[] | (.protection // {}) as $p | "\(.domain) [\(.access // "direct")]\n  爬虫=\($p.bots // "off")；网站请求=\($p.rate // 0)r/s；突发=\($p.burst // 30)；并发=\($p.connections // 0)；每响应=\($p.kbps // 0)KiB/s\n  静态缓存=\($p.static_ttl // 0)s；站点gzip=\($p.gzip // false)；仅CF回源=\($p.origin // false)；AOP=\($p.aop // "off")"' "$STATE"
-    printf '  全局静态gzip=%s；网站限额0表示关闭；WS/ACME不套用网站限额。\n' "$(get '.performance.gzip // false')"
+    printf '  全局静态gzip=%s；网站限额0表示关闭；WS/XHTTP/ACME不套用网站限额。\n' "$(get '.performance.gzip // false')"
     if [[ -f $ROOT/config/edge/updated.epoch ]]; then
         local stamp; read -r stamp < "$ROOT/config/edge/updated.epoch"
         if [[ $stamp =~ ^[0-9]{1,12}$ ]]; then printf '  CF资料更新于：%s；已有小时维护任务每7天尝试刷新，失败保留旧版。\n' "$(date -d "@$stamp" '+%F %T')"; fi
@@ -1296,7 +1340,7 @@ edge_traffic() {
     printf '计数来自网卡，可能包含虚拟接口重复流量；不是月度账单，不代表线路最大带宽。\n'
 }
 edge_guide() {
-    local domain paths probe
+    local domain paths probe xp
     edge_site domain
     paths=$(jq -r --arg d "$domain" '[.nodes[]|select(.domain==$d and .mode=="ws" and .enabled)|.path]|unique|map("\""+.+"\"")|join(" ")' "$STATE")
     probe=$(get '.edge.probe // ""')
@@ -1310,15 +1354,18 @@ edge_guide() {
 GUIDE
     printf '  (http.host eq "%s" and not starts_with(http.request.uri.path, "/.well-known/acme-challenge/")' "$domain"
     [[ -z $paths ]] || printf ' and not http.request.uri.path in {%s}' "$paths"
+    while IFS= read -r xp; do
+        printf ' and not starts_with(http.request.uri.path, "%s/")' "$xp"
+    done < <(jq -r --arg d "$domain" '[.nodes[]|select(.enabled and .mode=="xhttp" and .domain==$d)|.path]|unique[]' "$STATE")
     printf ')\n'
     cat <<'GUIDE'
-4. 普通访问应看到网站；为WS路径单独设置缓存Bypass，并避免JS挑战/CAPTCHA。
+4. 普通访问应看到网站；为WS精确路径及XHTTP路径前缀（包含末尾/）设置缓存Bypass，并避免JS挑战/CAPTCHA。
    若套餐支持，跳过仅会误伤代理的限流/机器人规则；不要给任意Upgrade头全站放行。
    免费Bot Fight Mode不能通过普通Skip规则豁免，不建议在共用代理域名上盲目启用。
 5. 静态CSS/JS/图片/字体尊重源站缓存头；不要对登录页、API或整个域名使用Cache Everything。
 6. 先检查网站与客户端，再启用本机“仅CF回源”；AOP先observe，在控制台开启Global AOP，验证后enforce。
 7. 网段限制和公共AOP只识别Cloudflare网络，不绑定你的账户。DNS历史、其他直连服务仍可能泄露源站。
-控制台规则不会由本脚本自动发布；DNS签发Token不被挪作WAF管理凭据。修改/停用WS节点后请同步更新边缘路径规则。
+控制台规则不会由本脚本自动发布；DNS签发Token不被挪作WAF管理凭据。修改/停用WS或XHTTP节点后请同步更新边缘路径规则。
 GUIDE
 }
 edge_menu() {
@@ -1329,7 +1376,7 @@ edge_menu() {
         menu_item 2 '爬虫策略' '关闭 / AI / AI+采集器 / 广泛爬虫；强策略会影响SEO'
         menu_item 3 '网站请求、并发与下载限额' '按访客IP调整；WS和ACME不使用网站限额'
         menu_item 4 '静态缓存与压缩' '减少重复回源；不强制缓存HTML、动态页面或代理流量'
-        menu_item 5 '限制Cloudflare回源' '仅所选网站/WS；Nginx层限制，源站IP直连将失败'
+        menu_item 5 '限制Cloudflare回源' '仅所选网站/WS/XHTTP；Nginx层限制，源站IP直连将失败'
         menu_item 6 'AOP回源认证' '关闭 / 观察 / 强制；先配置Cloudflare，再验证后强制'
         menu_item 7 '验证AOP实际回源' '通过公网HTTPS确认本次回源证书验证为SUCCESS'
         menu_item 8 '刷新Cloudflare网段与CA' '只下载官方资料；校验后重载，失败保留旧配置'
@@ -1350,8 +1397,9 @@ apply_config() {
     local xc="$ROOT/config/xray.next.json" nc="$ROOT/config/nginx.next.conf" count
     if [[ $(get .components.xray) == true ]]; then
         render_xray "$xc"
-        info '验证Xray配置（验证错误可能包含本机配置路径）。'
+        info '验证Xray配置；Warning弃用提示不等于失败，以测试退出码为准。'
         "$XRAY" run -test -config "$xc"
+        ok 'Xray配置验证通过；旧节点的弃用提示可通过节点菜单迁移处理。'
     fi
     if [[ $(get .components.nginx) == true ]]; then
         render_nginx "$nc"
@@ -1403,13 +1451,56 @@ site_select() {
     remember_domain "$_domain"
     printf -v "$dest" '%s' "$_domain"
 }
+# Read-only preflight: never print tokens, headers, or full API response bodies.
+cf_zone_preflight() {
+    local cf_domain=$1 cf_token=$2 cf_account=$3 cf_candidate cf_header cf_reply cf_codes
+    cf_header=$(mktemp "$WORK/cf-header.XXXXXXXX")
+    cf_reply=$(mktemp "$WORK/cf-reply.XXXXXXXX")
+    chmod 600 "$cf_header" "$cf_reply"
+    printf 'header = "Authorization: Bearer %s"\n' "$cf_token" > "$cf_header"
+    cf_candidate=$cf_domain
+    while [[ $cf_candidate == *.* ]]; do
+        if ! curl --silent --show-error --proto '=https' --connect-timeout 10 --max-time 30 \
+            --max-filesize 1048576 --config "$cf_header" --output "$cf_reply" \
+            "https://api.cloudflare.com/client/v4/zones?name=$cf_candidate&account.id=$cf_account"; then
+            rm -f "$cf_header" "$cf_reply"
+            warn '无法连接Cloudflare API：检查VPS出站HTTPS、DNS和网络。'; return 1
+        fi
+        if ! jq -e '.success==true and (.result|type=="array")' "$cf_reply" >/dev/null 2>&1; then
+            cf_codes=$(jq -r '[.errors[]?.code|tostring]|join(",")' "$cf_reply" 2>/dev/null || true)
+            [[ $cf_codes =~ ^[0-9,]{1,100}$ ]] || cf_codes=unknown
+            rm -f "$cf_header" "$cf_reply"
+            warn "Cloudflare区域查询被拒绝（错误码 $cf_codes）。检查Token有效期、Zone Read权限、授权域名和出口IP限制。"; return 1
+        fi
+        if jq -e --arg d "$cf_candidate" '.result[]|select(.name==$d and (.id|test("^[a-fA-F0-9]{32}$")))' "$cf_reply" >/dev/null; then
+            CF_Zone_ID=$(jq -r --arg d "$cf_candidate" '.result[]|select(.name==$d)|.id' "$cf_reply" | head -1)
+            export CF_Zone_ID
+            rm -f "$cf_header" "$cf_reply"
+            ok "Cloudflare可读取区域：$cf_candidate。预检不写DNS；DNS Edit权限将在ACME实际添加记录时验证。"
+            return 0
+        fi
+        cf_candidate=${cf_candidate#*.}
+    done
+    rm -f "$cf_header" "$cf_reply"
+    warn '当前Token与Account ID查不到该域名区域。资源应授权根域名（例如moglider.com），不是普通子域名；Account ID与Zone ID不能互换。'
+    return 1
+}
+
 dns_credentials() {
-    local provider=$1 token='' account='' sid='' skey=''
+    local provider=$1 domain=${2:-} token='' account='' sid='' skey=''
     # Credential values are exported only for the ACME process; acme stores them in its private account config.
     case "$provider" in
         dns_cf)
-            required_secret token 'Cloudflare限定区域DNS编辑Token'
-            required_secret account 'Cloudflare Account ID'
+            info '创建Token：Zone / DNS / Edit + Zone / Zone / Read；资源限定为证书域名所属区域。'
+            info '入口：https://dash.cloudflare.com/profile/api-tokens；Account ID取自该网站概览，不是Zone ID。'
+            while :; do
+                required_secret token 'Cloudflare限定区域DNS编辑Token'
+                if [[ ! $token =~ ^[A-Za-z0-9_-]{20,512}$ ]]; then warn 'Token格式异常；只粘贴令牌本身，不要粘贴引号或curl命令。'; continue; fi
+                required_secret account 'Cloudflare Account ID（32位十六进制，非Zone ID）'
+                if [[ ! $account =~ ^[a-fA-F0-9]{32}$ ]]; then warn 'Account ID应为32位十六进制，请重新输入。'; continue; fi
+                if [[ -z $domain ]] || cf_zone_preflight "$domain" "$token" "$account"; then break; fi
+                warn '请修正Cloudflare设置后重新输入；输入:q取消。本次尚未向CA提交签发请求。'
+            done
             export CF_Token="$token" CF_Account_ID="$account";;
         dns_dp)
             required_secret sid 'DNSPod API ID'; required_secret skey 'DNSPod API Key'
@@ -1446,21 +1537,25 @@ cert_issue() {
         info "HTTP-01要求 $domain 的公开HTTP验证路径能够到达本机80；可以经CDN转发，不比对A/AAAA是否为VPS地址。"
     else
         provider=$challenge
-        dns_credentials "$provider"
+        dns_credentials "$provider" "$domain"
         args+=(--dns "$provider")
     fi
     # Do not tee ACME's output to management logs (provider errors might contain sensitive context).
     local issue_rc=0
     acme_run "${args[@]}" || issue_rc=$?
     if ((issue_rc != 0 && issue_rc != 2)); then
-        unset CF_Token CF_Account_ID DP_Id DP_Key
-        die '签发失败，现有证书保留；核对DNS、80端口或DNS API权限。'
+        unset CF_Token CF_Account_ID CF_Zone_ID DP_Id DP_Key
+        if [[ $challenge == http ]]; then
+            die 'HTTP-01签发失败，现有证书保留；检查公网80及/.well-known/acme-challenge/回源路径。'
+        else
+            die 'DNS-01签发失败，现有证书保留；检查DNS编辑权限、权威DNS及TXT传播，不需要开放80端口或关闭橙云。'
+        fi
     fi
     if ((issue_rc == 2)) && [[ $(jq -r '.cert_settings_pending // false' <<< "$site") == true ]]; then
-        unset CF_Token CF_Account_ID DP_Id DP_Key
+        unset CF_Token CF_Account_ID CF_Zone_ID DP_Id DP_Key
         die 'ACME跳过签发，新验证参数尚未生效；原证书保留，请稍后重试。'
     fi
-    unset CF_Token CF_Account_ID DP_Id DP_Key
+    unset CF_Token CF_Account_ID CF_Zone_ID DP_Id DP_Key
     mkdir -p "$ROOT/certs/$domain/pending"
     acme_run --install-cert -d "$domain" --ecc --key-file "$ROOT/certs/$domain/pending/key.pem" \
         --fullchain-file "$ROOT/certs/$domain/pending/fullchain.pem" --reloadcmd /bin/true
@@ -1522,8 +1617,8 @@ site_access_prompt() {
     current=$(jq -r --arg d "$d" '[.sites[]|select(.domain==$d)][0].access // empty' "$STATE")
     [[ -n $current ]] || current=$(get '.preferences.site_access // (if .scheme=="B" then "cloudflare" else "direct" end)')
     old=$current
-    panel_title '网站 / WS连接方式'
-    menu_item 1 'Cloudflare代理（橙云）' '适用于网站和WS+TLS；公开DNS可以返回Cloudflare IP'
+    panel_title '网站 / WS/XHTTP连接方式'
+    menu_item 1 'Cloudflare代理（橙云）' '适用于网站和WS/XHTTP+TLS；公开DNS可以返回Cloudflare IP'
     menu_item 2 '直连 / 其他反向代理' '不强制DNS解析结果等于VPS；由你保证连接及回源正确'
     ask_valid answer '连接方式：编号或 cloudflare / direct' "$current" valid_choice '请选择1、2、cloudflare或direct。' '1 2 cloudflare direct'
     case "$answer" in 1|cloudflare) SITE_ACCESS=cloudflare;; 2|direct) SITE_ACCESS=direct;; esac
@@ -1544,7 +1639,7 @@ certificate_prompt() {
     panel_title "证书默认值 · $d"
     info "签发机构：Let's Encrypt；证书：ECC P-256；自动续期：每小时检查，按到期策略续期。"
     if [[ $(get .scheme) == A ]]; then info '方案A的REALITY代理不使用此证书；此证书用于你的网站。'
-    else info '方案B的网站与WS代理共用此域名的HTTPS证书。'; fi
+    else info '方案B的网站与WS/XHTTP代理共用此域名的HTTPS证书。'; fi
     current=$(jq -r '.email // empty' <<< "$existing"); [[ -n $current ]] || current=$(get '.preferences.email // ""')
     ask_valid CERT_EMAIL 'ACME联系邮箱' "$current" valid_email '邮箱格式示例：admin@example.com。'
     json_update --arg v "$CERT_EMAIL" '.preferences.email=$v'
@@ -1741,7 +1836,7 @@ node_list() {
         [[ $host != *:* ]] || host="[$host]"
         printf '  %s[%s]%s %s%s%s  %s[%s]%s\n' "$BLUE" "$index" "$RESET" "$BOLD" "$name" "$RESET" "$color" "$state" "$RESET"
         printf '       %s / %s | 连接 %s%s:%s%s | 本机端口 %s | TLS/SNI %s\n' "$proto" "$mode" "$CYAN" "$host" "$port" "$RESET" "$internal" "$domain"
-    done < <(jq -r '.nodes|to_entries[]|.key as $i|.value|[($i+1|tostring),.id,.protocol,(if .mode=="ws" then "WS+TLS" elif .mode=="ws-plain" then "WS(无TLS)" elif .mode=="tls" then "TCP+TLS" elif .mode=="reality" then "REALITY" else "TCP/UDP" end),.host,(if .mode=="ws" then "443" else (.port|tostring) end),(.port|tostring),(.enabled|tostring),(if .mode=="reality" then .sni elif (.domain // "")!="" then .domain else "-" end)]|@tsv' "$STATE")
+    done < <(jq -r '.nodes|to_entries[]|.key as $i|.value|[($i+1|tostring),.id,.protocol,(if .mode=="xhttp" then ("XHTTP/"+(.http_version // "h2")+"+TLS") elif .mode=="ws" then "WS+TLS" elif .mode=="ws-plain" then "WS(无TLS)" elif .mode=="tls" then "TCP+TLS" elif .mode=="reality" then "REALITY" else "TCP/UDP" end),.host,(if (.mode=="ws" or .mode=="xhttp") then "443" else (.port|tostring) end),(.port|tostring),(.enabled|tostring),(if .mode=="reality" then .sni elif (.domain // "")!="" then .domain else "-" end)]|@tsv' "$STATE")
     printf '  %s序号按当前列表排列；删除节点后会重新编号。启用状态不等于公网连通。%s\n' "$DIM" "$RESET"
 }
 valid_node_index() {
@@ -1778,13 +1873,13 @@ node_share_select() {
 }
 node_endpoint_prompt() {
     local ep_dest=$1 ep_mode=$2 ep_domain=$3 ep_default=$4 ep_value access
-    if [[ $ep_mode == ws || $ep_mode == tls ]]; then
-        info "连接地址与证书域名分开设置：TLS SNI/WS Host仍使用 $ep_domain。"
+    if [[ $ep_mode == ws || $ep_mode == xhttp || $ep_mode == tls ]]; then
+        info "连接地址与证书域名分开设置：TLS SNI/HTTP Host仍使用 $ep_domain。"
         ask_valid ep_value '客户端连接地址：域名、IPv4或IPv6（IPv6不加方括号）' "$ep_default" valid_host '请输入有效域名或IP，不含https://、端口或路径。'
         access=$(jq -r --arg d "$ep_domain" '[.sites[]|select(.domain==$d)][0].access // "direct"' "$STATE")
         if [[ $access == cloudflare ]]; then
             if ! valid_domain "$ep_value"; then warn '自定义IP会写入客户端链接；若填写源站IP，将绕过Cloudflare并暴露该IP。'; fi
-            [[ $ep_mode != tls ]] || warn '独立TCP+TLS不能通过Cloudflare普通橙云代理，请使用源站IP/直连域名，或改为WS+TLS。'
+            [[ $ep_mode != tls ]] || warn '独立TCP+TLS不能通过Cloudflare普通橙云代理，请使用源站IP/直连域名，或改为XHTTP+TLS。'
         fi
     else
         ask_valid ep_value '客户端连接地址：VPS IPv4、IPv6或直连域名' "$ep_default" valid_host '请输入有效IP或域名，不含端口、路径或IPv6方括号。'
@@ -1835,9 +1930,88 @@ node_listen_prompt() {
         printf -v "$nl_dest" '%s' "$nl_value"; return 0
     done
 }
+# XHTTP packet-up supports H2 at Nginx and H3 at Cloudflare's edge.
+# No QUIC listener is installed on the VPS; H3 is explicitly opt-in.
+xhttp_require_nginx() {
+    local build
+    build=$("$NGINX" -V 2>&1) || die '无法读取Nginx编译信息。'
+    [[ $build == *--with-http_v2_module* ]] || die 'XHTTP H2需要Nginx http_v2模块；请先在更新菜单更新Nginx，旧节点保持不变。'
+}
+xhttp_choose_version() {
+    local xv_dest=$1 xv_domain=$2 xv_host=$3 xv_value xv_default=${4:-h2} xv_access
+    xhttp_require_nginx
+    xv_access=$(jq -r --arg d "$xv_domain" '.sites[]|select(.domain==$d)|.access // "direct"' "$STATE")
+    while :; do
+        info 'H2：默认，直连/Cloudflare均可；H3：仅客户端→Cloudflare，源站仍TCP443。'
+        ask_valid xv_value 'XHTTP HTTP版本：h2 / h3' "$xv_default" valid_choice '请输入h2或h3。' 'h2 h3'
+        if [[ $xv_value == h3 ]]; then
+            if [[ $xv_access != cloudflare || $xv_host != "$xv_domain" ]]; then
+                warn 'H3要求网站连接方式为Cloudflare，节点连接地址必须等于网站域名；请先配置橙云，或选择h2。'
+                xv_default=h2; continue
+            fi
+            warn '请在Cloudflare开启HTTP/3，确认橙云和边缘证书有效；客户端须支持XHTTP及出站UDP443。'
+            warn '脚本不会自动修改Cloudflare开关，也不能仅凭设置证明H3公网可达；失败时可切回H2。'
+            confirm '确认以上条件，生成仅使用H3的客户端参数' || { xv_default=h2; continue; }
+        fi
+        printf -v "$xv_dest" '%s' "$xv_value"; return 0
+    done
+}
+node_migrate_xhttp() {
+    ensure_component xray; ensure_component nginx
+    local source=${1:-} n domain host name port path credential hv entry
+    node_select source "$source"
+    n=$(jq -c --arg n "$source" '.nodes[]|select(.id==$n)' "$STATE")
+    domain=$(jq -r '.domain // ""' <<< "$n")
+    if ! certificate_good "$domain"; then
+        info '原节点没有可复用的网站证书，请选择一个已签发证书的网站。'
+        site_select domain
+        certificate_good "$domain" || die '请先为此网站签发证书，再迁移节点。'
+    fi
+    host=$(jq -r '.host' <<< "$n")
+    node_endpoint_prompt host xhttp "$domain" "$host"
+    ask_valid name '新XHTTP节点名称（原节点保留）' "xhttp-$(randhex 3)" valid_new_node_name '名称须合法且不能重名。'
+    ask_node_port port '新节点本机端口（客户端连接443）' "$(next_port 20000)"
+    ask_valid path '新XHTTP路径' "/$(randhex 12)" valid_new_ws_path '路径须/开头且后接8～80个字母/数字/横线/下划线，不得重名。' "$domain"
+    xhttp_choose_version hv "$domain" "$host"
+    choose_credential credential vless ''
+    info "将创建 $name：VLESS + XHTTP/$hv + TLS；原节点 $source 和同入口其他用户均保留。"
+    confirm '客户端支持XHTTP，开始创建兼容升级节点' || return 0
+    entry="in-$(randhex 6)"
+    begin_tx; check_port "$port"
+    json_update --arg n "$name" --arg e "$entry" --arg d "$domain" --arg h "$host" --arg p "$path" --arg c "$credential" --arg v "$hv" --argjson port "$port" \
+      '.nodes += [{id:$n,entry:$e,protocol:"vless",mode:"xhttp",http_version:$v,port:$port,domain:$d,path:$p,method:"",credential:$c,host:$h,listen:"127.0.0.1",target:"",sni:"",privateKey:"",publicKey:"",shortId:"",enabled:true}]'
+    apply_config; commit_tx
+    ok '新节点已创建；请导入客户端测试，确认后再按序号停用旧节点。Cloudflare缓存/WAF规则需同步更新路径前缀。'
+    node_export "$name"
+}
+node_xhttp_version() {
+    local name=${1:-} n hv entry
+    node_select name "$name"
+    n=$(jq -c --arg n "$name" '.nodes[]|select(.id==$n)' "$STATE")
+    [[ $(jq -r .mode <<< "$n") == xhttp ]] || die '此节点不是XHTTP；请先使用兼容升级选项。'
+    xhttp_choose_version hv "$(jq -r .domain <<< "$n")" "$(jq -r .host <<< "$n")" "$(jq -r '.http_version // "h2"' <<< "$n")"
+    entry=$(jq -r .entry <<< "$n")
+    begin_tx
+    json_update --arg e "$entry" --arg v "$hv" '(.nodes[]|select(.entry==$e)|.http_version)=$v'
+    apply_config; commit_tx
+    ok '同入口客户端导出参数已更新；已导入客户端需重新导入，不会自动切换。'
+    node_export "$name"
+}
+node_xhttp_json() {
+    local name=${1:-}
+    node_select name "$name"
+    jq -e --arg n "$name" '.nodes[]|select(.id==$n and .mode=="xhttp")' "$STATE" >/dev/null || die '此节点不是XHTTP。'
+    warn '以下JSON含UUID；本地SOCKS监听127.0.0.1:10808，请勿公开。仅客户端使用，不要覆盖服务端配置。'
+    jq --arg n "$name" '.nodes[]|select(.id==$n)|. as $n|
+      {log:{loglevel:"warning"},inbounds:[{listen:"127.0.0.1",port:10808,protocol:"socks",settings:{auth:"noauth",udp:true}}],
+       outbounds:[{tag:"proxy",protocol:"vless",settings:{vnext:[{address:$n.host,port:443,users:[{id:$n.credential,encryption:"none"}]}]},
+       streamSettings:{network:"xhttp",security:"tls",tlsSettings:{serverName:$n.domain,alpn:[($n.http_version // "h2")],allowInsecure:false},
+         xhttpSettings:{host:$n.domain,path:($n.path+"/"),mode:"packet-up"}}}]}' "$STATE"
+}
+
 node_add() {
     ensure_component xray
-    local guided=${1:-no} name proto mode share='' entry port domain='' path='' method='' credential='' host listen target='' sni='' pk='' pub='' sid='' keys template
+    local guided=${1:-no} name proto mode share='' entry port domain='' path='' method='' credential='' host listen target='' sni='' pk='' pub='' sid='' keys template http_version=''
     ask_valid name '节点名称（英文/数字/下划线/横线）' "node-$(randhex 3)" valid_new_node_name '名称须为1～48个英文、数字、下划线或横线，且不能重名。'
     if [[ $guided != guided ]]; then
         node_share_select share
@@ -1856,11 +2030,11 @@ node_add() {
             info '沿用方案A：VLESS + REALITY + Vision。'
         else
             panel_title '选择代理协议'
-            menu_item 1 'VLESS' '轻量；可选REALITY、WS+TLS、TCP+TLS'
-            menu_item 2 'VMess' 'AEAD加密；可选WS、WS+TLS、TCP+TLS'
-            menu_item 3 'Trojan' '密码认证；可选WS+TLS、TCP+TLS'
+            menu_item 1 'VLESS（默认）' '推荐XHTTP+TLS；也支持REALITY和兼容传输'
+            menu_item 2 'VMess（旧版兼容）' 'Xray弃用提示；建议新客户端使用VLESS'
+            menu_item 3 'Trojan（旧版兼容）' 'Xray弃用提示；建议新客户端使用VLESS'
             local choices='1 2 3 vless vmess trojan' default_proto
-            default_proto=$(get '.preferences.protocol // "vless"')
+            default_proto=vless
             if [[ $guided != guided ]]; then
                 menu_item 4 'Shadowsocks' '独立TCP/UDP端口；AEAD或2022方法'
                 choices+=' 4 ss shadowsocks'
@@ -1868,25 +2042,29 @@ node_add() {
             ask_valid proto '协议编号或名称' "$default_proto" valid_choice '请选择列出的协议编号或名称。' "$choices"
             case "$proto" in 1) proto=vless;; 2) proto=vmess;; 3) proto=trojan;; 4|ss) proto=shadowsocks;; esac
             json_update --arg p "$proto" '.preferences.protocol=$p'
-            if [[ $guided == guided ]]; then mode=ws; info '沿用方案B：WS + TLS，网站与代理共用443。'
+            if [[ $guided == guided ]]; then
+                if [[ $proto == vless ]]; then mode=xhttp; info '沿用方案B：VLESS + XHTTP + TLS，默认H2，共用443。'
+                else mode=ws; warn '已明确选择旧协议兼容节点，将使用WS+TLS并可能显示弃用警告。'; fi
             elif [[ $proto == shadowsocks ]]; then mode=ss
             else
                 local default=1 mode_choices='1 2 ws wss ws-tls tls'
+                if [[ $proto == vless ]]; then default=5; mode_choices+=' 5 xhttp'; fi
                 [[ $(get .scheme) != A || $proto != vless ]] || default=3
                 panel_title '选择传输方式（WS是传输层，不是独立代理协议）'
-                menu_item 1 'WS + TLS' '推荐网站共用443；需要域名、Nginx和证书'
+                [[ $proto != vless ]] || menu_item 5 'XHTTP + TLS（推荐）' 'H2直连/CDN；H3经Cloudflare；需要域名、Nginx和证书'
+                menu_item 1 'WS + TLS（旧版兼容）' '仍可使用；Xray可能打印弃用警告'
                 menu_item 2 'TCP + TLS' '独立公网端口；需要域名和证书'
                 if [[ $proto == vless ]]; then menu_item 3 'TCP + REALITY' '独立端口，不需要自己的代理证书'; mode_choices+=' 3 reality'; fi
                 if [[ $proto == vmess ]]; then menu_item 4 'WS（无外层TLS）' 'VMess AEAD；独立端口，无HTTPS外观'; mode_choices+=' 4 ws-plain'; fi
                 ask_valid mode '传输编号或名称' "$default" valid_choice '此协议不支持该传输，请从当前列表重新选择。' "$mode_choices"
-                case "$mode" in 1|wss|ws-tls) mode=ws;; 2) mode=tls;; 3) mode=reality;; 4) mode=ws-plain;; esac
+                case "$mode" in 1|wss|ws-tls) mode=ws;; 2) mode=tls;; 3) mode=reality;; 4) mode=ws-plain;; 5) mode=xhttp;; esac
             fi
         fi
         if [[ $mode == ws-plain ]]; then
             warn '独立WS没有外层TLS和HTTPS伪装；VMess必须使用AEAD客户端，导出链接启用auto加密。VLESS/Trojan不提供明文WS。'
             confirm '选择VMess独立WS；通常建议改用选项1 WS+TLS' || return 0
         fi
-        if [[ $mode == ws || $mode == tls ]]; then
+        if [[ $mode == ws || $mode == xhttp || $mode == tls ]]; then
             ensure_component nginx
             if [[ $guided == guided ]]; then
                 domain=$(get '.wizard.domain // ""')
@@ -1908,9 +2086,9 @@ node_add() {
             json_update --arg h "$host" '.host=$h'
             if valid_domain "$host"; then remember_domain "$host"; fi
         fi
-        if [[ $mode == ws ]]; then
+        if [[ $mode == ws || $mode == xhttp ]]; then
             ask_node_port port 'Xray本机端口，客户端仍连接网站443' "$(next_port 20000)"
-            ask_valid path 'WebSocket路径（至少8个字母/数字/横线/下划线）' "/$(randhex 12)" valid_new_ws_path '路径须以/开头，后接8～80个允许字符，且当前网站尚未使用。' "$domain"
+            ask_valid path '代理路径（至少8个字母/数字/横线/下划线）' "/$(randhex 12)" valid_new_ws_path '路径须以/开头，后接8～80个允许字符，且当前网站尚未使用。' "$domain"
             listen=127.0.0.1
         else
             local start=8443
@@ -1944,6 +2122,7 @@ node_add() {
             ask_valid method 'Shadowsocks加密方法' 2022-blake3-aes-128-gcm valid_choice '支持aes-128-gcm、aes-256-gcm、chacha20-ietf-poly1305、2022-blake3-aes-128-gcm、2022-blake3-aes-256-gcm。' 'aes-128-gcm aes-256-gcm chacha20-ietf-poly1305 2022-blake3-aes-128-gcm 2022-blake3-aes-256-gcm'
             warn 'Shadowsocks已加密，但没有REALITY/HTTPS外观；端口须放行TCP和UDP。'
         fi
+        if [[ $mode == xhttp ]]; then xhttp_choose_version http_version "$domain" "$host"; fi
         choose_credential credential "$proto" "$method"
         entry="in-$(randhex 6)"
         begin_tx
@@ -1952,6 +2131,9 @@ node_add() {
           --argjson port "$port" --arg domain "$domain" --arg path "$path" --arg method "$method" --arg credential "$credential" \
           --arg host "$host" --arg listen "$listen" --arg target "$target" --arg sni "$sni" --arg pk "$pk" --arg pub "$pub" --arg sid "$sid" \
           '.nodes += [{id:$id,entry:$entry,protocol:$protocol,mode:$mode,port:$port,domain:$domain,path:$path,method:$method,credential:$credential,host:$host,listen:$listen,target:$target,sni:$sni,privateKey:$pk,publicKey:$pub,shortId:$sid,enabled:true}]'
+    fi
+    if [[ ${mode:-} == xhttp && -n ${http_version:-} ]]; then
+        json_update --arg n "$name" --arg h "$http_version" '(.nodes[]|select(.id==$n)|.http_version)=$h'
     fi
     apply_config; commit_tx
     ok "节点 $name 已添加。请用 vpskit firewall sync 放行系统防火墙端口；云安全组需另行设置。"
@@ -1964,7 +2146,7 @@ node_export() {
     host=$(jq -r .host <<< "$n"); port=$(jq -r .port <<< "$n"); mode=$(jq -r .mode <<< "$n"); proto=$(jq -r .protocol <<< "$n")
     credential=$(jq -r .credential <<< "$n"); label=$(jq -rn --arg v "$name" '$v|@uri')
     displayhost=$host; [[ $host != *:* ]] || displayhost="[$host]"
-    [[ $mode != ws ]] || port=443
+    [[ $mode != ws && $mode != xhttp ]] || port=443
     path=$(jq -r .path <<< "$n"); sni=$(jq -r '.domain' <<< "$n")
     warn '以下链接含访问凭据，请勿公开或粘贴到公共日志。'
     case "$proto" in
@@ -1977,6 +2159,11 @@ node_export() {
             if [[ $mode == reality ]]; then
                 sni=$(jq -r .sni <<< "$n"); key=$(jq -r .publicKey <<< "$n"); sid=$(jq -r .shortId <<< "$n")
                 query="security=reality&type=tcp&flow=xtls-rprx-vision&sni=$sni&fp=chrome&pbk=$key&sid=$sid"
+            elif [[ $mode == xhttp ]]; then
+                local hv
+                hv=$(jq -r '.http_version // "h2"' <<< "$n")
+                path=$(jq -rn --arg v "$path/" '$v|@uri')
+                query="security=tls&type=xhttp&sni=$sni&host=$sni&path=$path&mode=packet-up&alpn=$hv"
             elif [[ $mode == ws ]]; then
                 path=$(jq -rn --arg v "$path" '$v|@uri')
                 query="security=tls&type=ws&sni=$sni&host=$sni&path=$path"
@@ -2002,7 +2189,7 @@ node_action() {
             node_endpoint_prompt host "$mode" "$domain" "$old"
             [[ $host != "$old" ]] || { ok '连接地址未变更。'; return 0; }
             listen=$(jq -r --arg n "$name" '.nodes[]|select(.id==$n)|.listen' "$STATE")
-            if [[ $mode != ws && $host == *:* && $listen != :: ]]; then
+            if [[ $mode != ws && $mode != xhttp && $host == *:* && $listen != :: ]]; then
                 info '改为IPv6直连，需要同步调整共享入口的监听地址。'
                 node_listen_prompt listen "$host" ::
             fi
@@ -2032,7 +2219,7 @@ node_action() {
             begin_tx; json_update --arg n "$name" --arg c "$credential" '(.nodes[]|select(.id==$n)|.credential)=$c';;
         port)
             old=$(jq -r --arg n "$name" '.nodes[]|select(.id==$n)|.port' "$STATE")
-            ask_node_port port '新的入口端口（同入口所有用户一起修改；WS仅修改内部端口）' "$old" "$entry"
+            ask_node_port port '新的入口端口（同入口所有用户一起修改；WS/XHTTP仅修改内部端口）' "$old" "$entry"
             [[ $port != "$old" ]] || { ok '端口未变更。'; return 0; }
             begin_tx; check_port "$port"
             json_update --arg e "$entry" --argjson p "$port" '(.nodes[]|select(.entry==$e)|.port)=$p';;
@@ -2047,11 +2234,12 @@ explain() {
     cat <<'EOF'
 A：VLESS+REALITY+Vision直连（默认8443），网站单独使用80/443。
    代理不需要自有域名；网站仍需要域名和证书。
-B：VLESS/VMess/Trojan + WebSocket，经Nginx TLS共用网站443。
+B：默认VLESS + XHTTP + TLS H2，经Nginx共用网站443；H3可选经Cloudflare。
    需要有效证书和可达的域名/指定IP；支持Cloudflare橙云，不要求公开DNS等于VPS IP。
 额外：上述三个协议可选独立TCP+TLS；Shadowsocks使用独立TCP+UDP端口。
 VMess还可选独立WS（无外层TLS），仍使用VMess AEAD加密，但不伪装成HTTPS。
-WS+TLS适合网站共用443；WS封装本身不会加速，直连REALITY通常开销更低。
+XHTTP采用packet-up兼容回源；H3只用于客户端到Cloudflare，不要求VPS开放UDP443。
+WS/VMess/Trojan保留为旧客户端兼容选项；迁移先新增测试，旧节点不会自动删除。
 只启动一个Xray进程。A/B是新建节点的默认模式，允许明确选择其他支持的组合。
 TLS/REALITY降低内容暴露，但不保证匿名、无法识别或永久可用。
 本工具提供UFW/firewalld端口菜单；只按明确选择修改。云安全组需单独管理，不创建账户、不修改SSH配置。
@@ -2093,7 +2281,7 @@ configure_wizard() {
     fi
     if [[ $scheme == B ]]; then
         website=yes
-        info '方案B：网站与WS+TLS共用443；自动选择Nginx、acme.sh和域名证书。'
+        info '方案B：默认VLESS XHTTP H2与网站共用443；自动选择Nginx、acme.sh和域名证书。'
     else
         current=$(get '.wizard.website != false'); if [[ $current == true ]]; then current=yes; else current=no; fi
         ask_valid website '方案A同时部署HTTPS网站？yes/no（代理本身无需证书）' "$current" valid_choice '请输入yes或no。' 'yes no'
@@ -2122,7 +2310,7 @@ wizard_preview() {
     panel_title "已记住方案 $(get .scheme)"
     if [[ $(get .scheme) == A ]]; then
         printf '  代理：VLESS + REALITY + Vision；连接地址：%s；默认起始端口8443\n' "$(get '.host // "待输入"')"
-    else printf '  代理：默认VLESS + WS + TLS；客户端连接 %s:443；内部端口从20000选择\n' "${domain:-待输入}"; fi
+    else printf '  代理：默认VLESS + XHTTP + TLS H2；客户端连接 %s:443；内部端口从20000选择\n' "${domain:-待输入}"; fi
     if [[ $(get .scheme) == B || $website == true ]]; then
         printf '  网站：%s；内容类型：%s\n' "${domain:-待输入}" "$(get '.preferences.site_kind // "template"')"
         printf '  访问：%s；不强制公开DNS解析到本机IP\n' "$(get '.preferences.site_access // "direct"')"
@@ -2343,7 +2531,7 @@ uninstall_component() {
     local c=$1
     case "$c" in xray|nginx|acme);; *) die '卸载目标：xray/nginx/acme/all。';; esac
     if [[ $c == nginx ]]; then
-        jq -e '.nodes[]|select(.mode=="ws" or .mode=="tls")' "$STATE" >/dev/null && die '仍有域名/TLS节点，请先移除它们。'
+        jq -e '.nodes[]|select(.mode=="ws" or .mode=="xhttp" or .mode=="tls")' "$STATE" >/dev/null && die '仍有域名/TLS节点，请先移除它们。'
         [[ $(jq '.sites|length' "$STATE") == 0 ]] || die '仍有网站绑定，请先执行 site remove。'
     fi
     if [[ $c == acme ]]; then
@@ -2766,14 +2954,14 @@ firewall_port_action() {
 }
 firewall_required_ports() {
     if [[ $(get '.sites|length') -gt 0 ]] || { [[ $(get '.wizard.selected // false') == true ]] && plan_needs_site; }; then printf '80 tcp\n443 tcp\n'; fi
-    jq -r '.nodes[]|select(.enabled and .mode!="ws" and .listen!="127.0.0.1" and .listen!="::1")|"\(.port) tcp",(if .protocol=="shadowsocks" then "\(.port) udp" else empty end)' "$STATE"
+    jq -r '.nodes[]|select(.enabled and .mode!="ws" and .mode!="xhttp" and .listen!="127.0.0.1" and .listen!="::1")|"\(.port) tcp",(if .protocol=="shadowsocks" then "\(.port) udp" else empty end)' "$STATE"
 }
 firewall_sync() {
     local ports port proto
     firewall_prepare
     ports=$(firewall_required_ports | sort -u)
     [[ -n $ports ]] || { info '还没有需要放行的网站/公网代理端口。'; return 0; }
-    printf '将放行以下入站端口（WS本机内部端口不对公网开放）：\n%s\n' "$ports"
+    printf '将放行以下入站端口（WS/XHTTP本机内部端口不对公网开放）：\n%s\n' "$ports"
     info '只添加当前需要的放行规则；停用/删除节点后的旧端口，请通过关闭端口功能处理。'
     confirm '放行这些网站与节点端口' || return 0
     while read -r port proto; do firewall_change open "$port" "$proto"; done <<< "$ports"
@@ -2814,7 +3002,7 @@ firewall_menu() {
         menu_item 1 '查看状态与规则' '显示防火墙、zone和本工具操作记录'
         menu_item 2 '开放端口' '输入端口及TCP/UDP，确认后放行新入站连接'
         menu_item 3 '关闭端口' '增加阻止规则，保护SSH；已有连接可能继续'
-        menu_item 4 '放行网站与节点所需端口' '根据配置生成清单；WS本机内部端口不对公网开放'
+        menu_item 4 '放行网站与节点所需端口' '根据配置生成清单；WS/XHTTP本机内部端口不对公网开放'
         menu_item 5 '撤销本工具的防火墙规则' '保留外部规则；不重置或卸载整机防火墙'
         menu_item 0 '返回' '云安全组仍需在服务商控制台管理'
         ask choice '选择编号' 0
@@ -2978,7 +3166,7 @@ show_paths() {
     path_row '终端唤醒入口' "$ENTRY"
     path_row 'Xray配置：所有代理协议共用' "$ROOT/config/xray.json"
     path_row 'Xray可执行文件' "$XRAY"
-    path_row 'Nginx配置：网站、TLS、WS反向代理' "$ROOT/config/nginx.conf"
+    path_row 'Nginx配置：网站、TLS、WS/XHTTP反向代理' "$ROOT/config/nginx.conf"
     path_row 'Nginx可执行文件' "$NGINX"
     path_row '管理状态：节点、域名、偏好（含敏感信息）' "$STATE"
     path_row 'acme.sh程序' "$ACME"
@@ -3022,6 +3210,9 @@ VPSKit 单文件管理器
   sudo vpskit install [xray|nginx|acme] 完整向导/单组件安装
   sudo vpskit node add                 添加节点/共享入口用户
   sudo vpskit node list
+  sudo vpskit node migrate-xhttp [名称或序号]  保留旧节点，新增VLESS XHTTP
+  sudo vpskit node xhttp-version [名称或序号]  切换H2/经Cloudflare的H3
+  sudo vpskit node xhttp-json [名称或序号]     导出完整Xray客户端JSON（含凭据）
   sudo vpskit node export [名称或序号]       输出含凭据的客户端链接
   sudo vpskit node edit [名称或序号]         更换UUID/密码
   sudo vpskit node rename [名称或序号]       修改节点名称
@@ -3139,7 +3330,7 @@ component_menu() {
             uninstall) menu_item 1 '完整卸载' '删除本工具全部资料，并恢复本工具内核调优';;
         esac
         menu_item 2 'Xray代理核心' '只处理代理程序；卸载会删除所有代理节点'
-        menu_item 3 'Nginx网站与WS入口' '只处理独立Nginx；有依赖的网站/节点时禁止卸载'
+        menu_item 3 'Nginx网站与WS/XHTTP入口' '只处理独立Nginx；有依赖的网站/节点时禁止卸载'
         menu_item 4 'acme.sh自动证书' '只处理证书工具；有证书依赖时禁止卸载'
         [[ $action != update ]] || menu_item 5 '管理脚本' '从你配置的GitHub地址更新；下次唤醒生效'
         if [[ $action == install ]]; then
@@ -3176,12 +3367,16 @@ node_menu() {
         menu_item 8 '停用节点' '保留参数，可随时再次启用'
         menu_item 9 '删除节点' '按列表序号选择；删除该用户凭据前确认'
         menu_item 10 '修改连接域名 / IPv4 / IPv6' '按序号选择；保留证书域名/SNI，更新整个共享入口的连接地址'
+        menu_item 11 '迁移到VLESS XHTTP' '按序号选旧节点，新建独立节点，测试前保留旧节点'
+        menu_item 12 'XHTTP H2 / H3切换' 'H3仅经Cloudflare；切换后重新导入客户端'
+        menu_item 13 '导出XHTTP客户端JSON' '供不完整支持分享链接的Xray客户端使用；含凭据'
         menu_item 0 '返回' '回到主菜单'
         ask choice '选择编号' 0
         case "$choice" in
             1) menu_run node_add;; 2) menu_run node_list;; 3) menu_run node_export;;
             4) menu_run node_action edit;; 5) menu_run node_action port;; 6) menu_run node_action rename;;
             7) menu_run node_action enable;; 8) menu_run node_action disable;; 9) menu_run node_action delete;; 10) menu_run node_action address;;
+            11) menu_run node_migrate_xhttp;; 12) menu_run node_xhttp_version;; 13) menu_run node_xhttp_json;;
             0) return;; *) warn '无效选择。';;
         esac
     done
@@ -3242,7 +3437,7 @@ service_menu() {
     ask_valid choice '操作编号' 0 valid_choice '请选择0～3。' '0 1 2 3'
     case "$choice" in 0) return;; 1) action=start;; 2) action=stop;; 3) action=restart;; *) warn '无效选择。'; return;; esac
     menu_item 1 'Xray' '代理节点服务'
-    menu_item 2 'Nginx' '网站和WS+TLS入口'
+    menu_item 2 'Nginx' '网站和WS/XHTTP+TLS入口'
     ask_valid choice '组件编号' 1 valid_choice '请选择1或2。' '1 2'
     case "$choice" in 1) component=xray;; 2) component=nginx;; *) warn '无效选择。'; return;; esac
     menu_run service_action "$action" "$component"
@@ -3254,7 +3449,7 @@ operations_menu() {
         menu_item 1 '运行状态' '查看资源、组件版本、节点和证书状态'
         menu_item 2 '诊断检查' '验证配置，查看端口、DNS、HTTPS和续期timer'
         menu_item 3 'Xray日志' '最近100行代理错误日志'
-        menu_item 4 'Nginx日志' '最近100行网站/WS入口错误日志'
+        menu_item 4 'Nginx日志' '最近100行网站/WS/XHTTP入口错误日志'
         menu_item 5 '管理日志' '最近100行安装与管理过程日志'
         menu_item 6 '证书任务日志' '查看systemd续期任务结果'
         menu_item 7 '恢复中断事务' '重试恢复上次未完成的配置或调优操作'
@@ -3356,6 +3551,7 @@ main() {
         node)
             case "${2:-list}" in
                 add) node_add;; list) node_list;; export) node_export "${3:-}";;
+                migrate-xhttp) node_migrate_xhttp "${3:-}";; xhttp-version) node_xhttp_version "${3:-}";; xhttp-json) node_xhttp_json "${3:-}";;
                 edit|rename|port|address|enable|disable|delete) node_action "$2" "${3:-}";;
                 *) die '未知节点子命令。';;
             esac;;
