@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # VPSKIT_SINGLE_FILE - MIT License - Copyright (c) 2026 VPSKit contributors
-# VPSKit 1.3.0 | Debian 12+, Ubuntu 18.04+, systemd, amd64/arm64, Bash 4.4+.
+# VPSKit 1.4.0 | Debian 12+, Ubuntu 18.04+, systemd, amd64/arm64, Bash 4.4+.
 # 单文件交付；运行配置/上游程序/证书在 /opt/vpskit；不创建系统账户。
 # 使用: sudo bash vpskit.sh ; 安装后: sudo vpskit
 # 上传为 biao169/V2ray_deploy/main/vpskit.sh 后:
@@ -17,7 +17,7 @@ set -Eeuo pipefail
 umask 077
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export LC_ALL=C
-VERSION='1.3.0'
+VERSION='1.4.0'
 XRAY_TESTED_VERSION='v26.3.27'
 ROOT='/opt/vpskit'
 ENTRY='/usr/local/bin/vpskit'
@@ -39,12 +39,12 @@ LOCK_FD=''
 HAVE_LOCK=0
 TTY_FD=''
 LOGFILE=''
-RED='' GREEN='' YELLOW='' BLUE='' RESET=''
+RED='' GREEN='' YELLOW='' BLUE='' CYAN='' MAGENTA='' BOLD='' DIM='' RESET=''
 
 author_note() { printf '%s\n' 'VPSKit: 本地管理工具，不修改SSH、不创建用户、不清空防火墙；可显式管理端口。'; }
 colors() {
     if [[ -t 1 && ${TERM:-dumb} != dumb && -z ${NO_COLOR:-} && $NO_COLOR_FLAG == 0 ]]; then
-        RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; BLUE=$'\033[36m'; RESET=$'\033[0m'
+        RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; BLUE=$'\033[94m'; CYAN=$'\033[96m'; MAGENTA=$'\033[95m'; BOLD=$'\033[1m'; DIM=$'\033[2m'; RESET=$'\033[0m'
     fi
 }
 log() {
@@ -94,7 +94,7 @@ validate_cli() {
     case "$cmd" in
         help|--help|-h|version|--version|explain|selftest|menu|status|paths|doctor|repair|rollback|maintenance)
             (($#<=1)) || die '此命令不接受额外参数。';;
-        install|update|uninstall|logs|site|cert|optimize|wizard|firewall) (($#<=2)) || die '额外参数不支持；参数由交互向导收集。';;
+        install|update|uninstall|logs|site|cert|optimize|wizard|firewall|swap) (($#<=2)) || die '额外参数不支持；参数由交互向导收集。';;
         service) (($#==3)) || die '用法: vpskit service start|stop|restart xray|nginx';;
         node)
             (($#<=3)) || die '节点参数由交互向导收集，不支持额外选项。'
@@ -119,6 +119,8 @@ valid_host() {
         return 0
     fi
     [[ $1 =~ ^[0-9a-fA-F:]+$ && $1 == *:* && $1 != *:::* ]] || return 1
+    [[ $1 != :* || $1 == ::* ]] || return 1
+    [[ $1 != *: || $1 == *:: ]] || return 1
     # getent with AI_NUMERICHOST is unavailable in shell; use a bounded IPv6 syntax check.
     local rest=$1 doubles=0 count=0
     if [[ $rest == *::* ]]; then
@@ -209,17 +211,17 @@ valid_new_ws_path() {
 # UI preferences are saved before configuration transactions. A failed install
 # can roll back its runtime files while retaining already accepted answers.
 init_preferences() {
-    if jq -e '.ui_version==1' "$STATE" >/dev/null; then return 0; fi
+    if jq -e '.ui_version==2' "$STATE" >/dev/null; then return 0; fi
     local inferred_host; inferred_host=$(get '.host // ""')
     valid_domain "$inferred_host" || inferred_host=''
     json_update --arg h "$inferred_host" '
       (.sites[0] // {}) as $s |
       .preferences = ({domain:($s.domain // $h),email:($s.email // ""),challenge:($s.challenge // "http"),wildcard:($s.wildcard // false),
         site_kind:(if ($s|length)==0 then "template" elif ($s.upstream // "")!="" then "proxy" else "custom" end),
-        template:"welcome",upstream:($s.upstream // ""),redirect:"https://www.microsoft.com/",reality_target:"www.microsoft.com",protocol:"vless"} + (.preferences // {})) |
+        site_access:($s.access // (if ($s|length)>0 then "direct" elif .scheme=="B" then "cloudflare" else "direct" end)),template:"welcome",upstream:($s.upstream // ""),redirect:"https://www.microsoft.com/",reality_target:"www.microsoft.com",protocol:"vless"} + (.preferences // {})) |
       .wizard = ({selected:((.scheme=="B") or (.sites|length)>0 or (.nodes|length)>0 or (.components.xray // false)),
         website:((.scheme=="B") or (.sites|length)>0 or ((.nodes|length)==0)),domain:($s.domain // $h),defaults_ready:true,last_step:"",last_result:""} + (.wizard // {})) |
-      .ui_version=1'
+      .ui_version=2'
 }
 remember_domain() { json_update --arg d "$1" '.preferences.domain=$d'; }
 default_domain() {
@@ -788,6 +790,7 @@ validate_state() {
       ([.nodes[].id]|length== (unique|length)) and ([.sites[].domain]|length==(unique|length))' "$STATE" >/dev/null || die '状态结构或唯一性检查失败。'
     while IFS= read -r d; do valid_domain "$d" || die '状态中的域名非法。'; done < <(jq -r '.sites[].domain' "$STATE")
     while IFS= read -r site; do
+        valid_choice "$(jq -r '.access // "direct"' <<< "$site")" 'direct cloudflare' || die '网站连接方式不合法。'
         kind=$(jq -r '.kind // (if (.upstream // "")!="" then "proxy" else "custom" end)' <<< "$site")
         template=$(jq -r '.template // "welcome"' <<< "$site"); upstream=$(jq -r '.upstream // ""' <<< "$site"); redirect=$(jq -r '.redirect // ""' <<< "$site")
         case "$kind" in template) valid_choice "$template" 'welcome notes blog' || die '网站模板不合法。';;
@@ -799,6 +802,7 @@ validate_state() {
         id=$(jq -r .id <<< "$n"); p=$(jq -r .port <<< "$n")
         mode=$(jq -r .mode <<< "$n"); proto=$(jq -r .protocol <<< "$n")
         credential=$(jq -r .credential <<< "$n")
+        valid_host "$(jq -r .host <<< "$n")" || die '节点连接地址不合法。'
         if ! valid_name "$id" || ! valid_port "$p"; then die '节点名称或端口无效。'; fi
         case "$proto:$mode" in vless:reality|vless:ws|vless:tls|vmess:ws|vmess:ws-plain|vmess:tls|trojan:ws|trojan:tls|shadowsocks:ss) ;; *) die "不支持的协议组合: $proto/$mode";; esac
         if [[ $proto == vless || $proto == vmess ]]; then valid_uuid "$credential" || die 'UUID不合法。'; fi
@@ -1043,7 +1047,7 @@ cert_issue() {
     fi
     if [[ $challenge == http ]]; then
         args+=(--webroot "$ROOT/www/acme")
-        info "HTTP-01要求 $domain 的A/AAAA正确，公网80可达且验证路径未被CDN/WAF拦截。"
+        info "HTTP-01要求 $domain 的公开HTTP验证路径能够到达本机80；可以经CDN转发，不比对A/AAAA是否为VPS地址。"
     else
         provider=$challenge
         dns_credentials "$provider"
@@ -1117,6 +1121,27 @@ cert_status() {
     done < <(jq -r '.sites[].domain' "$STATE")
     ((bad == 0))
 }
+site_access_prompt() {
+    local d=$1 current answer old
+    current=$(jq -r --arg d "$d" '[.sites[]|select(.domain==$d)][0].access // empty' "$STATE")
+    [[ -n $current ]] || current=$(get '.preferences.site_access // (if .scheme=="B" then "cloudflare" else "direct" end)')
+    old=$current
+    panel_title '网站 / WS连接方式'
+    menu_item 1 'Cloudflare代理（橙云）' '适用于网站和WS+TLS；公开DNS可以返回Cloudflare IP'
+    menu_item 2 '直连 / 其他反向代理' '不强制DNS解析结果等于VPS；由你保证连接及回源正确'
+    ask_valid answer '连接方式：编号或 cloudflare / direct' "$current" valid_choice '请选择1、2、cloudflare或direct。' '1 2 cloudflare direct'
+    case "$answer" in 1|cloudflare) SITE_ACCESS=cloudflare;; 2|direct) SITE_ACCESS=direct;; esac
+    json_update --arg a "$SITE_ACCESS" '.preferences.site_access=$a | .preferences.access_chosen=true'
+    if [[ $SITE_ACCESS == cloudflare ]]; then
+        if [[ $old != cloudflare ]]; then
+            json_update '.preferences.challenge="dns_cf"'
+        fi
+        info '建议Cloudflare DNS-01：通过TXT验证域名所有权，不要求公开A/AAAA等于当前VPS。'
+        info 'Cloudflare控制台：记录开启橙云；正确设置源站/回源；SSL选择Full (strict)，WebSockets开启。'
+        info 'DNS-01签发不要求开放80，但网站回源443仍须可达。脚本不会自动修改Cloudflare控制台设置。'
+        warn '橙云不保证源站IP绝对隐藏；直连节点、其他DNS记录和历史记录仍可能暴露源站。'
+    else info '仅校验域名格式；不进行“DNS必须解析到本机IPv4/IPv6”的强制检查。'; fi
+}
 certificate_prompt() {
     local d=$1 existing current answer
     existing=$(jq -c --arg d "$d" '[.sites[]|select(.domain==$d)][0] // {}' "$STATE")
@@ -1128,7 +1153,10 @@ certificate_prompt() {
     ask_valid CERT_EMAIL 'ACME联系邮箱' "$current" valid_email '邮箱格式示例：admin@example.com。'
     json_update --arg v "$CERT_EMAIL" '.preferences.email=$v'
     current=$(jq -r '.challenge // empty' <<< "$existing"); [[ -n $current ]] || current=$(get '.preferences.challenge // "http"')
-    menu_item 1 'HTTP-01（默认）' '域名A/AAAA指向VPS，公网80端口可访问；不需要DNS API'
+    # Switching an existing site to orange-cloud offers DNS-01 once. Subsequent
+    # visits retain the user's explicit HTTP/DNS choice.
+    if [[ $(get '.preferences.site_access // "direct"') == cloudflare && $(jq -r '.access // "direct"' <<< "$existing") != cloudflare && $(jq -r 'has("domain")' <<< "$existing") == true ]]; then current=dns_cf; fi
+    menu_item 1 'HTTP-01' '公开域名的HTTP验证请求须能到达本机80；可经代理，不比对A/AAAA地址' 
     menu_item 2 'Cloudflare DNS-01' '适用于使用Cloudflare DNS、泛域名或80端口不可达的情况'
     menu_item 3 'DNSPod DNS-01' '适用于DNSPod DNS；需要API凭据，可申请泛域名'
     ask_valid answer '验证方式：编号或 http / dns_cf / dns_dp' "$current" valid_choice '请选择1/2/3或列出的验证方式。' '1 2 3 http dns_cf dns_dp'
@@ -1211,8 +1239,9 @@ site_template_file() {
 EOF_PAGE
 }
 site_apply_preferences() {
-    local domain=$1 exists=false own=false
+    local domain=$1 exists=false own=false access
     valid_domain "$domain" || die '网站域名不合法。'
+    access=$(get '.preferences.site_access // "direct"')
     SITE_KIND=$(get '.preferences.site_kind // "template"'); SITE_TEMPLATE=$(get '.preferences.template // "welcome"')
     SITE_UPSTREAM=''; SITE_REDIRECT=''
     [[ $SITE_KIND != proxy ]] || SITE_UPSTREAM=$(get '.preferences.upstream // ""')
@@ -1227,8 +1256,8 @@ site_apply_preferences() {
         json_update --arg d "$domain" '.sites += [{domain:$d,issued:false}]'
     fi
     site_template_file "$domain" "$SITE_KIND" "$SITE_TEMPLATE"
-    json_update --arg d "$domain" --arg e "$CERT_EMAIL" --arg c "$CERT_CHALLENGE" --arg u "$SITE_UPSTREAM" --arg r "$SITE_REDIRECT" --arg k "$SITE_KIND" --arg t "$SITE_TEMPLATE" --argjson w "$CERT_WILDCARD" '
-        (.sites[]|select(.domain==$d)) |= (. + {cert_settings_pending:((.cert_settings_pending // false) or (.issued==true and (.email!=$e or .challenge!=$c or (.wildcard // false)!=$w))),email:$e,challenge:$c,upstream:$u,redirect:$r,kind:$k,template:$t,wildcard:$w}) |
+    json_update --arg d "$domain" --arg e "$CERT_EMAIL" --arg c "$CERT_CHALLENGE" --arg u "$SITE_UPSTREAM" --arg r "$SITE_REDIRECT" --arg k "$SITE_KIND" --arg t "$SITE_TEMPLATE" --arg a "$access" --argjson w "$CERT_WILDCARD" '
+        (.sites[]|select(.domain==$d)) |= (. + {cert_settings_pending:((.cert_settings_pending // false) or (.issued==true and (.email!=$e or .challenge!=$c or (.wildcard // false)!=$w))),email:$e,challenge:$c,upstream:$u,redirect:$r,kind:$k,template:$t,access:$a,wildcard:$w}) |
         if .wizard.domain==$d then .wizard.site_pending=false else . end'
     apply_config; commit_tx
 }
@@ -1245,7 +1274,7 @@ site_add() {
             return 0
         fi
     fi
-    certificate_prompt "$domain"; site_content_prompt "$domain"
+    site_access_prompt "$domain"; certificate_prompt "$domain"; site_content_prompt "$domain"
     site_apply_preferences "$domain"
     info "网站域名已记住：$domain；内容目录：$ROOT/www/$domain。"
     if ! certificate_ready "$domain"; then cert_issue "$domain"; fi
@@ -1257,12 +1286,16 @@ site_edit() {
     # Preserve the site's certificate options while changing only content.
     local cert_data; cert_data=$(jq -c --arg d "$domain" '.sites[]|select(.domain==$d)|{email,challenge,wildcard:(.wildcard // false)}' "$STATE")
     json_update --argjson c "$cert_data" '.preferences += $c'
+    site_access_prompt "$domain"
+    # Editing website routing does not silently change active certificate settings.
+    json_update --argjson c "$cert_data" '.preferences += $c'
     site_content_prompt "$domain"
     site_apply_preferences "$domain"
 }
 site_certificate_edit() {
     local domain
     site_select domain
+    json_update --arg d "$domain" '.preferences.site_access=([.sites[]|select(.domain==$d)][0].access // "direct")'
     certificate_prompt "$domain"
     begin_tx
     json_update --arg d "$domain" --arg e "$CERT_EMAIL" --arg c "$CERT_CHALLENGE" --argjson w "$CERT_WILDCARD" '(.sites[]|select(.domain==$d)) |= (. + {cert_settings_pending:((.cert_settings_pending // false) or (.issued==true and (.email!=$e or .challenge!=$c or (.wildcard // false)!=$w))),email:$e,challenge:$c,wildcard:$w})'
@@ -1305,17 +1338,63 @@ site_remove() {
 }
 
 node_list() {
-    printf '名称\t协议\t传输\t入口\t监听端口\t客户端端口\t状态\t域名\n'
-    jq -r '.nodes[]|[.id,.protocol,(if .mode=="ws" then "WS+TLS" elif .mode=="ws-plain" then "WS(无TLS)" elif .mode=="tls" then "TCP+TLS" elif .mode=="reality" then "REALITY" else "TCP/UDP" end),.entry,(.port|tostring),(if .mode=="ws" then "443" else (.port|tostring) end),(if .enabled then "启用" else "停用" end),.domain]|@tsv' "$STATE"
+    local index name proto mode host port internal enabled domain state color
+    if [[ $(get '.nodes|length') == 0 ]]; then printf '  暂无节点；选择“添加节点”开始。\n'; return 0; fi
+    while IFS=$'\t' read -r index name proto mode host port internal enabled domain; do
+        color=$DIM; state='停用'; [[ $enabled != true ]] || { color=$GREEN; state='配置启用'; }
+        [[ $host != *:* ]] || host="[$host]"
+        printf '  %s[%s]%s %s%s%s  %s[%s]%s\n' "$BLUE" "$index" "$RESET" "$BOLD" "$name" "$RESET" "$color" "$state" "$RESET"
+        printf '       %s / %s | 连接 %s%s:%s%s | 本机端口 %s | TLS/SNI %s\n' "$proto" "$mode" "$CYAN" "$host" "$port" "$RESET" "$internal" "$domain"
+    done < <(jq -r '.nodes|to_entries[]|.key as $i|.value|[($i+1|tostring),.id,.protocol,(if .mode=="ws" then "WS+TLS" elif .mode=="ws-plain" then "WS(无TLS)" elif .mode=="tls" then "TCP+TLS" elif .mode=="reality" then "REALITY" else "TCP/UDP" end),.host,(if .mode=="ws" then "443" else (.port|tostring) end),(.port|tostring),(.enabled|tostring),(if .mode=="reality" then .sni elif (.domain // "")!="" then .domain else "-" end)]|@tsv' "$STATE")
+    printf '  %s序号按当前列表排列；删除节点后会重新编号。启用状态不等于公网连通。%s\n' "$DIM" "$RESET"
+}
+valid_node_index() {
+    [[ $1 =~ ^[0-9]{1,6}$ ]] || return 1
+    ((10#$1>=1 && 10#$1<=$(get '.nodes|length')))
 }
 node_select() {
-    local ns_dest=$1 ns_name=${2:-}
+    local ns_dest=$1 ns_name=${2:-} ns_index
     [[ $(get '.nodes|length') -gt 0 ]] || die '尚无节点，请先添加节点。'
     if [[ -z $ns_name ]]; then
         node_list >&2
-        ask_valid ns_name '节点名称' '' valid_existing_node '请输入列表中存在的节点名称。'
-    else valid_existing_node "$ns_name" || die '指定的节点不存在或名称不合法。'; fi
+        ask_valid ns_index '选择节点序号（输入:q取消）' '' valid_node_index '请输入当前列表内的有效序号。'
+        ns_name=$(jq -r --argjson i "$((10#$ns_index-1))" '.nodes[$i].id' "$STATE")
+    elif ! valid_existing_node "$ns_name"; then
+        # CLI keeps old names working. Numeric existing names have precedence.
+        valid_node_index "$ns_name" || die '指定节点名称或序号不存在。'
+        ns_name=$(jq -r --argjson i "$((10#$ns_name-1))" '.nodes[$i].id' "$STATE")
+    fi
+    info "已选择节点：$ns_name"
     printf -v "$ns_dest" '%s' "$ns_name"
+}
+node_share_select() {
+    local sh_dest=$1 sh_index sh_name
+    node_list >&2
+    while :; do
+        ask sh_index '复用入口：输入节点序号；0=新建独立入口' 0
+        if [[ $sh_index == 0 ]]; then printf -v "$sh_dest" '%s' ''; return 0; fi
+        if valid_node_index "$sh_index"; then
+            sh_name=$(jq -r --argjson i "$((10#$sh_index-1))" '.nodes[$i].id' "$STATE")
+            if valid_share_node "$sh_name"; then printf -v "$sh_dest" '%s' "$sh_name"; return 0; fi
+        fi
+        warn '序号无效或该节点为Shadowsocks（需独立入口），请重新选择。'
+    done
+}
+node_endpoint_prompt() {
+    local ep_dest=$1 ep_mode=$2 ep_domain=$3 ep_default=$4 ep_value access
+    if [[ $ep_mode == ws || $ep_mode == tls ]]; then
+        info "连接地址与证书域名分开设置：TLS SNI/WS Host仍使用 $ep_domain。"
+        ask_valid ep_value '客户端连接地址：域名、IPv4或IPv6（IPv6不加方括号）' "$ep_default" valid_host '请输入有效域名或IP，不含https://、端口或路径。'
+        access=$(jq -r --arg d "$ep_domain" '[.sites[]|select(.domain==$d)][0].access // "direct"' "$STATE")
+        if [[ $access == cloudflare ]]; then
+            if ! valid_domain "$ep_value"; then warn '自定义IP会写入客户端链接；若填写源站IP，将绕过Cloudflare并暴露该IP。'; fi
+            [[ $ep_mode != tls ]] || warn '独立TCP+TLS不能通过Cloudflare普通橙云代理，请使用源站IP/直连域名，或改为WS+TLS。'
+        fi
+    else
+        ask_valid ep_value '客户端连接地址：VPS IPv4、IPv6或直连域名' "$ep_default" valid_host '请输入有效IP或域名，不含端口、路径或IPv6方括号。'
+        info '当前传输需要直连；Cloudflare普通橙云不能代理此独立TCP/UDP入口。'
+    fi
+    printf -v "$ep_dest" '%s' "$ep_value"
 }
 choose_credential() {
     local cc_dest=$1 cc_protocol=$2 cc_method=${3:-} cc_except=${4:-} cc_value='' cc_length cc_wanted
@@ -1350,13 +1429,22 @@ choose_credential() {
         printf -v "$cc_dest" '%s' "$cc_value"; return 0
     done
 }
+ipv6_available() { [[ -r /proc/sys/net/ipv6/conf/all/disable_ipv6 && $(cat /proc/sys/net/ipv6/conf/all/disable_ipv6) == 0 ]]; }
+node_listen_prompt() {
+    local nl_dest=$1 nl_host=$2 nl_default=${3:-0.0.0.0} nl_value
+    while :; do
+        ask_valid nl_value '监听地址：0.0.0.0（IPv4）或 ::（IPv4/IPv6，需系统支持）' "$nl_default" valid_choice '请输入0.0.0.0或::。' '0.0.0.0 ::'
+        if [[ $nl_value == :: ]] && ! ipv6_available; then warn '系统IPv6已禁用；请先启用IPv6，或输入:q取消并改用IPv4地址。'; continue; fi
+        if [[ $nl_host == *:* && $nl_value != :: ]]; then warn 'IPv6直连地址需要::监听；请重新选择或:q取消。'; continue; fi
+        printf -v "$nl_dest" '%s' "$nl_value"; return 0
+    done
+}
 node_add() {
     ensure_component xray
     local guided=${1:-no} name proto mode share='' entry port domain='' path='' method='' credential='' host listen target='' sni='' pk='' pub='' sid='' keys template
     ask_valid name '节点名称（英文/数字/下划线/横线）' "node-$(randhex 3)" valid_new_node_name '名称须为1～48个英文、数字、下划线或横线，且不能重名。'
     if [[ $guided != guided ]]; then
-        node_list >&2
-        ask_valid share '复用现有入口的节点名称（留空新建入口）' '' valid_share_node '请填已有的非Shadowsocks节点名称，或留空新建入口。'
+        node_share_select share
     fi
     if [[ -n $share ]]; then
         node_select share "$share"
@@ -1416,11 +1504,11 @@ node_add() {
                     warn '此网站证书未就绪，请重新选择其他网站，或输入 :q 返回证书管理。'
                 done
             fi
-            host=$domain
+            node_endpoint_prompt host "$mode" "$domain" "$domain"
         elif [[ $guided == guided ]]; then
             host=$(get .host); info "沿用连接地址：$host"
         else
-            ask_valid host '客户端连接地址：VPS公网IP或直连域名（不要填写CDN代理域名）' "$(get .host)" valid_host '服务器地址应为IP或域名，不含端口、路径或IPv6方括号。'
+            node_endpoint_prompt host "$mode" "$domain" "$(get .host)"
             json_update --arg h "$host" '.host=$h'
             if valid_domain "$host"; then remember_domain "$host"; fi
         fi
@@ -1433,8 +1521,8 @@ node_add() {
             [[ $proto != shadowsocks ]] || start=8388
             ask_node_port port '公网代理端口（避开网站80/443和SSH）' "$(next_port "$start")"
             listen=0.0.0.0
-            if [[ -f /proc/sys/net/ipv6/conf/all/disable_ipv6 && $(cat /proc/sys/net/ipv6/conf/all/disable_ipv6) == 0 ]]; then listen='::'; fi
-            ask_valid listen '监听地址：0.0.0.0（IPv4）或 ::（IPv4/IPv6，需系统支持）' "$listen" valid_choice '请输入0.0.0.0或::。' '0.0.0.0 ::'
+            if ipv6_available; then listen='::'; fi
+            node_listen_prompt listen "$host" "$listen"
         fi
         if [[ $mode == ws-plain ]]; then
             ask_valid path '独立WebSocket路径（至少8个字母/数字/横线/下划线）' "/$(randhex 12)" valid_ws_path '路径须以/开头，后接8～80个字母、数字、横线或下划线。'
@@ -1507,10 +1595,24 @@ node_export() {
     esac
 }
 node_action() {
-    local action=$1 name=${2:-} entry credential proto method port old newname
+    local action=$1 name=${2:-} entry credential proto method port old newname mode domain host listen
     node_select name "$name"
     entry=$(jq -r --arg n "$name" '.nodes[]|select(.id==$n)|.entry' "$STATE")
     case "$action" in
+        address)
+            mode=$(jq -r --arg n "$name" '.nodes[]|select(.id==$n)|.mode' "$STATE")
+            domain=$(jq -r --arg n "$name" '.nodes[]|select(.id==$n)|.domain' "$STATE")
+            old=$(jq -r --arg n "$name" '.nodes[]|select(.id==$n)|.host' "$STATE")
+            node_endpoint_prompt host "$mode" "$domain" "$old"
+            [[ $host != "$old" ]] || { ok '连接地址未变更。'; return 0; }
+            listen=$(jq -r --arg n "$name" '.nodes[]|select(.id==$n)|.listen' "$STATE")
+            if [[ $mode != ws && $host == *:* && $listen != :: ]]; then
+                info '改为IPv6直连，需要同步调整共享入口的监听地址。'
+                node_listen_prompt listen "$host" ::
+            fi
+            info '同入口所有用户一起更新连接地址；证书域名/SNI、UUID和端口保留。'
+            begin_tx
+            json_update --arg e "$entry" --arg h "$host" --arg l "$listen" '(.nodes[]|select(.entry==$e)) |= (. + {host:$h,listen:$l})';;
         rename)
             ask_valid newname '新的节点名称' "$name" valid_new_node_name '名称格式不合法或与其他节点重名，请输入1～48个英文、数字、下划线或横线。' "$name"
             [[ $newname != "$name" ]] || return 0
@@ -1542,7 +1644,7 @@ node_action() {
     esac
     apply_config; commit_tx
     ok "节点操作完成: $action $name"
-    if [[ $action == edit || $action == port ]]; then node_export "$name"; fi
+    if [[ $action == edit || $action == port || $action == address ]]; then node_export "$name"; fi
 }
 
 explain() {
@@ -1550,7 +1652,7 @@ explain() {
 A：VLESS+REALITY+Vision直连（默认8443），网站单独使用80/443。
    代理不需要自有域名；网站仍需要域名和证书。
 B：VLESS/VMess/Trojan + WebSocket，经Nginx TLS共用网站443。
-   必须有解析正确的域名和有效证书；Xray只监听本机内部端口。
+   需要有效证书和可达的域名/指定IP；支持Cloudflare橙云，不要求公开DNS等于VPS IP。
 额外：上述三个协议可选独立TCP+TLS；Shadowsocks使用独立TCP+UDP端口。
 VMess还可选独立WS（无外层TLS），仍使用VMess AEAD加密，但不伪装成HTTPS。
 WS+TLS适合网站共用443；WS封装本身不会加速，直连REALITY通常开销更低。
@@ -1590,6 +1692,9 @@ configure_wizard() {
     ask_valid scheme '部署方案 A / B（回车保留上次选择）' "$(get '.scheme // "A"')" valid_scheme '方案只能为A或B。'
     scheme=${scheme^^}
     json_update --arg s "$scheme" '.scheme=$s | .wizard.selected=true | .wizard.defaults_ready=false'
+    if [[ $(get '.preferences.access_chosen // false') != true && $(get '.sites|length') == 0 ]]; then
+        json_update --arg s "$scheme" '.preferences.site_access=(if $s=="B" then "cloudflare" else "direct" end) | .preferences.challenge=(if $s=="B" then "dns_cf" else "http" end)'
+    fi
     if [[ $scheme == B ]]; then
         website=yes
         info '方案B：网站与WS+TLS共用443；自动选择Nginx、acme.sh和域名证书。'
@@ -1606,6 +1711,7 @@ configure_wizard() {
         ask_valid domain '自有网站域名（后续节点、网站和证书默认使用此域名）' "$current" valid_domain '请填写你能管理DNS的域名，不含https://或路径。'
         remember_domain "$domain"
         json_update --arg d "$domain" '.wizard.domain=$d'
+        site_access_prompt "$domain"
         certificate_prompt "$domain"
         site_content_prompt "$domain"
         json_update '.wizard.site_pending=true'
@@ -1623,6 +1729,7 @@ wizard_preview() {
     else printf '  代理：默认VLESS + WS + TLS；客户端连接 %s:443；内部端口从20000选择\n' "${domain:-待输入}"; fi
     if [[ $(get .scheme) == B || $website == true ]]; then
         printf '  网站：%s；内容类型：%s\n' "${domain:-待输入}" "$(get '.preferences.site_kind // "template"')"
+        printf '  访问：%s；不强制公开DNS解析到本机IP\n' "$(get '.preferences.site_access // "direct"')"
         printf '  证书：Let\047s Encrypt / ECC P-256；验证：%s；泛域名：%s\n' "$(get '.preferences.challenge // "http"')" "$(get '.preferences.wildcard // false')"
         printf '  后续：检查组件 → 配置当前域名网站 → 签发/检查证书 → 添加本方案节点 → 检查本机运行\n'
     else printf '  后续：检查Xray → 添加REALITY节点 → 检查本机运行（无需网站证书）\n'; fi
@@ -1879,10 +1986,11 @@ purge_owned_packages() {
     run apt-get -y purge "${pkgs[@]}"
 }
 uninstall_all() {
-    printf '将删除：\n  %s\n  %s\n  VPSKit服务、续期timer、全部节点/私钥/网站/日志/备份、本工具防火墙规则\n' "$ROOT" "$ENTRY"
+    printf '将删除：\n  %s\n  %s\n  VPSKit服务、续期timer、全部节点/私钥/网站/日志/备份、本工具防火墙规则及Swap\n' "$ROOT" "$ENTRY"
     printf '已配置网站：\n'; jq -r '.sites[].domain' "$STATE"
     warn '完整卸载不可恢复。请先把需要保留的网站文件复制到其他位置。不会删除其他工具的目录或系统共享日志。'
     confirm '完整卸载VPSKit' || return 0
+    swap_remove no
     firewall_cleanup no
     tuning_restore no
     UNINSTALLING=1
@@ -2321,6 +2429,145 @@ firewall_action() {
     case "$1" in status) firewall_status;; open|close) firewall_port_action "$1";; sync) firewall_sync;; cleanup) firewall_cleanup;; *) die '用法：vpskit firewall status|open|close|sync|cleanup';; esac
 }
 
+# Swap has its own ownership journal; never include a GiB-sized swapfile in
+# configuration snapshots, or touch any pre-existing system swap/fstab entries.
+swap_unit_name() { systemd-escape --path --suffix=swap "$ROOT/swap/swapfile"; }
+swap_active() { awk -v p="$ROOT/swap/swapfile" 'NR>1 && $1==p{found=1} END{exit !found}' /proc/swaps; }
+swap_used_kib() { awk -v p="$ROOT/swap/swapfile" 'NR>1 && $1==p{used=$4} END{print used+0}' /proc/swaps; }
+swap_available_kib() { awk '/^MemAvailable:/{print $2; found=1} END{if(!found)print 0}' /proc/meminfo; }
+swap_free_mib() { df -Pk "$ROOT" | awk 'NR==2{print int($4/1024)}'; }
+swap_filesystem() { findmnt -n -o FSTYPE --target "$ROOT"; }
+swap_container() { systemd-detect-virt --container --quiet; }
+valid_swap_size() { [[ $1 =~ ^[0-9]{3,4}$ ]] && ((10#$1>=256 && 10#$1<=4096 && 10#$1%256==0)); }
+swap_check_ownership() {
+    local file="$ROOT/swap/swapfile" record="$ROOT/data/swap.json" unit
+    unit=$(swap_unit_name)
+    [[ ! -L $ROOT/swap && ! -L $file && ! -L $record && ! -L $SYSTEMD/$unit ]] || die 'Swap路径为符号链接；拒绝接管。'
+    if [[ -e $SYSTEMD/$unit ]]; then
+        grep -Fxq '# VPSKIT_OWNED_SWAP' "$SYSTEMD/$unit" || die '存在同名外部Swap服务，拒绝修改。'
+    fi
+    if [[ -e $record ]]; then
+        [[ -f $record ]] || die 'Swap记录不是普通文件。'
+        jq -e --arg f "$file" --arg u "$unit" '.owner=="VPSKIT_SWAP_V1" and .path==$f and .unit==$u and (.phase=="creating" or .phase=="prepared" or .phase=="ready") and (.size_mib|type=="number")' "$record" >/dev/null || die 'Swap归属记录异常，保留现场。'
+        valid_swap_size "$(jq -r .size_mib "$record")" || die 'Swap容量记录异常。'
+        [[ ! -e $file || -f $file ]] || die 'Swap路径不是普通文件。'
+    elif [[ -e $file ]] || swap_active || [[ -e $SYSTEMD/$unit ]]; then
+        die '发现没有本工具归属记录的Swap文件/服务；拒绝覆盖或删除，请人工核实。'
+    fi
+}
+swap_record() {
+    local size=$1 phase=$2 tmp
+    tmp=$(mktemp "$ROOT/data/.swap.XXXXXXXX")
+    jq -n --arg p "$ROOT/swap/swapfile" --arg u "$(swap_unit_name)" --arg s "$phase" --argjson m "$size" \
+        '{owner:"VPSKIT_SWAP_V1",path:$p,unit:$u,size_mib:$m,phase:$s}' > "$tmp"
+    chmod 600 "$tmp"; mv -f "$tmp" "$ROOT/data/swap.json"
+}
+swap_caption() {
+    if [[ ! -f $ROOT/data/swap.json ]]; then printf '本工具未配置'; return; fi
+    if swap_active; then
+        if systemctl is-enabled --quiet "$(swap_unit_name)" 2>/dev/null; then printf '运行中 / 重启保留'; else printf '运行中 / 持久化待修复'; fi
+    else printf '已记录 / 未启用（可重试）'; fi
+}
+swap_status() {
+    panel_title 'Swap虚拟内存'
+    free -m
+    printf '\n系统所有Swap（只读）：\n'; cat /proc/swaps
+    printf '\n本工具：%s\n' "$(swap_caption)"
+    if [[ -f $ROOT/data/swap.json ]]; then
+        jq -r '"容量：\(.size_mib) MiB；阶段：\(.phase)\n文件：\(.path)\n持久化服务：\(.unit)"' "$ROOT/data/swap.json"
+    fi
+    printf 'Swap是磁盘缓冲，速度慢于RAM；不能替代物理内存或提高网络带宽。\n'
+}
+swap_enable() {
+    local mode=${1:-recommended} size=1024 free_mib phase=creating file="$ROOT/swap/swapfile" record="$ROOT/data/swap.json" unit tool
+    for tool in swapon swapoff mkswap dd findmnt systemd-escape systemd-detect-virt; do command -v "$tool" >/dev/null || die "缺少工具 $tool，请先安装util-linux、coreutils和systemd。"; done
+    swap_check_ownership
+    swap_container && die '容器通常不能自行配置Swap，请在宿主机或服务商控制台处理。'
+    case "$(swap_filesystem)" in ext2|ext3|ext4|xfs) ;; *) die '自动Swap仅支持ext2/ext3/ext4/XFS；其他文件系统需专门配置，未创建文件。';; esac
+    if [[ -f $record ]]; then
+        size=$(jq -r .size_mib "$record"); phase=$(jq -r .phase "$record")
+        info "继续使用已记录的 $size MiB Swap；变更容量请先安全移除再创建。"
+    elif [[ $mode == custom ]]; then
+        ask_valid size 'Swap容量MiB（256～4096，256的倍数）' 1024 valid_swap_size '请输入256～4096且为256倍数的整数。'
+        size=$((10#$size))
+    fi
+    unit=$(swap_unit_name)
+    if ! swap_active; then
+        if [[ ! -f $file || $phase == creating ]]; then
+            # A partial dd file is retained after interruption; retry can recreate
+            # it only while inactive. Reserve 1 GiB for OS, updates and the site.
+            free_mib=$(swap_free_mib)
+            if [[ -f $file ]]; then free_mib=$((free_mib + $(du -k "$file" | awk '{print int($1/1024)}'))); fi
+            ((free_mib-size>=1024)) || die "磁盘空间不足：创建${size}MiB后须至少剩余1024MiB。可选较小容量或清理磁盘。"
+            mkdir -p "$ROOT/swap"; chmod 700 "$ROOT/swap"
+            swap_record "$size" creating
+            info "分配 $size MiB Swap文件（512MiB RAM推荐1024MiB；现有系统Swap保留）。"
+            run dd if=/dev/zero of="$file" bs=1M count="$size" status=progress conv=fsync
+            chmod 600 "$file"
+            run mkswap "$file"
+            swap_record "$size" prepared
+        fi
+        info '启用Swap；若平台不允许，保留归属记录，稍后可重试或移除。'
+        run swapon --priority 10 "$file"
+        swap_active || die 'swapon返回成功但未发现活动Swap，保留文件供检查。'
+    fi
+    unit_write "$unit" <<UNIT
+# VPSKIT_OWNED
+# VPSKIT_OWNED_SWAP
+[Unit]
+Description=VPSKit persistent swap
+[Swap]
+What=$file
+Priority=10
+TimeoutSec=120
+[Install]
+WantedBy=swap.target
+UNIT
+    run systemctl daemon-reload
+    run systemctl enable "$unit"
+    systemctl is-enabled --quiet "$unit" || die 'Swap已启用但开机持久化失败；请再次运行swap enable修复。'
+    swap_record "$size" ready
+    ok "Swap已启用：$size MiB；开机通过 $unit 自动启用。"
+}
+swap_remove() {
+    local prompt=${1:-yes} file="$ROOT/swap/swapfile" record="$ROOT/data/swap.json" unit used available
+    swap_check_ownership
+    [[ -f $record ]] || { info '没有本工具管理的Swap。'; return 0; }
+    unit=$(swap_unit_name)
+    if [[ $prompt == yes ]]; then confirm '关闭并删除本工具Swap及开机服务（其他系统Swap保留）' || return 0; fi
+    if swap_active; then
+        used=$(swap_used_kib); available=$(swap_available_kib)
+        ((available>=used+131072)) || die '当前可用RAM不足以安全移除Swap（需已用Swap+128MiB余量）；请先停止占内存的程序再重试。'
+        info '仅停用本工具Swap；失败时保留文件和持久化服务。'
+        if ! swapoff "$file"; then die 'swapoff失败，未删除Swap；请释放内存后重试。'; fi
+        swap_active && die 'Swap仍然处于活动状态，拒绝删除。'
+    fi
+    if [[ -e $SYSTEMD/$unit ]]; then
+        run systemctl disable "$unit"
+        rm -f -- "$SYSTEMD/$unit"
+        run systemctl daemon-reload
+    fi
+    rm -f -- "$file" "$record"
+    if [[ -d $ROOT/swap ]]; then rmdir "$ROOT/swap" 2>/dev/null || warn 'Swap目录有其他文件，已保留。'; fi
+    ok '本工具Swap和开机服务已移除。'
+}
+swap_menu() {
+    local choice
+    while [[ -f $STATE ]]; do
+        panel_title "Swap虚拟内存 · $(swap_caption)"
+        menu_item 1 '一键添加 / 恢复Swap' '推荐1024MiB；文件集中存放，开机自动启用；已有配置则修复'
+        menu_item 2 '自定义容量' '256～4096MiB，256的倍数；至少保留1GiB磁盘空间'
+        menu_item 3 '内存与Swap状态' '查看实际使用量、其他系统Swap及开机持久化状态'
+        menu_item 4 '移除本工具Swap' '先检查可用RAM，成功停用后再删除；保留其他Swap'
+        menu_item 0 '返回' '回到主菜单'
+        ask choice '选择编号' 0
+        case "$choice" in 1) menu_run swap_enable;; 2) menu_run swap_enable custom;; 3) menu_run swap_status;; 4) menu_run swap_remove;; 0) return;; *) warn '无效选择。';; esac
+    done
+}
+swap_action() {
+    case "$1" in enable) swap_enable;; custom) swap_enable custom;; status) swap_status;; remove) swap_remove;; *) die '用法：vpskit swap status|enable|custom|remove';; esac
+}
+
 path_row() {
     local label=$1 path=$2 state='未创建 / 无权查看' color=$YELLOW
     if [[ -L $path && ! -e $path ]]; then state='链接目标缺失'; color=$RED
@@ -2355,6 +2602,9 @@ show_paths() {
     path_row 'Nginx日志' "$ROOT/logs/nginx.log"
     path_row '管理日志' "$ROOT/logs/manage.log"
     path_row '配置回滚快照' "$ROOT/backup/last"
+    path_row 'Swap文件' "$ROOT/swap/swapfile"
+    path_row 'Swap归属与阶段记录' "$ROOT/data/swap.json"
+    if command -v systemd-escape >/dev/null; then path_row 'Swap开机服务' "$SYSTEMD/$(swap_unit_name)"; fi
     path_row '防火墙操作记录' "$ROOT/data/firewall.json"
     path_row '内核调优配置' "$ROOT/data/sysctl.conf"
     path_row '内核调优系统入口' "$SYSCTL_LINK"
@@ -2374,11 +2624,12 @@ VPSKit 单文件管理器
   sudo vpskit install [xray|nginx|acme] 完整向导/单组件安装
   sudo vpskit node add                 添加节点/共享入口用户
   sudo vpskit node list
-  sudo vpskit node export [名称]       输出含凭据的客户端链接
-  sudo vpskit node edit [名称]         更换UUID/密码
-  sudo vpskit node rename [名称]       修改节点名称
-  sudo vpskit node port [名称]         修改整个入口端口
-  sudo vpskit node enable|disable|delete [名称]
+  sudo vpskit node export [名称或序号]       输出含凭据的客户端链接
+  sudo vpskit node edit [名称或序号]         更换UUID/密码
+  sudo vpskit node rename [名称或序号]       修改节点名称
+  sudo vpskit node address [名称或序号] 修改连接域名/IPv4/IPv6，保留SNI
+  sudo vpskit node port [名称或序号]         修改整个入口端口
+  sudo vpskit node enable|disable|delete [名称或序号]
   sudo vpskit site add|edit|list|remove|default
   sudo vpskit wizard configure|status  保存默认值/查看逐步进度
   sudo vpskit cert issue|renew|status|settings
@@ -2390,6 +2641,8 @@ VPSKit 单文件管理器
   sudo vpskit paths                    查看配置、证书、日志、服务等路径
   sudo vpskit firewall                 防火墙管理菜单
   sudo vpskit firewall status|open|close|sync|cleanup
+  sudo vpskit swap                     Swap虚拟内存菜单
+  sudo vpskit swap status|enable|custom|remove
   sudo vpskit status|doctor|repair
   sudo vpskit logs xray|nginx|manager|cert
   sudo vpskit uninstall xray|nginx|acme|all
@@ -2409,24 +2662,38 @@ Ubuntu旧版本需要仍可用的软件源及更新后的基础库；脚本不�
 完整卸载后系统软件包日志/已存在依赖不属于本工具文件，不擦除。
 EOF
 }
-panel_title() { printf '\n%s━━ %s ━━%s\n' "$BLUE" "$1" "$RESET"; }
-menu_item() { printf '  %s%2s%s  %s\n      %s%s%s\n' "$GREEN" "$1" "$RESET" "$2" "$BLUE" "$3" "$RESET"; }
+panel_title() { printf '\n%s%s━━ %s ━━%s\n' "$BOLD" "$MAGENTA" "$1" "$RESET"; }
+menu_item() {
+    local tone=$BLUE
+    case "$2" in *卸载*|*删除*|*移除*|*关闭端口*) tone=$RED;; esac
+    [[ $1 != 0 ]] || tone=$DIM
+    printf '  %s%2s%s  %s%s%s\n      %s%s%s\n' "$tone" "$1" "$RESET" "$BOLD" "$2" "$RESET" "$DIM" "$3" "$RESET"
+}
+status_badge() {
+    local value=$1 tone=$YELLOW
+    case "$value" in *异常*|*失败*|*缺失*) tone=$RED;; *未*|*待*|*停*|*进行中*) tone=$YELLOW;; *正常*|*运行*|*就绪*|*已*|*完成*) tone=$GREEN;; esac
+    printf '%s%s%s' "$tone" "$value" "$RESET"
+}
 panel_header() {
-    local memory disk color last
+    local memory disk last domain
     refresh_deployment
     memory=$(free -m | awk '/^Mem:/{printf "%s/%s MiB（可用%s）",$3,$2,$7}')
     disk=$(df -h "$ROOT" | awk 'NR==2{printf "%s可用",$4}')
+    domain=$(default_domain); domain=${domain:-待配置}
     panel_title "VPSKit $VERSION · 轻量终端面板"
-    printf '  方案%s | 默认网站 %s | 内存 %s | 磁盘 %s\n' "$D_SCHEME" "$(default_domain)" "$memory" "$disk"
-    color=$YELLOW; [[ $D_COMPLETE != true ]] || color=$GREEN
-    printf '  %s部署：%s（%s/%s步骤）%s\n' "$color" "$D_DEPLOYMENT" "$D_DONE" "$D_TOTAL" "$RESET"
-    printf '  Xray：%s | Nginx：%s | acme.sh：%s\n' "$D_XRAY" "$D_NGINX" "$D_ACME"
-    printf '  节点 %s（配置启用%s）| 网站 %s | 有效证书 %s | 续期 %s\n' "$D_NODE_TOTAL" "$D_NODE_ENABLED" "$D_SITE_TOTAL" "$D_CERT_OK" "$D_TIMER"
+    printf '  %s方案 %s%s  |  默认网站 %s%s%s\n' "$BOLD" "$D_SCHEME" "$RESET" "$CYAN" "$domain" "$RESET"
+    printf '  部署：'; status_badge "$D_DEPLOYMENT"; printf '（%s/%s步骤）\n' "$D_DONE" "$D_TOTAL"
+    printf '  Xray：'; status_badge "$D_XRAY"; printf '  |  Nginx：'; status_badge "$D_NGINX"; printf '  |  acme.sh：'; status_badge "$D_ACME"; printf '\n'
+    printf '  节点 %s%s%s（配置启用%s） | 网站 %s | 有效证书 %s | 续期 ' "$CYAN" "$D_NODE_TOTAL" "$RESET" "$D_NODE_ENABLED" "$D_SITE_TOTAL" "$D_CERT_OK"
+    status_badge "$D_TIMER"; printf '\n'
+    printf '  %s内存 %s | 磁盘 %s%s\n' "$DIM" "$memory" "$disk" "$RESET"
+    printf '  Swap：'; status_badge "$(swap_caption)"; printf '\n'
     if ((D_CERT_DUE>0)); then printf '  %s提醒：%s张证书不足14天，请检查续期。%s\n' "$YELLOW" "$D_CERT_DUE" "$RESET"; fi
     last=$(get '.wizard.last_step // ""')
-    if [[ -n $last ]]; then printf '  上次步骤：%s / %s\n' "$last" "$(get '.wizard.last_result // ""')"; fi
-    printf '  %s下一步：%s%s\n' "$BLUE" "$D_NEXT" "$RESET"
-    printf '  数据: %s | 唤醒: sudo vpskit | 输入错误可重试，:q取消当前操作\n' "$ROOT"
+    if [[ -n $last ]]; then printf '  上次步骤：%s / ' "$last"; status_badge "$(get '.wizard.last_result // ""')"; printf '\n'; fi
+    printf '  %s下一步：%s%s\n' "$CYAN" "$D_NEXT" "$RESET"
+    printf '  %s数据: %s | 唤醒: sudo vpskit | 输入错误可重试，:q取消%s\n' "$DIM" "$ROOT" "$RESET"
+    printf '  %s正常%s / %s待处理%s / %s异常或删除操作%s · 状态以文字同时标示\n' "$GREEN" "$RESET" "$YELLOW" "$RESET" "$RED" "$RESET"
 }
 menu_run() {
     # A subshell retains errexit and its rollback trap. Calling it in if/|| would
@@ -2503,13 +2770,14 @@ node_menu() {
         menu_item 6 '修改节点名称' '修改管理名称与导出链接备注'
         menu_item 7 '启用节点' '检查入口端口，再恢复代理服务'
         menu_item 8 '停用节点' '保留参数，可随时再次启用'
-        menu_item 9 '删除节点' '删除该用户凭据；操作前确认'
+        menu_item 9 '删除节点' '按列表序号选择；删除该用户凭据前确认'
+        menu_item 10 '修改连接域名 / IPv4 / IPv6' '按序号选择；保留证书域名/SNI，更新整个共享入口的连接地址'
         menu_item 0 '返回' '回到主菜单'
         ask choice '选择编号' 0
         case "$choice" in
             1) menu_run node_add;; 2) menu_run node_list;; 3) menu_run node_export;;
             4) menu_run node_action edit;; 5) menu_run node_action port;; 6) menu_run node_action rename;;
-            7) menu_run node_action enable;; 8) menu_run node_action disable;; 9) menu_run node_action delete;;
+            7) menu_run node_action enable;; 8) menu_run node_action disable;; 9) menu_run node_action delete;; 10) menu_run node_action address;;
             0) return;; *) warn '无效选择。';;
         esac
     done
@@ -2616,12 +2884,13 @@ main_menu() {
         menu_item 8 '方案说明与命令帮助' '查看要求、传输区别和命令行入口'
         menu_item 9 '配置文件与目录' '查看Xray、Nginx、证书、日志与网站路径'
         menu_item 10 '防火墙端口管理' 'UFW / firewalld状态、端口开闭和所需端口放行'
+        menu_item 11 'Swap虚拟内存' '一键添加1024MiB磁盘Swap，重启保留；支持状态、自定义容量和安全移除'
         menu_item 0 '退出' '后台代理、网站和自动续期继续运行'
         ask choice '请选择数字' 0
         case "$choice" in
             1) component_menu install;; 2) node_menu;; 3) site_menu;; 4) optimize_menu;;
             5) component_menu update;; 6) operations_menu;; 7) component_menu uninstall;;
-            8) menu_run show_help;; 9) menu_run show_paths;; 10) firewall_menu;; 0) return;; *) warn '无效选择，请输入菜单编号。';;
+            8) menu_run show_help;; 9) menu_run show_paths;; 10) firewall_menu;; 11) swap_menu;; 0) return;; *) warn '无效选择，请输入菜单编号。';;
         esac
     done
 }
@@ -2634,6 +2903,8 @@ selftest() {
     for t in 'a;reboot.com' '../x.com' '-a.example' 'a..example' 'a.com/new' '*.example.com'; do if valid_domain "$t"; then test_fail=1; fi; done
     for t in 1 443 65535 08443; do valid_port "$t" || test_fail=1; done
     for t in 0 65536 abc '80;id' -1; do if valid_port "$t"; then test_fail=1; fi; done
+    for t in 192.0.2.10 2001:db8::10 2001:db8:0:0:0:0:0:10 ::1; do valid_host "$t" || test_fail=1; done
+    for t in 256.0.0.1 '2001::1:' ':2001::1' '2001::db8::1' '[2001:db8::1]'; do if valid_host "$t"; then test_fail=1; fi; done
     valid_uuid '12345678-1234-1234-1234-123456789abc' || test_fail=1
     if valid_uuid '$(id)'; then test_fail=1; fi
     valid_ws_path /abcdefgh || test_fail=1
@@ -2680,7 +2951,7 @@ main() {
         node)
             case "${2:-list}" in
                 add) node_add;; list) node_list;; export) node_export "${3:-}";;
-                edit|rename|port|enable|disable|delete) node_action "$2" "${3:-}";;
+                edit|rename|port|address|enable|disable|delete) node_action "$2" "${3:-}";;
                 *) die '未知节点子命令。';;
             esac;;
         wizard) case "${2:-status}" in configure) configure_wizard;; status) deployment_details;; *) die '用法：vpskit wizard configure|status';; esac;;
@@ -2692,6 +2963,7 @@ main() {
         status) status;; logs) logs "${2:-manager}";; doctor) doctor;; repair) recover; doctor;; rollback) rollback_last;;
         firewall) if [[ -z ${2:-} ]]; then PANEL_IDLE=1; HAVE_LOCK=0; flock -u "$LOCK_FD"; firewall_menu; else firewall_action "$2"; fi;;
         optimize) if [[ -z ${2:-} ]]; then PANEL_IDLE=1; HAVE_LOCK=0; flock -u "$LOCK_FD"; optimize_menu; else optimize_action "$2"; fi;;
+        swap) if [[ -z ${2:-} ]]; then PANEL_IDLE=1; HAVE_LOCK=0; flock -u "$LOCK_FD"; swap_menu; else swap_action "$2"; fi;;
         maintenance) maintenance;;
         *) help_text; die '未知命令。';;
     esac
