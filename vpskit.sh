@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # VPSKIT_SINGLE_FILE - MIT License - Copyright (c) 2026 VPSKit contributors
-# VPSKit 1.4.0 | Debian 12+, Ubuntu 18.04+, systemd, amd64/arm64, Bash 4.4+.
+# VPSKit 1.5.0 | Debian 12+, Ubuntu 18.04+, systemd, amd64/arm64, Bash 4.4+.
 # 单文件交付；运行配置/上游程序/证书在 /opt/vpskit；不创建系统账户。
 # 使用: sudo bash vpskit.sh ; 安装后: sudo vpskit
 # 上传为 biao169/V2ray_deploy/main/vpskit.sh 后:
@@ -17,7 +17,7 @@ set -Eeuo pipefail
 umask 077
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export LC_ALL=C
-VERSION='1.4.0'
+VERSION='1.5.0'
 XRAY_TESTED_VERSION='v26.3.27'
 ROOT='/opt/vpskit'
 ENTRY='/usr/local/bin/vpskit'
@@ -94,7 +94,7 @@ validate_cli() {
     case "$cmd" in
         help|--help|-h|version|--version|explain|selftest|menu|status|paths|doctor|repair|rollback|maintenance)
             (($#<=1)) || die '此命令不接受额外参数。';;
-        install|update|uninstall|logs|site|cert|optimize|wizard|firewall|swap) (($#<=2)) || die '额外参数不支持；参数由交互向导收集。';;
+        install|update|uninstall|logs|site|cert|optimize|wizard|firewall|swap|edge) (($#<=2)) || die '额外参数不支持；参数由交互向导收集。';;
         service) (($#==3)) || die '用法: vpskit service start|stop|restart xray|nginx';;
         node)
             (($#<=3)) || die '节点参数由交互向导收集，不支持额外选项。'
@@ -729,7 +729,8 @@ install_nginx() {
     mkdir -p "$dir"
     run apt-get update
     # Extract distro's signed-repository packages, never execute nginx postinst/user creation.
-    for pkg in nginx nginx-light nginx-core; do
+    # Older nginx-light builds omit limit_req/limit_conn. Prefer nginx-core.
+    for pkg in nginx nginx-core nginx-light; do
         if ! apt-cache show "$pkg" >/dev/null 2>&1; then continue; fi
         info "下载发行版 $pkg 包，不执行维护脚本。"
         if ! (cd "$dir" && apt-get download "$pkg"); then continue; fi
@@ -790,6 +791,7 @@ validate_state() {
       ([.nodes[].id]|length== (unique|length)) and ([.sites[].domain]|length==(unique|length))' "$STATE" >/dev/null || die '状态结构或唯一性检查失败。'
     while IFS= read -r d; do valid_domain "$d" || die '状态中的域名非法。'; done < <(jq -r '.sites[].domain' "$STATE")
     while IFS= read -r site; do
+        edge_validate_site "$site"
         valid_choice "$(jq -r '.access // "direct"' <<< "$site")" 'direct cloudflare' || die '网站连接方式不合法。'
         kind=$(jq -r '.kind // (if (.upstream // "")!="" then "proxy" else "custom" end)' <<< "$site")
         template=$(jq -r '.template // "welcome"' <<< "$site"); upstream=$(jq -r '.upstream // ""' <<< "$site"); redirect=$(jq -r '.redirect // ""' <<< "$site")
@@ -837,15 +839,143 @@ render_xray() {
         {type:"field",ip:["0.0.0.0/8","10.0.0.0/8","127.0.0.0/8","169.254.0.0/16","172.16.0.0/12","192.168.0.0/16","224.0.0.0/4","::/128","::1/128","fc00::/7","fe80::/10","ff00::/8"],outboundTag:"blocked"}]}}
     ' "$STATE" > "$dest"
 }
+# Per-site website controls. WS and ACME use distinct locations and never
+# inherit website request/connection/bandwidth limits or crawler filters.
+edge_settings() {
+    jq -c '{bots:"off",rate:0,burst:30,connections:0,kbps:0,static_ttl:0,gzip:false,origin:false,aop:"off"} + (.protection // {})' <<< "$1"
+}
+edge_zone() { printf '%s' "$1" | sha256sum | cut -c1-12; }
+edge_validate_site() {
+    local settings
+    settings=$(edge_settings "$1")
+    jq -e 'def n($lo;$hi): type=="number" and .==floor and . >= $lo and . <= $hi;
+      (.bots=="off" or .bots=="ai" or .bots=="common" or .bots=="all") and
+      (.rate|n(0;100)) and (.burst|n(1;200)) and (.connections|n(0;200)) and
+      (.kbps|n(0;10240)) and (.static_ttl|n(0;604800)) and
+      (.gzip|type=="boolean") and (.origin|type=="boolean") and
+      (.aop=="off" or .aop=="observe" or .aop=="enforce")' <<< "$settings" >/dev/null || die '网站防护参数非法。'
+    if [[ $(jq -r .origin <<< "$settings") == true || $(jq -r .aop <<< "$settings") != off ]]; then
+        [[ $(jq -r '.access // "direct"' <<< "$1") == cloudflare ]] || die '源站限制/AOP要求网站连接方式为Cloudflare；请先关闭这些防护再改成直连。'
+    fi
+    if [[ $(jq -r .aop <<< "$settings") != off ]]; then
+        [[ $(jq -r .issued <<< "$1") == true && -s $ROOT/config/edge/aop-ca.pem ]] || die 'AOP需要已签发网站证书及回源CA。'
+    fi
+}
+edge_ai_tokens() {
+    printf '%s\n' GPTBot ChatGPT-User OAI-SearchBot ClaudeBot Claude-User Claude-SearchBot anthropic-ai CCBot Bytespider Amazonbot Applebot-Extended Google-Extended cohere-ai PerplexityBot Perplexity-User Diffbot FacebookBot meta-externalagent meta-externalfetcher
+}
+edge_bot_pattern() {
+    local pattern
+    pattern=$(edge_ai_tokens | paste -sd '|' -)
+    case "$1" in common) pattern+='|AhrefsBot|SemrushBot|MJ12bot|DotBot|BLEXBot|DataForSeoBot|SeekportBot';;
+        all) pattern+='|bot|spider|crawler|scrapy|python-requests|curl|wget|go-http-client|headlesschrome';; esac
+    printf '%s' "$pattern"
+}
+edge_cidrs_valid() {
+    local file=$1 family=$2 line address prefix count=0
+    [[ -f $file && $(stat -c %s "$file") -le 65536 ]] || return 1
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ $line == */* && $line != *[[:space:]]* ]] || return 1
+        address=${line%/*}; prefix=${line##*/}
+        valid_host "$address" && [[ $prefix =~ ^[0-9]{1,3}$ ]] || return 1
+        if [[ $family == 4 ]]; then
+            [[ $address =~ ^[0-9.]+$ && $address == *.* && $address != *:* ]] && ((10#$prefix>=8 && 10#$prefix<=32)) || return 1
+        else
+            [[ $address == *:* ]] && ((10#$prefix>=16 && 10#$prefix<=128)) || return 1
+        fi
+        count=$((count+1)); ((count<=512)) || return 1
+    done < "$file"
+    ((count>=1))
+}
+edge_cf_ready() { edge_cidrs_valid "$ROOT/config/edge/cf-v4.txt" 4 && edge_cidrs_valid "$ROOT/config/edge/cf-v6.txt" 6; }
+edge_needs_cf() {
+    jq -e '.sites[]|select((.access // "direct")=="cloudflare" and (((.protection.rate // 0)>0) or ((.protection.connections // 0)>0) or .protection.origin==true))' "$STATE" >/dev/null
+}
+edge_http_config() {
+    local site settings domain zone rate connections policy cidr build
+    build=$("$NGINX" -V 2>&1)
+    cat <<'NGINX'
+    map $http_upgrade $vpskit_is_ws { default 0; ~*^websocket$ 1; }
+NGINX
+    for policy in ai common all; do
+        printf '    map $http_user_agent $vpskit_bot_%s { default 0; ~*(%s) 1; }\n' "$policy" "$(edge_bot_pattern "$policy")"
+    done
+    if edge_needs_cf; then
+        edge_cf_ready || die '缺少有效Cloudflare网段，请运行 vpskit edge refresh。'
+        [[ $("$NGINX" -V 2>&1) == *--with-http_realip_module* ]] || die '当前Nginx不含realip模块，不能安全按访客IP限流或限制Cloudflare回源。'
+        printf '    geo $realip_remote_addr $vpskit_cf_peer {\n        default 0;\n'
+        while read -r cidr; do printf '        %s 1;\n' "$cidr"; done < <(awk '1' "$ROOT/config/edge/cf-v4.txt" "$ROOT/config/edge/cf-v6.txt")
+        printf '    }\n'
+    fi
+    while IFS= read -r site; do
+        settings=$(edge_settings "$site"); domain=$(jq -r .domain <<< "$site"); zone=$(edge_zone "$domain")
+        rate=$(jq -r .rate <<< "$settings"); connections=$(jq -r .connections <<< "$settings")
+        if ((rate>0)) && [[ $build == *--without-http_limit_req_module* ]]; then die '当前Nginx缺少limit_req模块；请先运行vpskit update nginx升级为完整构建。'; fi
+        if ((connections>0)) && [[ $build == *--without-http_limit_conn_module* ]]; then die '当前Nginx缺少limit_conn模块；请先运行vpskit update nginx升级为完整构建。'; fi
+        if ((rate>0)); then printf '    limit_req_zone $binary_remote_addr zone=vr_%s:1m rate=%sr/s;\n' "$zone" "$rate"; fi
+        if ((connections>0)); then printf '    limit_conn_zone $binary_remote_addr zone=vc_%s:1m;\n' "$zone"; fi
+    done < <(jq -c '.sites[]' "$STATE")
+}
+edge_server_config() {
+    local site=$1 tls=$2 settings mode domain cidr
+    settings=$(edge_settings "$site"); domain=$(jq -r .domain <<< "$site")
+    printf '        if ($host != %s) { return 404; }\n' "$domain"
+    if [[ $(jq -r '.access // "direct"' <<< "$site") == cloudflare ]] && { [[ $(jq -r .origin <<< "$settings") == true ]] || (( $(jq -r .rate <<< "$settings")>0 || $(jq -r .connections <<< "$settings")>0 )); }; then
+        while read -r cidr; do printf '        set_real_ip_from %s;\n' "$cidr"; done < <(awk '1' "$ROOT/config/edge/cf-v4.txt" "$ROOT/config/edge/cf-v6.txt")
+        printf '        real_ip_header CF-Connecting-IP;\n        real_ip_recursive off;\n'
+    fi
+    mode=$(jq -r .aop <<< "$settings")
+    if [[ $tls == true && $mode != off ]]; then
+        printf '        ssl_client_certificate %s/config/edge/aop-ca.pem;\n        ssl_verify_depth 2;\n' "$ROOT"
+        if [[ $mode == enforce ]]; then printf '        ssl_verify_client on;\n'; else printf '        ssl_verify_client optional;\n'; fi
+        # A random, explicitly invoked diagnostic path is never listed publicly.
+        # It returns only TLS client verification status; no credentials or IPs.
+        local probe; probe=$(get '.edge.probe // ""')
+        [[ $probe =~ ^[a-f0-9]{32}$ ]] || die 'AOP诊断路径缺失，请重新配置AOP。'
+        printf '        location = /.well-known/vpskit-aop-%s {\n' "$probe"
+        edge_origin_guard "$settings"
+        printf '            default_type text/plain;\n            add_header Cache-Control "no-store" always;\n            return 200 "$ssl_client_verify\\n";\n        }\n'
+    fi
+}
+edge_origin_guard() {
+    if [[ $(jq -r .origin <<< "$1") == true ]]; then printf '            if ($vpskit_cf_peer = 0) { return 403; }\n'; fi
+}
+edge_web_guard() {
+    local settings=$1 domain=$2 bots rate burst connections kbps zone
+    bots=$(jq -r .bots <<< "$settings"); rate=$(jq -r .rate <<< "$settings"); burst=$(jq -r .burst <<< "$settings")
+    connections=$(jq -r .connections <<< "$settings"); kbps=$(jq -r .kbps <<< "$settings"); zone=$(edge_zone "$domain")
+    edge_origin_guard "$settings"
+    [[ $bots == off ]] || printf '            if ($vpskit_bot_%s) { return 403; }\n' "$bots"
+    if ((rate>0)); then printf '            limit_req zone=vr_%s burst=%s nodelay;\n            limit_req_status 429;\n            limit_req_log_level info;\n' "$zone" "$burst"; fi
+    if ((connections>0)); then printf '            limit_conn vc_%s %s;\n            limit_conn_status 429;\n            limit_conn_log_level info;\n' "$zone" "$connections"; fi
+    if ((kbps>0)); then printf '            limit_rate %sk;\n' "$kbps"; fi
+}
+edge_static_gzip() {
+    if [[ $1 == true ]]; then
+        cat <<'NGINX'
+            gzip on;
+            gzip_vary on;
+            gzip_comp_level 2;
+            gzip_min_length 1024;
+            gzip_types text/plain text/css application/javascript application/json image/svg+xml;
+NGINX
+    fi
+}
+edge_robots_content() {
+    local mode=$1 token
+    if [[ $mode == all ]]; then printf 'User-agent: *\nDisallow: /\n'; return; fi
+    while read -r token; do printf 'User-agent: %s\nDisallow: /\n\n' "$token"; done < <(edge_ai_tokens)
+    if [[ $mode == common ]]; then for token in AhrefsBot SemrushBot MJ12bot DotBot BLEXBot DataForSeoBot SeekportBot; do printf 'User-agent: %s\nDisallow: /\n\n' "$token"; done; fi
+}
+
 render_nginx() {
-    local dest=$1 site domain issued upstream kind template redirect n path port ipv6='' protocols gzip
+    local dest=$1 site domain issued upstream kind template redirect n path port ipv6='' protocols gzip settings ttl bots robots
     protocols=$(nginx_tls_protocols)
-    gzip=$(get '.performance.gzip // false')
-    [[ -f /proc/sys/net/ipv6/conf/all/disable_ipv6 && $(cat /proc/sys/net/ipv6/conf/all/disable_ipv6) == 0 ]] && ipv6='yes'
+    [[ ! -f /proc/sys/net/ipv6/conf/all/disable_ipv6 || $(cat /proc/sys/net/ipv6/conf/all/disable_ipv6) != 0 ]] || ipv6=yes
     mkdir -p "$ROOT/run/nginx"/{client,proxy,fastcgi,uwsgi,scgi}
     {
-        cat <<EOF
-# VPSKIT_OWNED -- generated; edit sites with vpskit site, not this file.
+        cat <<EOF_NGINX
+# VPSKIT_OWNED -- generated; use vpskit site / edge to manage.
 user root;
 worker_processes 1;
 pid $ROOT/run/nginx.pid;
@@ -859,6 +989,11 @@ http {
     tcp_nodelay on;
     tcp_nopush on;
     keepalive_timeout 30;
+    keepalive_requests 256;
+    client_header_timeout 15s;
+    client_body_timeout 15s;
+    send_timeout 30s;
+    reset_timedout_connection on;
     client_max_body_size 10m;
     access_log off;
     client_body_temp_path $ROOT/run/nginx/client;
@@ -869,32 +1004,34 @@ http {
     ssl_session_cache shared:VPSKIT:1m;
     ssl_session_timeout 10m;
     ssl_protocols $protocols;
-    server {
-        listen 80 default_server;
-EOF
+EOF_NGINX
+        edge_http_config
+        printf '    server {\n        listen 80 default_server;\n'
         [[ -z $ipv6 ]] || printf '        listen [::]:80 default_server;\n'
-        cat <<EOF
-        server_name _;
-        location ^~ /.well-known/acme-challenge/ { root $ROOT/www/acme; default_type text/plain; }
-        location / { return 404; }
-    }
-EOF
+        printf '        server_name _;\n        location ^~ /.well-known/acme-challenge/ { root %s/www/acme; default_type text/plain; }\n        location / { return 404; }\n    }\n' "$ROOT"
         while IFS= read -r site; do
             domain=$(jq -r .domain <<< "$site"); issued=$(jq -r .issued <<< "$site"); upstream=$(jq -r '.upstream // ""' <<< "$site")
             kind=$(jq -r '.kind // (if (.upstream // "")!="" then "proxy" else "custom" end)' <<< "$site")
             template=$(jq -r '.template // "welcome"' <<< "$site"); redirect=$(jq -r '.redirect // ""' <<< "$site")
+            settings=$(edge_settings "$site"); ttl=$(jq -r .static_ttl <<< "$settings"); bots=$(jq -r .bots <<< "$settings")
+            gzip=$(jq -r .gzip <<< "$settings"); [[ $(get '.performance.gzip // false') != true ]] || gzip=true
             if ! valid_domain "$domain" || ! valid_upstream "$upstream"; then die '网站参数不合法。'; fi
+            edge_validate_site "$site"
             printf '    server {\n        listen 80;\n'
             [[ -z $ipv6 ]] || printf '        listen [::]:80;\n'
             printf '        server_name %s;\n' "$domain"
+            edge_server_config "$site" false
             printf '        location ^~ /.well-known/acme-challenge/ { root %s/www/acme; default_type text/plain; }\n' "$ROOT"
             if [[ $issued == true ]]; then
-                printf '        location / { return 301 https://%s$request_uri; }\n    }\n' "$domain"
+                printf '        location / {\n'
+                edge_origin_guard "$settings"
+                [[ $bots == off ]] || printf '            if ($vpskit_bot_%s) { return 403; }\n' "$bots"
+                printf '            return 301 https://%s$request_uri;\n        }\n    }\n' "$domain"
                 printf '    server {\n        listen 443 ssl;\n'
                 [[ -z $ipv6 ]] || printf '        listen [::]:443 ssl;\n'
-                printf '        server_name %s;\n' "$domain"
-                printf '        ssl_certificate %s/certs/%s/current/fullchain.pem;\n' "$ROOT" "$domain"
-                printf '        ssl_certificate_key %s/certs/%s/current/key.pem;\n' "$ROOT" "$domain"
+                printf '        server_name %s;\n        ssl_certificate %s/certs/%s/current/fullchain.pem;\n        ssl_certificate_key %s/certs/%s/current/key.pem;\n' "$domain" "$ROOT" "$domain" "$ROOT" "$domain"
+                edge_server_config "$site" true
+                printf '        location ^~ /.well-known/acme-challenge/ { root %s/www/acme; default_type text/plain; }\n' "$ROOT"
             fi
             printf '        root %s/www/%s;\n' "$ROOT" "$domain"
             if [[ $kind == template ]]; then printf '        index vpskit-%s.html index.html;\n' "$template"; else printf '        index index.html;\n'; fi
@@ -902,8 +1039,11 @@ EOF
             if [[ $issued == true ]]; then
                 while IFS= read -r n; do
                     path=$(jq -r .path <<< "$n"); port=$(jq -r .port <<< "$n")
-                    cat <<EOF
-        location = $path {
+                    printf '        location = %s {\n' "$path"
+                    edge_origin_guard "$settings"
+                    cat <<EOF_WS
+            if (\$vpskit_is_ws = 0) { return 404; }
+            if (\$request_method != GET) { return 404; }
             proxy_pass http://127.0.0.1:$port;
             proxy_http_version 1.1;
             proxy_set_header Upgrade \$http_upgrade;
@@ -911,44 +1051,300 @@ EOF
             proxy_set_header Host \$host;
             proxy_buffering off;
             proxy_request_buffering off;
+            proxy_cache off;
+            gzip off;
+            add_header Cache-Control "no-store" always;
             proxy_read_timeout 3600s;
             proxy_send_timeout 3600s;
         }
-EOF
+EOF_WS
                 done < <(jq -c --arg d "$domain" '[.nodes[]|select(.enabled and .mode=="ws" and .domain==$d)]|unique_by(.entry)[]' "$STATE")
             fi
+            if [[ $kind == template || $kind == custom ]]; then
+                if [[ $bots != off ]]; then
+                    robots=$(edge_robots_content "$bots" | awk '{printf "%s\\n",$0}')
+                    printf '        location = /robots.txt {\n'
+                    edge_origin_guard "$settings"
+                    printf '            try_files /robots.txt @vpskit_robots;\n        }\n        location @vpskit_robots {\n            default_type text/plain;\n            add_header Cache-Control "no-cache" always;\n            return 200 "%s";\n        }\n' "$robots"
+                fi
+                if ((ttl>0)); then
+                    printf '        location ~* \\.(css|js|png|jpe?g|gif|svg|webp|avif|ico|woff2?|ttf)$ {\n'
+                    edge_web_guard "$settings" "$domain"
+                    printf '            try_files $uri =404;\n            expires %ss;\n' "$ttl"
+                    edge_static_gzip "$gzip"
+                    printf '        }\n'
+                fi
+            fi
+            printf '        location / {\n'
+            edge_web_guard "$settings" "$domain"
             if [[ $kind == redirect ]]; then
                 valid_redirect "$redirect" "$domain" || die '跳转网址不合法。'
-                printf '        location / { return 302 "%s"; }\n' "$redirect"
+                printf '            return 302 "%s";\n' "$redirect"
             elif [[ -n $upstream ]]; then
-                cat <<EOF
-        location / {
+                cat <<EOF_PROXY
             proxy_pass $upstream;
             proxy_set_header Host \$host;
             proxy_set_header X-Real-IP \$remote_addr;
             proxy_set_header X-Forwarded-For \$remote_addr;
             proxy_set_header X-Forwarded-Proto \$scheme;
-        }
-EOF
+            proxy_hide_header X-Powered-By;
+EOF_PROXY
             else
-                printf '        location / {\n            try_files $uri $uri/ =404;\n'
-                if [[ $gzip == true ]]; then
-                    cat <<'EOF'
-            # Only static content; do not compress proxy payloads or dynamic secrets.
-            gzip on;
-            gzip_vary on;
-            gzip_comp_level 2;
-            gzip_min_length 1024;
-            gzip_types text/plain text/css application/javascript application/json image/svg+xml;
-EOF
-                fi
-                printf '        }\n'
+                printf '            try_files $uri $uri/ =404;\n'
+                edge_static_gzip "$gzip"
             fi
-            printf '    }\n'
+            printf '        }\n    }\n'
         done < <(jq -c '.sites[]' "$STATE")
         printf '}\n'
     } > "$dest"
 }
+# Website-only changes reload Nginx without restarting Xray on success.
+apply_web_config() {
+    ensure_component nginx
+    validate_state
+    render_nginx "$ROOT/config/nginx.next.conf"
+    nginx_cmd -t -p "$ROOT/" -c "$ROOT/config/nginx.next.conf"
+    mv -f "$ROOT/config/nginx.next.conf" "$ROOT/config/nginx.conf"
+    if systemctl is-active --quiet vpskit-nginx.service; then run systemctl reload vpskit-nginx.service
+    else run systemctl start vpskit-nginx.service; fi
+    systemctl is-active --quiet vpskit-nginx.service || die 'Nginx未正常运行。'
+}
+edge_fetch_assets() {
+    EDGE_STAGE="$WORK/edge-assets"
+    mkdir -p "$EDGE_STAGE"
+    local item url
+    for item in v4 v6 ca; do
+        case "$item" in v4) url=https://www.cloudflare.com/ips-v4;; v6) url=https://www.cloudflare.com/ips-v6;; ca) url=https://developers.cloudflare.com/ssl/static/authenticated_origin_pull_ca.pem;; esac
+        info "下载Cloudflare官方资料：$item"
+        curl --proto '=https' --proto-redir '=https' -fSL --connect-timeout 15 --max-time 45 --max-filesize 65536 --retry 1 -o "$EDGE_STAGE/$item" "$url"
+    done
+    if ! edge_cidrs_valid "$EDGE_STAGE/v4" 4 || ! edge_cidrs_valid "$EDGE_STAGE/v6" 6; then die 'Cloudflare网段下载结果异常，保留旧配置。'; fi
+    openssl x509 -in "$EDGE_STAGE/ca" -noout -checkend 2592000 >/dev/null || die '回源CA无效或不足30天有效期，保留旧配置。'
+    openssl x509 -in "$EDGE_STAGE/ca" -text -noout | grep -q 'CA:TRUE' || die '下载结果不是CA证书。'
+}
+edge_install_assets() {
+    mkdir -p "$ROOT/config/edge"
+    install -m 600 "$EDGE_STAGE/v4" "$ROOT/config/edge/cf-v4.txt"
+    install -m 600 "$EDGE_STAGE/v6" "$ROOT/config/edge/cf-v6.txt"
+    install -m 600 "$EDGE_STAGE/ca" "$ROOT/config/edge/aop-ca.pem"
+    date +%s > "$ROOT/config/edge/updated.epoch"
+}
+edge_refresh() {
+    ensure_component nginx
+    edge_fetch_assets
+    begin_tx; edge_install_assets; apply_web_config; commit_tx
+    ok 'Cloudflare IPv4/IPv6网段及公共回源CA已验证并更新。'
+}
+edge_auto_refresh() {
+    local stamp=0 rc
+    jq -e '.sites[]|select((.access // "direct")=="cloudflare" and ((.protection.origin==true) or ((.protection.rate // 0)>0) or ((.protection.connections // 0)>0) or ((.protection.aop // "off")!="off")))' "$STATE" >/dev/null || return 0
+    if [[ -f $ROOT/config/edge/updated.epoch ]]; then read -r stamp < "$ROOT/config/edge/updated.epoch"; fi
+    [[ $stamp =~ ^[0-9]{1,12}$ ]] || stamp=0
+    (( $(date +%s)-stamp>=604800 )) || return 0
+    # The existing hourly timer drives a weekly refresh. A failed download or
+    # reload rolls back in an isolated action and cannot suppress ACME renewal.
+    set +e
+    trap - ERR
+    (
+        set -Ee
+        trap 'on_error $? $LINENO' ERR
+        trap on_exit EXIT
+        edge_refresh_job
+    )
+    rc=$?
+    set -e
+    trap 'on_error $? $LINENO' ERR
+    [[ $rc == 0 ]] || warn 'Cloudflare资料自动更新失败，保留旧配置；请运行 vpskit edge refresh 检查。'
+}
+edge_refresh_job() {
+    WORK=$(mktemp -d "$ROOT/tmp/edge-refresh.XXXXXXXX")
+    TX=0
+    edge_refresh
+}
+edge_site() { site_select "$1"; }
+edge_get_site() { jq -c --arg d "$1" '.sites[]|select(.domain==$d)' "$STATE"; }
+valid_edge_number() { [[ $1 =~ ^[0-9]{1,6}$ ]] && ((10#$1>=${2:-0} && 10#$1<=${3:-100})); }
+edge_profile() {
+    local domain site cf=false
+    ensure_component nginx; edge_site domain; site=$(edge_get_site "$domain")
+    info '均衡预设：拦截声明身份的AI爬虫；网站5请求/秒、突发30、每IP20并发；静态资源缓存1小时、轻量gzip。'
+    info '仅网站应用上述限制；WS、ACME不套用。已有robots.txt保留。不会自动启用回源限制或AOP。'
+    confirm "应用到 $domain" || return 0
+    if [[ $(jq -r '.access // "direct"' <<< "$site") == cloudflare ]] && ! edge_cf_ready; then edge_fetch_assets; cf=true; fi
+    begin_tx
+    [[ $cf != true ]] || edge_install_assets
+    json_update --arg d "$domain" '(.sites[]|select(.domain==$d)|.protection) = ((.sites[]|select(.domain==$d)|.protection // {}) + {bots:"ai",rate:5,burst:30,connections:20,kbps:0,static_ttl:3600,gzip:true})'
+    apply_web_config; commit_tx
+    ok '网站防护与节流预设已生效。Cloudflare边缘拦截/缓存仍需按控制台指引设置。'
+}
+edge_bots() {
+    local domain site policy
+    ensure_component nginx; edge_site domain; site=$(edge_get_site "$domain")
+    panel_title '网站爬虫策略（WS与ACME不应用）'
+    menu_item 1 '仅AI爬虫 ai' '拒绝匹配已知AI User-Agent；普通搜索爬虫保留'
+    menu_item 2 'AI + 常见采集器 common' '增加Ahrefs、Semrush等采集器；通常不拦Googlebot/Bingbot'
+    menu_item 3 '广泛拒绝声明爬虫 all' '包括搜索爬虫、curl/wget等；影响SEO和网站API/监控，请慎选'
+    menu_item 0 '关闭 off' '恢复网站默认行为；已有robots.txt文件不删除'
+    ask_valid policy '编号或 off / ai / common / all' "$(jq -r '.protection.bots // "off"' <<< "$site")" valid_choice '请选择0/1/2/3或策略名称。' '0 1 2 3 off ai common all'
+    case "$policy" in 0) policy=off;; 1) policy=ai;; 2) policy=common;; 3) policy=all;; esac
+    warn 'User-Agent可伪造；本机规则不能识别所有爬虫。robots.txt是自愿遵守的声明，不是访问控制。'
+    if [[ $policy == all ]]; then confirm '会拒绝普通搜索爬虫及部分自动客户端，继续' || return 0; fi
+    begin_tx
+    json_update --arg d "$domain" --arg p "$policy" '(.sites[]|select(.domain==$d)|.protection.bots)=$p'
+    apply_web_config; commit_tx
+}
+edge_limits() {
+    local domain site settings rate burst connections kbps cf=false
+    ensure_component nginx; edge_site domain; site=$(edge_get_site "$domain"); settings=$(edge_settings "$site")
+    info '按访客IP限制普通网站请求；同一NAT出口会共享额度。WS、证书验证不受这些限额约束。'
+    ask_valid rate '每IP每秒请求数，0关闭，最高100' "$(jq -r .rate <<< "$settings")" valid_edge_number '请输入0～100的整数。' 0 100
+    ask_valid burst '允许突发请求数' "$(jq -r .burst <<< "$settings")" valid_edge_number '请输入1～200的整数。' 1 200
+    ask_valid connections '每IP网站并发请求数，0关闭' "$(jq -r .connections <<< "$settings")" valid_edge_number '请输入0～200的整数。' 0 200
+    ask_valid kbps '每个网站响应的下载上限KiB/s，0不限速' "$(jq -r .kbps <<< "$settings")" valid_edge_number '请输入0～10240的整数。' 0 10240
+    if [[ $(jq -r '.access // "direct"' <<< "$site") == cloudflare ]] && ((10#$rate>0 || 10#$connections>0)) && ! edge_cf_ready; then edge_fetch_assets; cf=true; fi
+    begin_tx
+    [[ $cf != true ]] || edge_install_assets
+    json_update --arg d "$domain" --argjson r "$((10#$rate))" --argjson b "$((10#$burst))" --argjson c "$((10#$connections))" --argjson k "$((10#$kbps))" '(.sites[]|select(.domain==$d)|.protection) = ((.sites[]|select(.domain==$d)|.protection // {}) + {rate:$r,burst:$b,connections:$c,kbps:$k})'
+    apply_web_config; commit_tx
+    info '网站跳转响应很小，Nginx直接return的跳转不受请求限流阶段约束；请在Cloudflare边缘另加规则。'
+}
+edge_cache() {
+    local domain site ttl gzip
+    ensure_component nginx; edge_site domain; site=$(edge_get_site "$domain")
+    info '仅静态网站的CSS/JS/图片/字体使用缓存头；HTML、动态应用和代理流量不强制缓存。更新同名资源后可能需清CDN缓存。'
+    ask_valid ttl '静态资源缓存秒数，0关闭，最高604800（7天）' "$(jq -r '.protection.static_ttl // 0' <<< "$site")" valid_edge_number '请输入0～604800。' 0 604800
+    ask_valid gzip '此网站开启轻量gzip？yes/no' "$(jq -r 'if .protection.gzip==true then "yes" else "no" end' <<< "$site")" valid_choice '请输入yes或no。' 'yes no'
+    begin_tx
+    json_update --arg d "$domain" --argjson t "$((10#$ttl))" --argjson g "$([[ $gzip == yes ]] && printf true || printf false)" '(.sites[]|select(.domain==$d)|.protection) = ((.sites[]|select(.domain==$d)|.protection // {}) + {static_ttl:$t,gzip:$g})'
+    apply_web_config; commit_tx
+    if [[ $(get '.performance.gzip // false') == true ]]; then info '全局静态gzip仍开启；需要全部关闭时，请同时执行 vpskit optimize gzip-off。'; fi
+}
+edge_origin() {
+    local domain site choice cf=false
+    ensure_component nginx; edge_site domain; site=$(edge_get_site "$domain")
+    ask_valid choice '仅允许Cloudflare网段访问此网站和WS？yes/no' "$(jq -r 'if .protection.origin==true then "yes" else "no" end' <<< "$site")" valid_choice '请输入yes或no。' 'yes no'
+    if [[ $choice == yes ]]; then
+        [[ $(jq -r '.access // "direct"' <<< "$site") == cloudflare ]] || die '请先在网站设置中选择Cloudflare访问方式并完成控制台橙云配置。'
+        warn '启用后源站IP直连网站/WS会被拒绝；该限制在Nginx层，不替代云防火墙，也不影响SSH。HTTP证书验证路径保持可用。'
+        warn 'Cloudflare网段和公共AOP都不能证明请求属于你的账户；其他直连代理端口仍可能暴露源站。'
+        confirm '已确认网站与WS能通过Cloudflare正常访问，现在启用限制' || return 0
+        if ! edge_cf_ready; then edge_fetch_assets; cf=true; fi
+    fi
+    begin_tx
+    [[ $cf != true ]] || edge_install_assets
+    json_update --arg d "$domain" --argjson e "$([[ $choice == yes ]] && printf true || printf false)" '(.sites[]|select(.domain==$d)|.protection.origin)=$e'
+    apply_web_config; commit_tx
+}
+edge_aop_probe() {
+    local domain=${1:-} token result
+    if [[ -z $domain ]]; then edge_site domain; fi
+    token=$(get '.edge.probe // ""'); [[ $token =~ ^[a-f0-9]{32}$ ]] || die '请先设置AOP观察模式。'
+    info "通过公网域名验证 $domain 的实际回源客户端证书；不显示源站IP。"
+    result=$(curl --noproxy '*' -fsS --connect-timeout 10 --max-time 20 -H 'Cache-Control: no-cache' "https://$domain/.well-known/vpskit-aop-$token?check=$(randhex 8)") || die '回源验证请求失败，请检查橙云、SSL模式、WAF及AOP设置。'
+    [[ $result == SUCCESS ]] || die "未确认有效AOP客户端证书（期望SUCCESS）；请在Cloudflare启用Global AOP后重试。"
+    ok '本次公网回源已提供可验证的客户端证书。'
+}
+edge_aop() {
+    local domain site mode
+    ensure_component nginx; edge_site domain; site=$(edge_get_site "$domain")
+    info '公共AOP验证请求来自Cloudflare网络，不专属于你的账户；账户级保护需另行配置自有回源证书。'
+    ask_valid mode 'AOP：off关闭 / observe观察（建议先选） / enforce强制' "$(jq -r '.protection.aop // "off"' <<< "$site")" valid_choice '请选择off、observe或enforce。' 'off observe enforce'
+    if [[ $mode != off ]]; then
+        [[ $(jq -r '.access // "direct"' <<< "$site") == cloudflare && $(jq -r .issued <<< "$site") == true ]] || die 'AOP需要Cloudflare访问方式和已签发的HTTPS网站。'
+        if [[ $mode == enforce && $(jq -r '.protection.aop // "off"' <<< "$site") != enforce ]]; then
+            [[ $(jq -r '.protection.aop // "off"' <<< "$site") == observe ]] || die '请先启用observe，再在Cloudflare开启Global AOP，验证后才能切换enforce。'
+            edge_aop_probe "$domain"
+            confirm '本次回源验证通过；缺少有效客户端证书的HTTPS请求将被拒绝，启用强制模式' || return 0
+        fi
+        edge_fetch_assets
+    fi
+    begin_tx
+    if [[ $mode != off ]]; then
+        edge_install_assets
+        if [[ ! $(get '.edge.probe // ""') =~ ^[a-f0-9]{32}$ ]]; then json_update --arg p "$(randhex 16)" '.edge.probe=$p'; fi
+    fi
+    json_update --arg d "$domain" --arg a "$mode" '(.sites[]|select(.domain==$d)|.protection.aop)=$a'
+    apply_web_config
+    if [[ $mode == enforce ]]; then edge_aop_probe "$domain"; fi
+    commit_tx
+    if [[ $mode == observe ]]; then info '观察模式已启用：现在去Cloudflare开启Global AOP，再用菜单“验证回源”检查；未提供证书的请求暂时允许。'; fi
+}
+edge_reset() {
+    local domain
+    ensure_component nginx; edge_site domain
+    confirm "关闭 $domain 的新增爬虫/网站限额/静态缓存/回源限制/AOP（节点及网站文件保留）" || return 0
+    begin_tx; json_update --arg d "$domain" '(.sites[]|select(.domain==$d)) |= del(.protection)'
+    apply_web_config; commit_tx
+    info '此网站增强设置已关闭；全局gzip和你在Cloudflare控制台设置的规则需分别调整。'
+}
+edge_status() {
+    panel_title '方案B · 网站防护与流量'
+    jq -r '.sites[] | (.protection // {}) as $p | "\(.domain) [\(.access // "direct")]\n  爬虫=\($p.bots // "off")；网站请求=\($p.rate // 0)r/s；突发=\($p.burst // 30)；并发=\($p.connections // 0)；每响应=\($p.kbps // 0)KiB/s\n  静态缓存=\($p.static_ttl // 0)s；站点gzip=\($p.gzip // false)；仅CF回源=\($p.origin // false)；AOP=\($p.aop // "off")"' "$STATE"
+    printf '  全局静态gzip=%s；网站限额0表示关闭；WS/ACME不套用网站限额。\n' "$(get '.performance.gzip // false')"
+    if [[ -f $ROOT/config/edge/updated.epoch ]]; then
+        local stamp; read -r stamp < "$ROOT/config/edge/updated.epoch"
+        if [[ $stamp =~ ^[0-9]{1,12}$ ]]; then printf '  CF资料更新于：%s；已有小时维护任务每7天尝试刷新，失败保留旧版。\n' "$(date -d "@$stamp" '+%F %T')"; fi
+    fi
+    printf '  Nginx状态：%s；未知Host或普通HTTP访问WS路径返回404；不保证流量无法被识别。\n' "$(service_caption nginx)"
+}
+edge_traffic() {
+    panel_title '网卡实际流量 · 采样约1秒（不下载测速文件）'
+    local first="$WORK/net-before" second="$WORK/net-after"
+    cat /proc/net/dev > "$first"; sleep 1; cat /proc/net/dev > "$second"
+    awk 'NR==FNR{gsub(":"," "); if(NF==17){rx[$1]=$2;tx[$1]=$10} next}
+      {gsub(":"," "); if(NF==17 && $1!="lo" && ($1 in rx)){printf "  %s: 入站 %.1f KiB/s / 出站 %.1f KiB/s；累计接收 %.2f GiB / 发送 %.2f GiB\n",$1,($2-rx[$1])/1024,($10-tx[$1])/1024,$2/1073741824,$10/1073741824}}' "$first" "$second"
+    printf '计数来自网卡，可能包含虚拟接口重复流量；不是月度账单，不代表线路最大带宽。\n'
+}
+edge_guide() {
+    local domain paths probe
+    edge_site domain
+    paths=$(jq -r --arg d "$domain" '[.nodes[]|select(.domain==$d and .mode=="ws" and .enabled)|.path]|unique|map("\""+.+"\"")|join(" ")' "$STATE")
+    probe=$(get '.edge.probe // ""')
+    if [[ $probe =~ ^[a-f0-9]{32}$ ]]; then paths+=" \"/.well-known/vpskit-aop-$probe\""; fi
+    printf '\nCloudflare控制台配置指引 · %s\n' "$domain"
+    cat <<'GUIDE'
+1. 域名橙云 + Full (strict) + WebSockets。使用自己的正常网站内容。
+2. 优先在Cloudflare边缘拦截爬虫，节省回源带宽；可用AI机器人策略取决于当前控制台选项。
+3. 以下“网站范围”表达式可用于自定义拦截/限流规则的作用范围，再叠加你需要的条件。
+   不要把此范围表达式单独设为Block，否则会封禁正常网站访问。
+GUIDE
+    printf '  (http.host eq "%s" and not starts_with(http.request.uri.path, "/.well-known/acme-challenge/")' "$domain"
+    [[ -z $paths ]] || printf ' and not http.request.uri.path in {%s}' "$paths"
+    printf ')\n'
+    cat <<'GUIDE'
+4. 普通访问应看到网站；为WS路径单独设置缓存Bypass，并避免JS挑战/CAPTCHA。
+   若套餐支持，跳过仅会误伤代理的限流/机器人规则；不要给任意Upgrade头全站放行。
+   免费Bot Fight Mode不能通过普通Skip规则豁免，不建议在共用代理域名上盲目启用。
+5. 静态CSS/JS/图片/字体尊重源站缓存头；不要对登录页、API或整个域名使用Cache Everything。
+6. 先检查网站与客户端，再启用本机“仅CF回源”；AOP先observe，在控制台开启Global AOP，验证后enforce。
+7. 网段限制和公共AOP只识别Cloudflare网络，不绑定你的账户。DNS历史、其他直连服务仍可能泄露源站。
+控制台规则不会由本脚本自动发布；DNS签发Token不被挪作WAF管理凭据。修改/停用WS节点后请同步更新边缘路径规则。
+GUIDE
+}
+edge_menu() {
+    local choice
+    while [[ -f $STATE ]]; do
+        edge_status
+        menu_item 1 '应用均衡预设' '网站AI爬虫拦截、5r/s限流、并发20、静态缓存和gzip；不自动锁回源'
+        menu_item 2 '爬虫策略' '关闭 / AI / AI+采集器 / 广泛爬虫；强策略会影响SEO'
+        menu_item 3 '网站请求、并发与下载限额' '按访客IP调整；WS和ACME不使用网站限额'
+        menu_item 4 '静态缓存与压缩' '减少重复回源；不强制缓存HTML、动态页面或代理流量'
+        menu_item 5 '限制Cloudflare回源' '仅所选网站/WS；Nginx层限制，源站IP直连将失败'
+        menu_item 6 'AOP回源认证' '关闭 / 观察 / 强制；先配置Cloudflare，再验证后强制'
+        menu_item 7 '验证AOP实际回源' '通过公网HTTPS确认本次回源证书验证为SUCCESS'
+        menu_item 8 '刷新Cloudflare网段与CA' '只下载官方资料；校验后重载，失败保留旧配置'
+        menu_item 9 'Cloudflare边缘配置指引' '输出网站规则范围、WS缓存旁路与防误伤说明'
+        menu_item 10 '网卡流量' '查看实际收发和约1秒速率；不消耗大量流量测速'
+        menu_item 11 '关闭所选网站的增强设置' '保留网站、节点；Cloudflare控制台规则需单独关闭'
+        menu_item 0 '返回' '回到主菜单'
+        ask choice '选择编号' 0
+        case "$choice" in 1) menu_run edge_profile;; 2) menu_run edge_bots;; 3) menu_run edge_limits;; 4) menu_run edge_cache;; 5) menu_run edge_origin;; 6) menu_run edge_aop;; 7) menu_run edge_aop_probe;; 8) menu_run edge_refresh;; 9) menu_run edge_guide;; 10) menu_run edge_traffic;; 11) menu_run edge_reset;; 0) return;; *) warn '无效选择。';; esac
+    done
+}
+edge_action() {
+    case "$1" in status|profile|bots|limits|cache|origin|aop|refresh|guide|traffic|reset) "edge_$1";; probe) edge_aop_probe;; *) die '用法：vpskit edge status|profile|bots|limits|cache|origin|aop|probe|refresh|guide|traffic|reset';; esac
+}
+
 apply_config() {
     validate_state
     local xc="$ROOT/config/xray.next.json" nc="$ROOT/config/nginx.next.conf" count
@@ -2052,6 +2448,7 @@ service_action() {
 }
 maintenance() {
     rotate_logs
+    edge_auto_refresh
     if [[ $(get .components.acme) == true ]]; then cert_renew; fi
 }
 # Reversible system-wide tuning. Kept outside generic configuration snapshots so
@@ -2602,6 +2999,7 @@ show_paths() {
     path_row 'Nginx日志' "$ROOT/logs/nginx.log"
     path_row '管理日志' "$ROOT/logs/manage.log"
     path_row '配置回滚快照' "$ROOT/backup/last"
+    path_row '方案B回源网段、公共AOP CA与更新时间' "$ROOT/config/edge"
     path_row 'Swap文件' "$ROOT/swap/swapfile"
     path_row 'Swap归属与阶段记录' "$ROOT/data/swap.json"
     if command -v systemd-escape >/dev/null; then path_row 'Swap开机服务' "$SYSTEMD/$(swap_unit_name)"; fi
@@ -2641,6 +3039,8 @@ VPSKit 单文件管理器
   sudo vpskit paths                    查看配置、证书、日志、服务等路径
   sudo vpskit firewall                 防火墙管理菜单
   sudo vpskit firewall status|open|close|sync|cleanup
+  sudo vpskit edge                     方案B防护与流量菜单
+  sudo vpskit edge status|profile|bots|limits|cache|origin|aop|probe|refresh|guide|traffic|reset
   sudo vpskit swap                     Swap虚拟内存菜单
   sudo vpskit swap status|enable|custom|remove
   sudo vpskit status|doctor|repair
@@ -2688,6 +3088,10 @@ panel_header() {
     status_badge "$D_TIMER"; printf '\n'
     printf '  %s内存 %s | 磁盘 %s%s\n' "$DIM" "$memory" "$disk" "$RESET"
     printf '  Swap：'; status_badge "$(swap_caption)"; printf '\n'
+    printf '  网站防护：爬虫策略%s个 / 仅CF回源%s个 / AOP强制%s个（菜单12管理）\n' \
+        "$(get '[.sites[]|select((.protection.bots // "off")!="off")]|length')" \
+        "$(get '[.sites[]|select(.protection.origin==true)]|length')" \
+        "$(get '[.sites[]|select(.protection.aop=="enforce")]|length')"
     if ((D_CERT_DUE>0)); then printf '  %s提醒：%s张证书不足14天，请检查续期。%s\n' "$YELLOW" "$D_CERT_DUE" "$RESET"; fi
     last=$(get '.wizard.last_step // ""')
     if [[ -n $last ]]; then printf '  上次步骤：%s / ' "$last"; status_badge "$(get '.wizard.last_result // ""')"; printf '\n'; fi
@@ -2885,12 +3289,13 @@ main_menu() {
         menu_item 9 '配置文件与目录' '查看Xray、Nginx、证书、日志与网站路径'
         menu_item 10 '防火墙端口管理' 'UFW / firewalld状态、端口开闭和所需端口放行'
         menu_item 11 'Swap虚拟内存' '一键添加1024MiB磁盘Swap，重启保留；支持状态、自定义容量和安全移除'
+        menu_item 12 '方案B防护与流量' '爬虫策略、网站限流、静态缓存、Cloudflare回源与AOP认证'
         menu_item 0 '退出' '后台代理、网站和自动续期继续运行'
         ask choice '请选择数字' 0
         case "$choice" in
             1) component_menu install;; 2) node_menu;; 3) site_menu;; 4) optimize_menu;;
             5) component_menu update;; 6) operations_menu;; 7) component_menu uninstall;;
-            8) menu_run show_help;; 9) menu_run show_paths;; 10) firewall_menu;; 11) swap_menu;; 0) return;; *) warn '无效选择，请输入菜单编号。';;
+            8) menu_run show_help;; 9) menu_run show_paths;; 10) firewall_menu;; 11) swap_menu;; 12) edge_menu;; 0) return;; *) warn '无效选择，请输入菜单编号。';;
         esac
     done
 }
@@ -2964,6 +3369,7 @@ main() {
         firewall) if [[ -z ${2:-} ]]; then PANEL_IDLE=1; HAVE_LOCK=0; flock -u "$LOCK_FD"; firewall_menu; else firewall_action "$2"; fi;;
         optimize) if [[ -z ${2:-} ]]; then PANEL_IDLE=1; HAVE_LOCK=0; flock -u "$LOCK_FD"; optimize_menu; else optimize_action "$2"; fi;;
         swap) if [[ -z ${2:-} ]]; then PANEL_IDLE=1; HAVE_LOCK=0; flock -u "$LOCK_FD"; swap_menu; else swap_action "$2"; fi;;
+        edge) if [[ -z ${2:-} ]]; then PANEL_IDLE=1; HAVE_LOCK=0; flock -u "$LOCK_FD"; edge_menu; else edge_action "$2"; fi;;
         maintenance) maintenance;;
         *) help_text; die '未知命令。';;
     esac
