@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # VPSKIT_SINGLE_FILE
-# VPSKIT_FEATURE_LEVEL=2
+# VPSKIT_FEATURE_LEVEL=3
 # VPSKIT_STATE_SCHEMA=1
-# VPSKit 1.7.0-enhanced — complete, standalone manager; not an upstream release.
+# VPSKit 1.7.1-panel — full colored menu edition; independent enhanced release.
 # Based on the public VPSKit 1.6.0 data model and deployment layout.
 # MIT License — Copyright (c) 2026 VPSKit contributors.
 # Run: sudo bash ./vpskit.sh ; help: bash ./vpskit.sh help
@@ -15,8 +15,8 @@ shopt -s inherit_errexit
 umask 077
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export LC_ALL=C
-VERSION='1.7.0-enhanced'
-FEATURE_LEVEL=2
+VERSION='1.7.1-panel'
+FEATURE_LEVEL=3
 ROOT='/opt/vpskit'
 STATE="$ROOT/data/state.json"
 ENTRY='/usr/local/bin/vpskit'
@@ -31,38 +31,12 @@ WORK='' LOCK_FD='' TTY_FD='' TX=0 LOGFILE='' BOOTSTRAP_DIR=''
 HISTORY_KEEP=20
 UNITS=(vpskit-xray.service vpskit-nginx.service vpskit-maintain.service vpskit-maintain.timer)
 
-log() {
-    local level=$1; shift
-    printf '[%s] %s\n' "$level" "$*" >&2
-    if [[ -n $LOGFILE && -d ${LOGFILE%/*} ]]; then
-        printf '[%s] [%s] %s\n' "$(date -u '+%FT%TZ')" "$level" "$*" >> "$LOGFILE"
-    fi
-}
 info() { log INFO "$@"; }
 warn() { log WARN "$@"; }
 ok() { log OK "$@"; }
 die() { log ERROR "$@"; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "缺少命令 $1。"; }
 root_check() { (( EUID == 0 )) || die '请使用 sudo bash ./vpskit.sh 或 sudo vpskit。'; }
-ask() {
-    local ap_dest=$1 ap_label=$2 ap_default=${3:-} ap_reply
-    [[ -n $TTY_FD ]] || die '此操作需要交互终端；输入 :q 可取消。'
-    printf '%s' "$ap_label" >&2
-    [[ -z $ap_default ]] || printf ' [%s]' "$ap_default" >&2
-    printf ': ' >&2
-    IFS= read -r -u "$TTY_FD" ap_reply || die '输入已关闭。'
-    [[ $ap_reply != :q ]] || exit 130
-    printf -v "$ap_dest" '%s' "${ap_reply:-$ap_default}"
-}
-secret() {
-    local sp_dest=$1 sp_label=$2 sp_reply
-    [[ -n $TTY_FD ]] || die '凭据输入需要终端。'
-    printf '%s（不回显；:q取消）: ' "$sp_label" >&2
-    IFS= read -r -s -u "$TTY_FD" sp_reply || die '输入已关闭。'
-    printf '\n' >&2
-    [[ $sp_reply != :q ]] || exit 130
-    printf -v "$sp_dest" '%s' "$sp_reply"
-}
 confirm() { local cp_answer; ask cp_answer "$1；输入 yes 确认" no; [[ $cp_answer == yes ]]; }
 ask_valid() {
     local av_dest=$1 av_label=$2 av_default=$3 av_validator=$4 av_value
@@ -1049,7 +1023,7 @@ check_listener_ports() {
     while IFS= read -r port; do guard_port "$port" vpskit-xray.service; done < <(jq -r '[.nodes[]|select(.enabled)]|unique_by(.entry)[].port' "$STATE")
 }
 code_candidate_check() {
-    local file=$1 minimum=${2:-2}
+    local file=$1 minimum=${2:-$FEATURE_LEVEL}
     [[ -s $file && ! -L $file && $(stat -c %s "$file") -le 4194304 ]] || die '脚本文件为空、为链接或大于4MiB。'
     grep -Fq 'VPSKIT_SINGLE_FILE' "$file" || die '没有VPSKit单文件标识。'
     grep -Fxq '# VPSKIT_STATE_SCHEMA=1' "$file" || die '候选脚本不兼容当前配置结构。'
@@ -1295,19 +1269,6 @@ advanced_defaults() {
     json_update --argjson d "$(nginx_defaults)" '.advanced.nginx=$d | .advanced.xray={nofile:8192}'
     if component_ready nginx || component_ready xray; then apply_config; else migrate_state; fi
     commit_tx
-}
-advanced_edit() {
-    local key=${1:-} value workers connections nofile
-    if [[ -z $key || $key == capacity ]]; then
-        ask_valid workers 'Worker数量（auto或1～64；小内存推荐1）' "$(ng_value workers)" valid_worker_count
-        ask_valid connections '每个Worker连接上限（128～65535）' "$(ng_value connections)" number 128 65535
-        ask_valid nofile 'Nginx文件数上限（必须至少为连接数+1024）' "$(ng_value nofile)" number 2048 1048576
-        advanced_set nginx.workers "$workers" nginx.connections "$connections" nginx.nofile "$nofile"
-        return
-    fi
-    if [[ $key == xray.nofile ]]; then value=$(xray_nofile); else value=$(ng_value "${key#nginx.}"); fi
-    ask value "设置 $key（true/false用于开关；:q取消）" "$value"
-    advanced_set "$key" "$value"
 }
 site_list() { jq -r '.sites|to_entries[]|[(.key+1),.value.domain,(.value.kind // "custom"),(.value.access // "direct"),(.value.issued|tostring)]|@tsv' "$STATE"; }
 site_select() {
@@ -1566,7 +1527,8 @@ node_add() {
             [[ $private =~ ^[A-Za-z0-9_-]{43}$ && $public =~ ^[A-Za-z0-9_-]{43}$ ]] || die 'Xray x25519输出格式无法识别，未保存节点。'
             short=$(randhex 8);;
         ss) ask_valid method 'Shadowsocks算法' '2022-blake3-aes-128-gcm' choice 'aes-128-gcm aes-256-gcm chacha20-ietf-poly1305 2022-blake3-aes-128-gcm 2022-blake3-aes-256-gcm 2022-blake3-chacha20-poly1305';;
-        ws-plain) warn '此模式没有外层TLS，仅用于明确需要的可信部署；不建议暴露到不可信网络。';;
+        ws-plain) warn '此模式没有外层TLS，仅用于明确需要的可信部署；不建议暴露到不可信网络。'
+            ask_valid path 'WebSocket路径（至少8位，保留前导/）' "/$(randhex 12)" valid_path;;
     esac
     credential=$(node_credential "$protocol" "$method")
     item=$(jq -n --arg id "$id" --arg p "$protocol" --arg m "$mode" --arg h "$host" --arg d "$domain" --argjson port "$port" --arg path "$path" --arg method "$method" --arg c "$credential" --arg l "$listen" --arg t "$target" --arg s "$sni" --arg pk "$private" --arg pub "$public" --arg sid "$short" --arg hv "$http_version" '{id:$id,entry:$id,protocol:$p,mode:$m,host:$h,domain:$d,port:$port,path:$path,method:$method,credential:$c,listen:$l,target:$t,sni:$s,privateKey:$pk,publicKey:$pub,shortId:$sid,http_version:$hv,enabled:true}')
@@ -1667,35 +1629,6 @@ edge_show() {
     printf '%s\n' "$d"; edge_settings "$s" | jq .
     info '请求频率/连接/速度/爬虫限制仅作用于网站内容；不套用到WS/XHTTP节点或HTTP-01。'
 }
-edge_set() {
-    local domain=$1 key=$2 value=$3 probe
-    site_select domain "$domain"
-    case "$key" in
-        bots) choice "$value" 'off ai common all' || die 'bots: off/ai/common/all。';;
-        aop) choice "$value" 'off observe enforce' || die 'aop: off/observe/enforce。';;
-        gzip|origin) valid_bool "$value" || die '开关应为true/false。';;
-        rate) number "$value" 0 100 || die 'rate:0～100。';;
-        burst) number "$value" 1 200 || die 'burst:1～200。';;
-        connections) number "$value" 0 200 || die 'connections:0～200。';;
-        kbps) number "$value" 0 10240 || die 'kbps:0～10240。';;
-        static_ttl) number "$value" 0 604800 || die 'static_ttl:0～604800。';;
-        *) die '不支持的网站防护参数。';;
-    esac
-    if [[ $key == aop && $value == enforce ]]; then
-        warn '强制AOP前必须在Cloudflare启用Authenticated Origin Pulls，并先用observe模式测试。误配会导致网站/节点525或403。'
-    fi
-    if [[ $key == origin && $value == true ]]; then warn '开启后此站点只接受已知Cloudflare网段，直连该站点会返回403。'; fi
-    if [[ $key == aop && $value != off && ! -s $ROOT/config/edge/aop-ca.pem ]] || { cf_needed && ! cf_ready; }; then cf_fetch; fi
-    confirm "设置 $domain：$key=$value" || return 0
-    begin_tx "edge:$domain:$key"
-    [[ ! -d $WORK/edge ]] || cf_install_assets
-    probe=$(get '.edge.probe // ""'); [[ -n $probe ]] || json_update --arg p "$(randhex 16)" '.edge.probe=$p'
-    case "$key" in
-        bots|aop) json_update --arg d "$domain" --arg k "$key" --arg v "$value" '(.sites[]|select(.domain==$d)).protection[$k]=$v';;
-        *) json_update --arg d "$domain" --arg k "$key" --argjson v "$value" '(.sites[]|select(.domain==$d)).protection[$k]=$v';;
-    esac
-    apply_config web; commit_tx
-}
 edge_refresh() {
     cf_fetch
     begin_tx edge-refresh; cf_install_assets
@@ -1786,32 +1719,6 @@ doctor() {
     printf '\n当前拥塞控制：\n'; sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc 2>/dev/null || true
     ok '上述本机检查完成；不等于外网连通性、CDN回源或实际吞吐测试通过。'
 }
-paths_show() {
-    cat <<EOF
-管理代码：$ROOT/vpskit.sh
-快捷命令：$ENTRY
-持久配置：$STATE（包含凭据，禁止公开）
-Nginx生成配置：$ROOT/config/nginx.conf
-Xray生成配置：$ROOT/config/xray.json
-网站文件：$ROOT/www/<domain>/
-证书/私钥：$ROOT/certs/<domain>/current/
-ACME账户与DNS凭据：$ROOT/acme/config/
-历史快照：$ROOT/backup/history/（最近$HISTORY_KEEP份）
-最近事务回滚：$ROOT/backup/last/
-代码备份：$ROOT/backup/code/
-服务文件：$SYSTEMD/vpskit-*.service / vpskit-maintain.timer
-日志：$ROOT/logs/
-不要直接编辑自动生成的Nginx/Xray配置；使用高级配置和节点/网站菜单。
-EOF
-}
-logs_show() {
-    local name=${1:-nginx} lines=${2:-100} file
-    number "$lines" 1 2000 || die '日志行数应为1～2000。'
-    case "$name" in nginx) file=nginx.log;; xray) file=xray.log;; manager) file=manage.log;; service) file=nginx-service.log;; access) file=access.log;; *) die '日志类型：nginx/xray/manager/service/access。';; esac
-    [[ -f $ROOT/logs/$file && ! -L $ROOT/logs/$file ]] || { info '日志文件尚不存在。'; return; }
-    warn '日志可能包含IP、路径或上游错误信息；分享前请脱敏。'
-    tail -n "$lines" "$ROOT/logs/$file"
-}
 service_action() {
     local name=$1 action=$2
     choice "$name" 'nginx xray' && choice "$action" 'start stop restart' || die '服务操作无效。'
@@ -1821,61 +1728,12 @@ service_action() {
     systemctl "$action" "vpskit-$name.service"
     if [[ $action != stop ]]; then systemctl is-active --quiet "vpskit-$name.service" || die '服务未运行。'; fi
 }
-firewall_show() {
-    printf '本工具不会自动启用/重置防火墙，不修改SSH规则。\n'
-    if command -v ufw >/dev/null; then ufw status verbose; fi
-    if command -v nft >/dev/null; then nft list ruleset; elif command -v iptables >/dev/null; then iptables -S; fi
-    printf '\n本工具需要的公网端口（云厂商安全组仍需单独放行）：\n'
-    if component_ready nginx; then printf '80/tcp 443/tcp\n'; fi
-    jq -r '[.nodes[]|select(.enabled and .mode!="ws" and .mode!="xhttp")]|unique_by(.entry)[]|"\(.port)/tcp"+(if .mode=="ss" then " \(.port)/udp" else "" end)' "$STATE"
-}
-firewall_allow() {
-    local port=${1:-} proto=${2:-tcp}
-    need ufw
-    [[ -n $port ]] || ask_valid port '要添加的UFW放行端口' '' valid_port
-    valid_port "$port" && choice "$proto" 'tcp udp' || die '端口/协议无效。'
-    confirm "仅添加UFW allow $port/$proto，不启用或重置UFW" || return 0
-    ufw allow "$port/$proto" comment VPSKit
-}
-swap_show() { free -h; swapon --show; }
-swap_create() {
-    local size=${1:-} file=/var/lib/vpskit/swapfile available needed fstype
-    [[ -n $size ]] || ask_valid size 'Swap容量MiB（256～8192）' 1024 number 256 8192
-    number "$size" 256 8192 || die 'Swap容量超出范围。'
-    [[ ! -e /var/lib/vpskit && ! -L /var/lib/vpskit ]] || {
-        [[ -d /var/lib/vpskit && ! -L /var/lib/vpskit && -f /var/lib/vpskit/.owned ]] || die 'Swap目录被外部程序占用。'
-    }
-    [[ ! -e $file && ! -L $file ]] || die '已存在本工具Swap，不会反复创建或覆盖。'
-    fstype=$(stat -f -c %T /var/lib)
-    case "$fstype" in ext2/ext3|xfs) ;; *) die "当前文件系统${fstype}不在此简化Swap流程支持范围（ext4/XFS），请手工管理。";; esac
-    available=$(df -Pk /var/lib | awk 'NR==2{print $4}'); needed=$((size*1024+262144))
-    ((available>needed)) || die '磁盘空间不足（预留256MiB）。'
-    [[ -f /etc/fstab && ! -L /etc/fstab ]] || die '/etc/fstab必须为普通文件。'
-    confirm "创建${size}MiB Swap并添加一条带标识的fstab记录；不会变更已有Swap" || return 0
-    mkdir -p /var/lib/vpskit; chmod 700 /var/lib/vpskit; printf VPSKIT_SWAP > /var/lib/vpskit/.owned
-    if ! dd if=/dev/zero of="$file" bs=1M count="$size" status=none; then rm -f "$file"; die 'Swap文件分配失败。'; fi
-    chmod 600 "$file"
-    if ! mkswap "$file" || ! swapon "$file"; then rm -f "$file"; die 'Swap激活失败，已删除本次文件。'; fi
-    mkdir -p "$ROOT/backup/system"; cp -a /etc/fstab "$ROOT/backup/system/fstab-before-swap-$(date +%s)"
-    if ! grep -Fq "$file " /etc/fstab; then printf '%s none swap sw 0 0 # VPSKIT_SWAP\n' "$file" >> /etc/fstab; fi
-    ok 'Swap已启用；现有Swap未修改。'
-}
-swap_remove() {
-    local file=/var/lib/vpskit/swapfile
-    [[ -f /var/lib/vpskit/.owned && $(cat /var/lib/vpskit/.owned) == VPSKIT_SWAP && ! -L /var/lib/vpskit && -f $file && ! -L $file ]] || die '没有可验证的本工具Swap。'
-    confirm '关闭并删除本工具Swap；内存不足时swapoff可能失败，不处理其他Swap' || return 0
-    if swapon --noheadings --raw --show=NAME | grep -Fxq "$file"; then swapoff "$file" || die 'swapoff失败，文件及启动配置保持不变。'; fi
-    mkdir -p "$ROOT/backup/system"; cp -a /etc/fstab "$ROOT/backup/system/fstab-before-swap-remove-$(date +%s)"
-    sed -i '\|^/var/lib/vpskit/swapfile .*# VPSKIT_SWAP$|d' /etc/fstab
-    rm -f "$file" /var/lib/vpskit/.owned; rmdir /var/lib/vpskit || true
-    ok '只删除了本工具Swap。'
-}
 uninstall_keep_data() {
     local u
     warn '卸载只停止/删除本工具服务与命令入口。配置、证书、网站、代码、备份、Swap和防火墙规则全部保留。'
     confirm '执行保留数据的卸载' || return 0
     for u in "${UNITS[@]}"; do
-        if [[ -f $SYSTEMD/$u ]] && grep -Fq '# VPSKIT_OWNED' "$SYSTEMD/$u"; then systemctl disable --now "$u" || true; rm -f "$SYSTEMD/$u"; fi
+        if [[ -f $SYSTEMD/$u ]] && grep -Fq '# VPSKIT_OWNED' "$SYSTEMD/$u"; then systemctl disable --now "$u" || die "停用 $u 失败，保留该服务文件和全部资料。"; rm -f "$SYSTEMD/$u"; fi
     done
     [[ ! -L $ENTRY || $(readlink "$ENTRY") != "$ROOT/vpskit.sh" ]] || rm -f "$ENTRY"
     systemctl daemon-reload
@@ -1908,49 +1766,6 @@ legacy_restore_transaction() {
     fi
     ((failed==0))
 }
-usage() {
-    cat <<'EOF'
-VPSKit 1.7.0-enhanced 完整单文件管理器（非上游官方发布）
-用法：sudo bash ./vpskit.sh [命令]  /  sudo vpskit [命令]
-无参数进入面板。执行前建议先阅读随附README。
-
-  version | help | selftest                 无需root，不改变系统
-  install                                  新装或继续原部署（保留已填参数）
-  install xray|nginx|acme [Xray版本]         单独补装，不重复安装已有组件
-  apply                                    按现有state重新生成、检查并应用
-  status | doctor | paths                  状态、检查、文件位置
-  node list|add|share|export|client [名称]    节点、共享用户、客户端配置
-  node enable|disable|delete|rotate 名称
-  node rename|port|host 名称 [值]           改名、入口端口、连接地址
-  site list|add|edit|remove [域名]           网站配置，不覆盖网站内容
-  cert issue [域名] | cert status | cert renew
-  cert import 域名 /证书路径 /私钥路径
-  advanced show | advanced edit [键] | advanced defaults
-  advanced set nginx.workers 2 nginx.connections 2048 nginx.nofile 8192
-  advanced set nginx.worker_user auto
-  advanced set xray.nofile 16384
-  history list | history save [备注]
-  history restore [快照ID] [full|state|advanced]
-  rollback | repair                        最近事务回滚 / 恢复中断事务
-  update manager [/新版脚本.sh|HTTPS地址] [独立确认的SHA256]
-  update nginx|xray|acme [Xray版本]          组件更新，与代码更新分离
-  edge show [域名] | edge edit | edge refresh
-  edge set 域名 bots|rate|burst|connections|kbps|static_ttl|gzip|origin|aop 值
-  performance gzip [true|false]
-  service nginx|xray start|stop|restart
-  logs [nginx|xray|manager|service|access] [行数]
-  firewall status | firewall allow [端口] [tcp|udp]
-  swap status | swap create [MiB] | swap remove
-  maintenance                              定时证书/日志维护
-  uninstall                                卸载服务，保留所有数据
-
-示例：先 sudo bash ./vpskit.sh update manager ./vpskit.sh 仅换代码；
-再 sudo vpskit apply 明确应用降权与参数，不把代码更新当成部署重做。
-Xray默认版本固定为v26.3.27；update xray latest为显式选择最新版。
-原版1.6.0远程文件不含增强标识，拒绝用它覆盖本版；可上传本版到自己的仓库。
-端口/凭据/证书均保存在/opt/vpskit/data/state.json及私有目录。
-EOF
-}
 selftest() {
     valid_domain example.com && ! valid_domain 'a;evil.com' && ! valid_domain '../example.com'
     valid_host 127.0.0.1 && valid_host ::1 && ! valid_host 999.1.1.1 && ! valid_host 1::2::3
@@ -1962,106 +1777,1210 @@ selftest() {
     if command -v jq >/dev/null; then nginx_defaults | jq -e '.workers==1 and .connections==1024 and .worker_user=="auto"' >/dev/null; fi
     printf '内置纯校验自检通过；未安装组件、未变更系统。\n'
 }
-menu_run() {
-    local rc answer
-    # Each command runs in a child with its own lock and errexit scope. Testing
-    # a mutating function in `if fn` would disable Bash errexit inside that fn.
-    set +e
-    bash "$SELF" "$@"
-    rc=$?
-    set -e
-    printf '\n操作退出码：%s\n' "$rc"
-    ask answer '回车返回面板（:q退出）' ''
+
+
+# The menu is a single registry: every visible item has a purpose, requirement,
+# risk badge and an explicit dispatch route. No eval and no command strings.
+menu_catalog() {
+    cat <<'VPSKIT_MENU_CATALOG'
+main|1|部署与安装|新装、继续历史部署或单独安装组件|Debian/Ubuntu、root；下载组件需联网|nav|menu:install
+main|2|节点与用户|新增、共享用户、改端口/地址、启停和导出|已安装 Xray；TLS 类节点还需域名与证书|nav|menu:nodes
+main|3|网站与证书|网站内容、反向代理、跳转、签发与导入证书|网站需要 Nginx；自动证书还需 ACME|nav|menu:websites
+main|4|网络与网站优化|BBR、MTU 探测、网站 gzip 和资源状态|内核调优需支持；MTU 只探测不改网卡|nav|menu:optimize
+main|5|组件更新|独立更新 Nginx、Xray、ACME 或全部组件|需联网；组件变更可能重启相关服务|nav|menu:update
+main|6|状态、日志与维护|运行状态、诊断、日志、服务启停及应用配置|诊断结果是本机视角；日志分享前脱敏|nav|menu:status
+main|7|卸载管理|保留数据停用、卸载单个组件或完整清理|删除前先备份；危险操作须二次确认|danger|menu:uninstall
+main|8|方案说明与命令帮助|查看方案 A/B、命令及使用流程|只读；无需先完成部署|nav|menu:help
+main|9|配置文件与目录|显示配置、网站、证书、日志和备份位置|只显示路径，不显示 UUID、密码或私钥|read|paths
+main|10|防火墙端口管理|查看、开放、关闭、同步和撤销托管规则|仅操作已启用的 UFW 或 firewalld；保护 SSH|nav|menu:firewall
+main|11|Swap 虚拟内存|创建、恢复、查看和安全移除本工具 Swap|需磁盘空间及内核支持；不接管系统 Swap|nav|menu:swap
+main|12|方案 B 防护与流量|爬虫、网站限流、缓存、Cloudflare 与 AOP|先确保网站可用；回源限制需正确配置橙云|nav|menu:edge
+main|13|高级配置 · Nginx / Xray|Worker、连接容量、文件数、TLS 和超时|保留现有节点；部分参数变更需要重启|nav|menu:advanced
+main|14|历史配置和恢复|创建快照、恢复配置、回滚和中断恢复|快照含敏感资料；不等于整机或网站文件备份|nav|menu:history
+main|15|仅更新管理脚本|只替换管理代码，不更新组件或重启服务|提供可信的完整脚本或 HTTPS 源码地址|write|update-manager
+install|1|继续部署向导|自动读取已保存参数，跳过已完成步骤|新机或未完成部署；需要联网|write|install-wizard
+install|2|单独安装 Nginx|安装独立 Nginx，自动复用非 root 服务账户|需要软件源可用；不接管外部 Nginx|write|install-nginx
+install|3|单独安装 Xray|补装代理组件，不覆盖已保存节点|需 GitHub 可达；已安装时不重复安装|write|install-xray
+install|4|单独安装 ACME|补装证书工具，保留账户及续期资料|需联网；安装不等于已经签发证书|write|install-acme
+install|5|修改方案与默认值|保存方案 A/B 和新建节点的默认连接地址|不自动改动已有节点、证书或网站|write|wizard-configure
+install|6|查看部署进度|查看向导停在哪一步及已安装组件|只读；不重做任何部署步骤|read|wizard-status
+nodes|1|查看节点列表|显示序号、名称、协议、入口和启用状态|只读；不显示访问凭据|read|node-list
+nodes|2|新增节点|添加 REALITY、XHTTP、WS、TLS 或 Shadowsocks|Xray 已安装；所选传输需满足域名/证书条件|write|node-add
+nodes|3|添加共享入口用户|复用同一监听端口，生成独立用户凭据|已有支持共享的入口；不新增公网端口|write|node-share
+nodes|4|启用节点|让保存的节点重新参与运行配置|需端口可用；客户端与防火墙需匹配|write|node-enable
+nodes|5|停用节点|保留节点资料，停止该用户的访问|该用户连接可能中断；其他共享用户保留|warn|node-disable
+nodes|6|删除节点|删除选中用户的节点记录|删除不可直接撤销；可从历史快照恢复|danger|node-delete
+nodes|7|自动轮换凭据|重新生成 UUID 或密码|客户端必须更新；现有连接可能中断|warn|node-rotate
+nodes|8|导出分享链接|输出可导入客户端的节点 URI|链接含访问凭据，禁止公开发布|sensitive|node-export
+nodes|9|导出 XHTTP 客户端 JSON|生成本地 SOCKS 的 Xray 客户端配置|仅 XHTTP 节点；JSON 含 UUID|sensitive|node-client
+nodes|10|修改节点名称|修改用户显示名称，保留共享入口关系|名称须唯一；不会轮换访问凭据|write|node-rename
+nodes|11|修改入口端口|同步修改整个共享入口的监听端口|同步客户端、防火墙和安全组；WS/XHTTP 仍走公网443|warn|node-port
+nodes|12|修改连接地址|修改客户端连接域名、IPv4 或 IPv6|保留 TLS SNI/Host；同入口用户同步修改|write|node-host
+nodes|13|指定 UUID 或密码|手动设置凭据，可留空自动生成|需符合协议格式；客户端必须同步更新|sensitive|node-credential
+nodes|14|修改监听地址|选择 IPv4、IPv6 或双栈监听入口|仅直连入口；WS/XHTTP 后端保持回环监听|warn|node-listen
+websites|1|查看网站列表|显示域名、内容类型、访问方式和证书状态|只读；不显示 DNS API 凭据|read|site-list
+websites|2|新增网站|创建模板、静态站、本机反代或 HTTPS 跳转|已安装 Nginx；需自有域名|write|site-add
+websites|3|修改网站内容与访问方式|编辑已有网站；保留内容文件和证书|不覆盖已存在模板；修改后检查依赖节点|write|site-edit
+websites|4|移除网站绑定|停止该域名网站和自动续期，保留文件|必须先删除引用该网站的节点|danger|site-remove
+websites|5|签发 / 重试证书|按已保存设置申请或重新签发证书|需 ACME；HTTP-01 需80可达，DNS-01 需 API权限|write|cert-issue
+websites|6|证书有效期|查看当前证书到期时间|只读；尚未签发会明确提示|read|cert-status
+websites|7|检查续期|按 ACME 到期策略检查，不强制重复签发|需联网；手动导入的证书不自动续期|write|cert-renew
+websites|8|修改证书验证设置|保存邮箱、HTTP/DNS 验证及泛域名选项|保存不立即重签；泛域名需要 DNS-01|write|cert-settings
+websites|9|导入证书与私钥|校验域名和密钥匹配后部署手动证书|提供本机 PEM 文件；暂停此域名 ACME 自动续期|sensitive|cert-import
+optimize|1|资源与网络现状|查看内存、连接、拥塞控制和网卡 MTU|只读；不会修改系统参数|read|optimize-status
+optimize|2|启用 BBR + fq|记录旧参数后启用内核拥塞控制|需内核提供 BBR；不保证提升所有链路性能|warn|optimize-bbr
+optimize|3|撤销本工具 BBR 设置|恢复本工具记录的旧值并移除其持久化文件|只撤销可验证的托管设置；不覆盖外部新改动|warn|optimize-restore
+optimize|4|MTU 路径探测|使用 tracepath 检查目标路径的 MTU|需 iputils-tracepath；只发送探测，不修改网卡|read|optimize-mtu
+optimize|5|静态网站 gzip|启停轻量文本压缩，不压缩节点代理流量|Nginx 已安装；站点单独设置可覆盖全局值|write|performance-gzip
+optimize|6|Nginx 容量设置|一起调整 Worker、连接数和文件数上限|需结合内存及并发；文件数至少为连接数+1024|write|advanced-capacity
+update|1|更新 Nginx|从发行版软件源更新独立二进制|需联网；可能重启 Nginx，网站连接可能中断|write|update-nginx
+update|2|更新 Xray|选择固定版本或显式 latest|需联网；重启会中断代理连接，先核对客户端兼容性|write|update-xray
+update|3|更新 ACME|更新证书工具，保留证书和账户资料|需联网；不会直接重新申请所有证书|write|update-acme
+update|4|仅更新管理代码|校验完整脚本后替换代码并备份旧版|不改 state.json、不升级组件、不重启服务|write|update-manager
+update|5|更新全部已安装组件|依次更新已安装的组件，再询问是否更新管理代码|逐组件提交；失败保留已完成更新，可能多次中断连接|warn|update-all
+status|1|查看运行状态|查看组件版本、服务状态和 Worker 身份|只读；不显示节点凭据|read|status
+status|2|本机诊断|检查配置语法、权限、监听和服务进程|不能代替公网、CDN 或吞吐验收|read|doctor
+status|3|Nginx 错误日志|显示最近 Nginx 错误记录|只读；分享前删除敏感地址与路径|read|logs-nginx
+status|4|Xray 日志|显示最近代理运行错误记录|只读；分享前脱敏|read|logs-xray
+status|5|管理操作日志|查看安装、更新与配置操作结果|只读；不会打印已保存密码或私钥|read|logs-manager
+status|6|证书与维护日志|查看定时续期服务的近期 journal 记录|需要 systemd journal；分享前脱敏|read|logs-cert
+status|7|Nginx 服务日志|查看启动服务的标准输出和错误|日志尚不存在时只提示，不新建文件|read|logs-service
+status|8|网站访问日志|显示高级配置中启用的访问日志|默认关闭；日志包含访客 IP 和访问路径|read|logs-access
+status|9|应用已保存配置|重新生成、验证并加载 Nginx/Xray 配置|首次降权或文件数变化可能重启服务|warn|apply
+status|10|服务启动 / 停止 / 重启|单独控制本工具的 Nginx 或 Xray|不操作系统其他同名软件实例|nav|menu:services
+status|11|DNS 与公网 HTTPS 检查|检查网站解析和公网响应，不修改 DNS|需网络；Cloudflare解析不必等于源站IP|read|network-check
+status|12|配置文件与目录|显示配置与资料保存位置|只显示路径；不要公开包含密钥的目录|read|paths
+services|1|启动 Nginx|仅控制 vpskit-nginx 服务|已安装对应组件；停止或重启会中断相关连接|write|service:nginx:start
+services|2|停止 Nginx|仅控制 vpskit-nginx 服务|已安装对应组件；停止或重启会中断相关连接|warn|service:nginx:stop
+services|3|重启 Nginx|仅控制 vpskit-nginx 服务|已安装对应组件；停止或重启会中断相关连接|warn|service:nginx:restart
+services|4|验证并重载 Nginx|仅控制 vpskit-nginx 服务|已安装对应组件；停止或重启会中断相关连接|write|service:nginx:reload
+services|5|启动 Xray|仅控制 vpskit-xray 服务|已安装对应组件；停止或重启会中断相关连接|write|service:xray:start
+services|6|停止 Xray|仅控制 vpskit-xray 服务|已安装对应组件；停止或重启会中断相关连接|warn|service:xray:stop
+services|7|重启 Xray|仅控制 vpskit-xray 服务|已安装对应组件；停止或重启会中断相关连接|warn|service:xray:restart
+uninstall|1|停用服务，保留数据|删除本工具服务与入口；网站、节点、证书、备份保留|不会删除 Swap/防火墙；以后可用完整脚本 apply 恢复|warn|uninstall-keep
+uninstall|2|单独卸载 Xray|删除代理节点和 Xray 程序，保留网站|所有代理用户断开；先导出需要保留的资料|danger|uninstall-xray
+uninstall|3|单独卸载 Nginx|移除独立 Nginx，保留其他资料|存在网站或 TLS 网关节点依赖时拒绝执行|danger|uninstall-nginx
+uninstall|4|单独卸载 ACME|删除自动证书工具及其账户资料|存在自动续期证书依赖时拒绝执行|danger|uninstall-acme
+uninstall|5|完整卸载 VPSKit|清理本工具资料、服务、已识别规则与 Swap|需输入删除口令；备份也会删除，未知外部资料不接管|danger|uninstall-all
+help|1|方案 A / B 说明|对比 REALITY 直连与网站 TLS/XHTTP|只读；帮助选择部署模式|read|explain
+help|2|完整命令帮助|查看命令、兼容别名及调用示例|只读；命令行与面板共用后端|read|help
+help|3|Cloudflare 配置指引|说明橙云、严格 TLS、缓存排除和 AOP|需要自行在 Cloudflare 控制台配置|read|edge-guide
+help|4|升级、恢复与安全说明|说明代码更新、配置应用、备份和权限边界|只读；历史快照不含网站内容和系统资源变更|read|workflow-help
+help|5|面板颜色与操作提示|查看颜色含义、返回/取消及无颜色模式|支持 NO_COLOR 和 --no-color；日志不带颜色控制符|read|color-help
+firewall|1|防火墙与所需端口|查看启用的管理器、规则和节点公网端口|只读；云安全组需另行检查|read|firewall-status
+firewall|2|开放端口|显式添加带归属记录的 TCP/UDP 放行规则|仅已启用的 UFW/firewalld；SSH 端口交给管理员|warn|firewall-open
+firewall|3|关闭端口|添加阻止新入站连接的规则|会影响相关业务；拒绝操作检测到的 SSH 端口|danger|firewall-close
+firewall|4|同步当前所需端口|预览后开放网站及启用节点需要的公网端口|不会开放本机后端端口；不会自动关闭旧端口|write|firewall-sync
+firewall|5|撤销本版托管规则|只撤销有本版归属记录、标识匹配的规则|外部规则和旧格式记录不盲目删除；可能改变可达性|danger|firewall-cleanup
+swap|1|Swap 状态|查看实际使用量、归属文件与启动配置|只读；不把磁盘交换区当成新增物理内存|read|swap-status
+swap|2|启用 / 恢复 1 GiB Swap|已有托管 Swap 则恢复，不重复分配|新建需 ext4/XFS 等支持、足够磁盘及内核权限|warn|swap-enable
+swap|3|自定义容量|创建 256–8192 MiB 的托管交换文件|256 的倍数；预留至少1GiB磁盘，不覆盖现有Swap|warn|swap-custom
+swap|4|安全移除本工具 Swap|先检查可用内存，再停用并删除交换文件|内存不足或 swapoff 失败时保留文件和启动配置|danger|swap-remove
+edge|1|查看网站防护|查看各站爬虫、限额、缓存及回源设置|只读；不显示节点凭据|read|edge-status
+edge|2|应用均衡预设|AI爬虫拦截、5请求/秒、20并发、1小时缓存与gzip|仅网站内容；不主动开启源站封锁或强制AOP|write|edge-profile
+edge|3|爬虫策略|选择 off、ai、common、all 的 UA 拦截|UA可伪造；all会影响搜索引擎、API及监控|warn|edge-bots
+edge|4|请求、并发和下载限额|调整请求频率、突发、并发及每响应速度|同出口IP共享额度；不是全机或代理用户带宽配额|write|edge-limits
+edge|5|静态缓存与 gzip|设置静态资源缓存头和站点压缩|不强制缓存HTML/动态应用/节点流量|write|edge-cache
+edge|6|限制 Cloudflare 回源|仅允许已验证的 Cloudflare 网段访问网站/网关|需要橙云；直连将被拒绝，ACME路径保留|warn|edge-origin
+edge|7|AOP 回源客户端证书|切换 off、observe、enforce|先观察并探测成功，再强制；误配会中断访问|warn|edge-aop
+edge|8|AOP 公网验证|通过公开域名检查本次回源是否为 SUCCESS|域名已走橙云；源站须有有效证书且启用observe|read|edge-probe
+edge|9|更新 Cloudflare 官方资料|刷新IPv4/IPv6网段与公共AOP CA|需联网；失败保留旧资料|write|edge-refresh
+edge|10|Cloudflare 配置指引|输出控制台设置和节点路径缓存排除原则|只提供指引，不自动修改外部账户|read|edge-guide
+edge|11|网卡流量采样|显示网卡累计流量和约1秒速率|为接口总流量，不是节点计费统计|read|edge-traffic
+edge|12|重置单站防护|关闭该站新增爬虫、限流、缓存及回源限制|不删除网站、节点或证书；需确认|warn|edge-reset
+edge|13|按字段编辑防护|逐项编辑单站点防护参数|适用于了解参数范围的用户；保存前验证|write|edge-edit
+advanced|1|查看保存值与实际值|显示合并默认值后的参数、CPU/内存及Worker身份|只读；连接上限不是用户人数|read|advanced-show
+advanced|2|Worker / 连接数 / 文件数|一起调整并发容量，防止参数互相冲突|低内存先用1个Worker；auto按CPU而不是内存|write|advanced-capacity
+advanced|3|选择非 root 服务账户|自动检测或手工选择已有合格服务账户|不创建用户；拒绝root及高权限/可交互登录账户|warn|advanced-user
+advanced|4|其他 Nginx 参数|按编号设置Keepalive、TLS、HTTP/2及超时|每项显示当前值、单位、范围和影响|nav|menu:nginxparams
+advanced|5|Xray 文件描述符上限|调整Xray的systemd LimitNOFILE|变更后需重启Xray，代理连接可能中断|warn|advanced-xray
+advanced|6|恢复高级默认值|只恢复Nginx/Xray高级参数|保留节点、证书和网站；可能重启相关服务|warn|advanced-defaults
+advanced|7|查看可复用服务账户|列出自动候选账户的UID及资格检查结果|只读；不会创建、删除或修改系统账户|read|advanced-users
+nginxparams|1|HTTP Keepalive|空闲HTTP连接保留时间|5–300 秒；影响普通HTTP复用，不是WS连接寿命|write|param:keepalive
+nginxparams|2|Keepalive 请求数|单连接最多处理的请求数|100–100000 次；过大不是无条件更快|write|param:keepalive_requests
+nginxparams|3|TLS 会话缓存|共享TLS会话缓存容量|1–128 MiB；修改后重载验证，按内存设置|write|param:ssl_cache
+nginxparams|4|TLS 会话复用时间|可复用TLS会话的有效时间|1–1440 分钟；不是HTTP连接超时|write|param:ssl_timeout
+nginxparams|5|HTTP/2 开关|控制网站是否启用HTTP/2|true/false；存在启用XHTTP时仍保留HTTP/2|write|param:http2
+nginxparams|6|请求头超时|读取客户端请求头的超时|5–300 秒；过短会影响弱网访问|write|param:client_header_timeout
+nginxparams|7|普通请求体超时|读取网站请求体的空闲超时|5–3600 秒；节点流量有独立超时|write|param:client_body_timeout
+nginxparams|8|网站响应发送超时|向客户端发送响应的空闲超时|5–3600 秒；不是整个文件下载总时长|write|param:send_timeout
+nginxparams|9|连接上游超时|连接本机反向代理上游的等待时间|1–60 秒；本机上游通常无需设置很大|write|param:proxy_connect_timeout
+nginxparams|10|节点上游读取超时|WS/XHTTP上游读取空闲超时|30–86400 秒；依据心跳和客户端行为设置|write|param:proxy_read_timeout
+nginxparams|11|节点上游写入超时|WS/XHTTP上游发送空闲超时|30–86400 秒；保持与客户端行为协调|write|param:proxy_send_timeout
+nginxparams|12|普通网站反代超时|本机应用的读写空闲超时|5–3600 秒；与节点长连接参数分开|write|param:site_proxy_timeout
+nginxparams|13|普通网站上传上限|限制普通站点单请求体大小|1–4096 MiB；XHTTP节点不套用此限制|write|param:client_max_body_mb
+nginxparams|14|网站访问日志开关|开启或关闭缓冲访问日志|true/false；会记录IP与路径并占用磁盘|write|param:access_log
+nginxparams|15|Worker 优雅退出期限|reload后旧Worker最多等待的时间|0–3600 秒；0不强制截止，非0可能断开长连接|write|param:worker_shutdown_timeout
+nginxparams|16|网站上游连接池|每Worker保留的应用上游空闲连接数|0–128；0关闭；并非最大上游连接总数|write|param:upstream_keepalive
+history|1|列出历史快照|显示快照时间、备注和版本|只读；快照含敏感凭据，不要公开|read|history-list
+history|2|立即创建快照|保存当前配置、证书及ACME资料|当前state.json须有效；不备份网站内容|write|history-save
+history|3|恢复配置与证书|从历史恢复配置及证书，验证后应用|现有程序必须满足依赖；可能重启服务|warn|history-full
+history|4|仅恢复高级参数|取回旧的Nginx/Xray参数|保留当前节点、证书和网站；状态文件须有效|warn|history-advanced
+history|5|回滚最近事务|恢复上一次操作前配置，可能含组件程序|将重启之前运行的服务；需有最近事务备份|warn|rollback
+history|6|恢复中断事务|处理掉线或失败留下的未完成事务|检测到残留事务时优先执行此项|warn|repair
+history|7|只恢复状态配置|使用历史节点/网站设置及当前证书重新生成|当前证书及组件必须满足历史配置要求|warn|history-state
+history|8|查看当前部署进度|核对现有历史参数和向导完成情况|只读；不会重置部署|read|wizard-status
+main|0|退出面板|不修改任何配置|未保存的当前输入不提交|back|back
+install|0|返回上一级|不修改任何配置|未保存的当前输入不提交|back|back
+nodes|0|返回上一级|不修改任何配置|未保存的当前输入不提交|back|back
+websites|0|返回上一级|不修改任何配置|未保存的当前输入不提交|back|back
+optimize|0|返回上一级|不修改任何配置|未保存的当前输入不提交|back|back
+update|0|返回上一级|不修改任何配置|未保存的当前输入不提交|back|back
+status|0|返回上一级|不修改任何配置|未保存的当前输入不提交|back|back
+services|0|返回上一级|不修改任何配置|未保存的当前输入不提交|back|back
+uninstall|0|返回上一级|不修改任何配置|未保存的当前输入不提交|back|back
+help|0|返回上一级|不修改任何配置|未保存的当前输入不提交|back|back
+firewall|0|返回上一级|不修改任何配置|未保存的当前输入不提交|back|back
+swap|0|返回上一级|不修改任何配置|未保存的当前输入不提交|back|back
+edge|0|返回上一级|不修改任何配置|未保存的当前输入不提交|back|back
+advanced|0|返回上一级|不修改任何配置|未保存的当前输入不提交|back|back
+nginxparams|0|返回上一级|不修改任何配置|未保存的当前输入不提交|back|back
+history|0|返回上一级|不修改任何配置|未保存的当前输入不提交|back|back
+VPSKIT_MENU_CATALOG
 }
-menu_group() {
-    local group=$1 option key d id value
-    case "$group" in
-        nodes)
-            printf '1.查看  2.新增  3.共享入口用户  4.启用  5.禁用  6.删除  7.轮换凭据  8.分享链接  9.XHTTP客户端JSON  0.返回\n'
-            ask option '选择' 0
-            case "$option" in 1) menu_run node list;; 2) menu_run node add;; 3) menu_run node share;; 4) menu_run node enable;; 5) menu_run node disable;; 6) menu_run node delete;; 7) menu_run node rotate;; 8) menu_run node export;; 9) menu_run node client;; esac;;
-        websites)
-            printf '1.网站列表  2.新增/编辑  3.移除绑定  4.签发证书  5.证书状态  6.续期检查  0.返回\n'
-            ask option '选择' 0
-            case "$option" in 1) menu_run site list;; 2) menu_run site add;; 3) menu_run site remove;; 4) menu_run cert issue;; 5) menu_run cert status;; 6) menu_run cert renew;; esac;;
-        update)
-            printf '1.Nginx组件  2.Xray组件  3.ACME组件  4.仅管理代码  0.返回\n'; ask option '选择' 0
-            case "$option" in 1) menu_run update nginx;; 2) ask value 'Xray版本（v数字.数字.数字或latest）' "$XRAY_DEFAULT_VERSION"; menu_run update xray "$value";; 3) menu_run update acme;; 4) menu_run update manager;; esac;;
-        advanced)
-            printf '1.显示已保存/实际参数  2.Worker/连接数/文件数  3.选择已有服务账户  4.其他Nginx参数  5.Xray文件数  6.恢复高级默认值  0.返回\n'
-            ask option '选择' 0
-            case "$option" in
-                1) menu_run advanced show;; 2) menu_run advanced edit capacity;; 3) menu_run advanced edit nginx.worker_user;;
-                4) printf 'keepalive keepalive_requests ssl_cache ssl_timeout http2 client_header_timeout client_body_timeout send_timeout proxy_connect_timeout proxy_read_timeout proxy_send_timeout site_proxy_timeout client_max_body_mb access_log worker_shutdown_timeout upstream_keepalive\n'
-                   ask key '参数名称（不含nginx.）' keepalive; menu_run advanced edit "nginx.$key";;
-                5) menu_run advanced edit xray.nofile;; 6) menu_run advanced defaults;;
-            esac;;
-        history)
-            printf '1.列出历史  2.立即创建快照  3.恢复配置及证书  4.只恢复高级参数  5.回滚最近事务  6.恢复中断事务  0.返回\n'; ask option '选择' 0
-            case "$option" in 1) menu_run history list;; 2) menu_run history save manual;; 3) menu_run history restore;; 4) menu_run history restore '' advanced;; 5) menu_run rollback;; 6) menu_run repair;; esac;;
-        status)
-            printf '1.状态  2.完整本机检查  3.Nginx日志  4.Xray日志  5.按已保存配置应用  6.重启Nginx  0.返回\n'; ask option '选择' 0
-            case "$option" in 1) menu_run status;; 2) menu_run doctor;; 3) menu_run logs nginx;; 4) menu_run logs xray;; 5) menu_run apply;; 6) menu_run service nginx restart;; esac;;
-        firewall)
-            printf '1.显示规则与所需端口  2.添加UFW放行规则  0.返回\n'; ask option '选择' 0
-            case "$option" in 1) menu_run firewall status;; 2) menu_run firewall allow;; esac;;
-        swap)
-            printf '1.查看Swap  2.创建本工具Swap  3.移除本工具Swap  0.返回\n'; ask option '选择' 0
-            case "$option" in 1) menu_run swap status;; 2) menu_run swap create;; 3) menu_run swap remove;; esac;;
-        edge)
-            printf '1.显示网站防护  2.编辑防护  3.更新Cloudflare官方IP与AOP CA  0.返回\n'; ask option '选择' 0
-            case "$option" in 1) menu_run edge show;; 2) menu_run edge edit;; 3) menu_run edge refresh;; esac;;
+
+# Colors are presentation-only: JSON, node URIs and on-disk logs stay plain.
+COLOR_MODE=${VPSKIT_COLOR:-auto}
+RED='' GREEN='' YELLOW='' BLUE='' CYAN='' MAGENTA='' BOLD='' DIM='' RESET=''
+colors() {
+    RED='' GREEN='' YELLOW='' BLUE='' CYAN='' MAGENTA='' BOLD='' DIM='' RESET=''
+    [[ -z ${NO_COLOR:-} && $COLOR_MODE != never ]] || return 0
+    if [[ $COLOR_MODE == always || ( -t 1 && ${TERM:-dumb} != dumb ) ]]; then
+        RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'
+        BLUE=$'\033[94m'; CYAN=$'\033[96m'; MAGENTA=$'\033[95m'
+        BOLD=$'\033[1m'; DIM=$'\033[2m'; RESET=$'\033[0m'
+    fi
+}
+ui_title() { printf '\n%s%s%s%s\n%s%s%s\n' "$BOLD" "$MAGENTA" "$1" "$RESET" "$DIM" '--------------------------------------------------------------------' "$RESET"; }
+ui_note() { printf '  %s%s%s\n' "$DIM" "$*" "$RESET"; }
+ui_status() {
+    local label=$1 state=$2 c=$YELLOW
+    case "$state" in active|running|正常|已安装) c=$GREEN;; failed|异常|损坏) c=$RED;; esac
+    printf '  %s：%s%s%s\n' "$label" "$c" "$state" "$RESET"
+}
+menu_title() {
+    case "$1" in
+        main) printf '主面板';; install) printf '部署与安装';; nodes) printf '节点与用户';;
+        websites) printf '网站与证书';; optimize) printf '网络与网站优化';; update) printf '组件更新';;
+        status) printf '状态、日志与维护';; services) printf '服务控制';; uninstall) printf '卸载管理';;
+        help) printf '方案说明与帮助';; firewall) printf '防火墙端口管理';; swap) printf 'Swap 虚拟内存';;
+        edge) printf '方案 B 防护与流量';; advanced) printf '高级配置 · Nginx / Xray';;
+        nginxparams) printf 'Nginx 参数设置';; history) printf '历史配置和恢复';;
+        *) return 1;;
     esac
 }
-main_menu() {
-    local option
+panel_summary() {
+    if ! command -v jq >/dev/null 2>&1; then
+        ui_note '尚未安装 jq：可先进入部署菜单；不会覆盖现有状态文件。'; return
+    fi
+    if [[ -f $STATE ]] && state_basic "$STATE" 2>/dev/null; then
+        printf '  已载入配置：方案 %s%s%s  节点 %s%s%s（启用 %s）  网站 %s%s%s\n' \
+          "$CYAN" "$(get '.scheme // "A"')" "$RESET" "$CYAN" "$(get '.nodes|length')" "$RESET" \
+          "$(get '[.nodes[]|select(.enabled)]|length')" "$CYAN" "$(get '.sites|length')" "$RESET"
+        printf '  Worker：%s%s%s  数量：%s%s%s  每 Worker 连接：%s%s%s\n' \
+          "$CYAN" "$(get '.advanced.nginx.resolved_user // "应用配置时自动检测"')" "$RESET" \
+          "$CYAN" "$(ng_value workers)" "$RESET" "$CYAN" "$(ng_value connections)" "$RESET"
+        ui_note '保留节点、网站、证书和高级参数；再次打开不会重置。'
+    elif [[ -e $STATE ]]; then ui_status '配置文件' '损坏'; ui_note '请选择 14 恢复；不会创建空配置覆盖它。'
+    else ui_note '尚未初始化；请选择 1 新装，已有部署请先检查 14 历史恢复。'; fi
+    if [[ -d $ROOT/backup/transaction ]]; then ui_status '待处理事务' '请先选择 14 → 6 恢复中断事务'; fi
+}
+menu_render() {
+    local group=$1 row_group number title desc req risk route c badge current
+    local heading; heading=$(menu_title "$group") || return 1
+    ui_title "VPSKit $VERSION  |  $heading"
+    [[ $group != main ]] || panel_summary
+    ui_note '蓝色=选项  绿色=只读/正常  黄色=注意  红色=危险  灰色=说明'
+    while IFS='|' read -r row_group number title desc req risk route; do
+        [[ $row_group == "$group" ]] || continue
+        c=$BLUE; badge='设置'
+        case "$risk" in read) c=$GREEN; badge='只读';; nav) c=$BLUE; badge='菜单';;
+            write) c=$BLUE; badge='修改';; warn) c=$YELLOW; badge='注意';;
+            danger) c=$RED; badge='危险';; sensitive) c=$YELLOW; badge='敏感';;
+            back) c=$DIM; badge='返回';; esac
+        current=''
+        if [[ $group == nginxparams ]] && command -v jq >/dev/null && state_basic "$STATE" 2>/dev/null; then
+            [[ $route != param:* ]] || current="（当前：$(ng_value "${route#param:}")）"
+        fi
+        printf '  %s%2s.%s %s%s%s %s[%s]%s %s%s%s\n' "$BLUE" "$number" "$RESET" "$c" "$title" "$RESET" "$c" "$badge" "$RESET" "$CYAN" "$current" "$RESET"
+        printf '      %s用途：%s  |  要求：%s%s\n' "$DIM" "$desc" "$req" "$RESET"
+    done < <(menu_catalog)
+    ui_note '输入序号；0 返回；操作中 :q 取消后回到面板。危险操作默认不执行。'
+}
+menu_preview() {
+    local group=${1:-main} g
+    if [[ $group == all ]]; then
+        while IFS= read -r g; do menu_render "$g"; done < <(menu_catalog | cut -d'|' -f1 | awk '!seen[$0]++')
+    else menu_render "$group" || die '未知面板；使用 preview all 查看所有面板。'; fi
+}
+menu_run() {
+    local rc answer
+    # Run mutations in a fresh Bash process. Do not put the backend function in
+    # `if fn`: that would suppress errexit inside it and bypass rollback guards.
+    set +e
+    VPSKIT_COLOR="$COLOR_MODE" bash "$SELF" "$@"
+    rc=$?
+    set -e
+    case "$rc" in
+        0) printf '\n%s[完成] 操作已结束。%s\n' "$GREEN" "$RESET";;
+        130) printf '\n%s[取消] 已取消当前操作；已提交的配置保留。%s\n' "$YELLOW" "$RESET";;
+        *) printf '\n%s[未完成] 退出码 %s；请阅读上方原因，再重试或进入历史恢复。%s\n' "$RED" "$rc" "$RESET";;
+    esac
+    if [[ ! -f $SELF ]]; then ui_note '管理脚本已卸载，退出面板。'; exit 0; fi
+    ask answer '按回车返回当前菜单（:q退出面板）' ''
+}
+menu_dispatch() {
+    local route=$1 name action
+    case "$route" in
+        menu:*) menu_group "${route#menu:}";;
+        param:*) menu_run advanced edit "nginx.${route#param:}";;
+        service:*) name=${route#service:}; action=${name#*:}; name=${name%%:*}; menu_run service "$name" "$action";;
+        install-wizard) menu_run install;; install-nginx) menu_run install nginx;; install-xray) menu_run install xray;; install-acme) menu_run install acme;;
+        wizard-configure) menu_run wizard configure;; wizard-status) menu_run wizard status;;
+        node-list) menu_run node list;; node-add) menu_run node add;; node-share) menu_run node share;;
+        node-enable) menu_run node enable;; node-disable) menu_run node disable;; node-delete) menu_run node delete;;
+        node-rotate) menu_run node rotate;; node-export) menu_run node export;; node-client) menu_run node client;;
+        node-rename) menu_run node rename;; node-port) menu_run node port;; node-host) menu_run node host;;
+        node-credential) menu_run node edit;; node-listen) menu_run node listen;;
+        site-list) menu_run site list;; site-add) menu_run site add;; site-edit) menu_run site edit;; site-remove) menu_run site remove;;
+        cert-issue) menu_run cert issue;; cert-status) menu_run cert status;; cert-renew) menu_run cert renew;;
+        cert-settings) menu_run cert settings;; cert-import) menu_run cert import;;
+        optimize-status) menu_run optimize status;; optimize-bbr) menu_run optimize bbr;; optimize-restore) menu_run optimize restore;; optimize-mtu) menu_run optimize mtu;;
+        performance-gzip) menu_run performance gzip;;
+        update-nginx) menu_run update nginx;; update-xray) menu_run update xray;; update-acme) menu_run update acme;;
+        update-manager) menu_run update manager;; update-all) menu_run update all;;
+        status) menu_run status;; doctor) menu_run doctor;; paths) menu_run paths;; apply) menu_run apply;;
+        logs-*) menu_run logs "${route#logs-}";; network-check) menu_run network-check;;
+        uninstall-keep) menu_run uninstall keep;; uninstall-xray) menu_run uninstall xray;; uninstall-nginx) menu_run uninstall nginx;; uninstall-acme) menu_run uninstall acme;; uninstall-all) menu_run uninstall all;;
+        help) menu_run help;; explain) menu_run explain;; workflow-help) menu_run help workflow;; color-help) menu_run help colors;;
+        firewall-*) menu_run firewall "${route#firewall-}";;
+        swap-status) menu_run swap status;; swap-enable) menu_run swap enable;; swap-custom) menu_run swap custom;; swap-remove) menu_run swap remove;;
+        edge-*) menu_run edge "${route#edge-}";;
+        advanced-show) menu_run advanced show;; advanced-capacity) menu_run advanced edit capacity;; advanced-user) menu_run advanced edit nginx.worker_user;;
+        advanced-xray) menu_run advanced edit xray.nofile;; advanced-defaults) menu_run advanced defaults;; advanced-users) menu_run advanced users;;
+        history-list) menu_run history list;; history-save) menu_run history save;; history-full) menu_run history restore '' full;;
+        history-state) menu_run history restore '' state;; history-advanced) menu_run history restore '' advanced;;
+        rollback) menu_run rollback;; repair) menu_run repair;; back) return;;
+        *) die "面板路由不存在：$route";;
+    esac
+}
+menu_group() {
+    local group=${1:-main} option route
+    menu_title "$group" >/dev/null || die '未知菜单。'
     while :; do
-        printf '\nVPSKit %s 管理面板\n' "$VERSION"
-        if [[ -f $STATE ]] && command -v jq >/dev/null && state_basic "$STATE"; then
-            printf '已载入历史配置：%s个节点 / %s个网站；不会重置。\n' "$(get '.nodes|length')" "$(get '.sites|length')"
-        elif [[ -e $STATE ]]; then printf '状态文件异常；请选择14恢复，不会覆盖。\n'
-        else printf '尚未初始化；选择1部署，或先安装单独组件。\n'; fi
-        cat <<'EOF'
- 1. 部署与安装 / 继续历史部署
- 2. 节点与用户
- 3. 网站与证书
- 4. 网站压缩设置
- 5. 组件更新（与代码分离）
- 6. 状态、日志与维护
- 7. 卸载服务（保留数据）
- 8. 方案说明与命令帮助
- 9. 配置文件与目录
-10. 防火墙端口管理
-11. Swap虚拟内存
-12. 网站防护与流量
-13. 高级配置 · Nginx / Xray
-14. 历史配置和恢复
-15. 仅更新管理脚本
- 0. 退出
-EOF
-        ask option '选择' 0
-        case "$option" in
-            0) return;;
-            1) printf '1.向导/继续  2.只安装Nginx  3.只安装Xray  4.只安装ACME  0.返回\n'; ask option '选择' 1
-               case "$option" in 1) menu_run install;; 2) menu_run install nginx;; 3) menu_run install xray;; 4) menu_run install acme;; esac;;
-            2) menu_group nodes;; 3) menu_group websites;; 4) menu_run performance gzip;;
-            5) menu_group update;; 6) menu_group status;; 7) menu_run uninstall;; 8) menu_run help;; 9) menu_run paths;;
-            10) menu_group firewall;; 11) menu_group swap;; 12) menu_group edge;; 13) menu_group advanced;; 14) menu_group history;; 15) menu_run update manager;;
-            *) printf '无效选项。\n';;
-        esac
+        menu_render "$group"
+        ask option '请选择序号' 0
+        if [[ ! $option =~ ^(0|[1-9][0-9]?)$ ]]; then warn '请输入面板中的数字序号。'; continue; fi
+        route=$(menu_catalog | awk -F'|' -v g="$group" -v n="$option" '$1==g && $2==n {print $7}')
+        if [[ -z $route ]]; then warn '该序号不存在，请重新选择。'; continue; fi
+        [[ $route != back ]] || return 0
+        menu_dispatch "$route"
     done
 }
+main_menu() { menu_group main; }
+
+# Compatibility helpers restored as explicit actions, not automatic side effects.
+record_update() {
+    local file=$1 tmp; shift
+    [[ ! -L $file && -d ${file%/*} && ! -L ${file%/*} ]] || die '记录路径不安全。'
+    tmp=$(mktemp "${file%/*}/.record.XXXXXXXX")
+    if ! jq "$@" "$file" > "$tmp"; then rm -f "$tmp"; die '记录更新失败。'; fi
+    chmod 600 "$tmp"; mv -f -- "$tmp" "$file"
+}
+worker_users() {
+    local u state row
+    printf '候选账户\tUID\t主组\t检查结果\n'
+    for u in vpskit-www www-data nginx http nobody; do
+        if row=$(getent passwd "$u"); then
+            state='不可选：需非root、禁用登录且无高权限组'
+            if service_user_valid "$u"; then state='可复用'; fi
+            printf '%s\t%s\t%s\t%s\n' "$u" "$(id -u "$u")" "$(id -gn "$u")" "$state"
+        else printf '%s\t-\t-\t系统不存在（不会创建）\n' "$u"; fi
+    done
+    info '可指定其他已有合格账户；复用用户不等于不同服务之间的UID隔离。'
+}
+wizard_configure() {
+    local scheme host
+    ask_valid scheme '方案 A=REALITY直连；B=网站TLS+XHTTP' "$(get '.scheme // "A"')" choice 'A B'
+    ask_valid host '以后新增节点默认连接的公网IP或域名' "$(get '.host // ""')" valid_host
+    confirm '仅保存向导方案和默认地址，不自动修改已有节点/网站' || return 0
+    begin_tx wizard-preferences
+    json_update --arg s "$scheme" --arg h "$host" '.scheme=$s|.host=$h|.wizard.selected=true'
+    commit_tx
+}
+wizard_status() {
+    if ! state_basic "$STATE" 2>/dev/null; then info '暂无可用配置；新装从部署向导开始，已有部署先恢复。'; return; fi
+    jq -r '"方案：\(.scheme // "A")\n连接默认值：\(.host // "未设置")\n向导已选择：\(.wizard.selected // false)\n最后步骤：\(.wizard.last_step // "未记录")\n结果：\(.wizard.last_result // "未记录")\n组件：Xray=\(.components.xray) Nginx=\(.components.nginx) ACME=\(.components.acme)\n节点数：\(.nodes|length)；网站数：\(.sites|length)"' "$STATE"
+    info '继续部署不会重新生成已有 UUID/密码；尚未提交的输入需要重新填写。'
+}
+cert_settings() {
+    local d s e c w=false
+    site_select d "${1:-}"
+    s=$(jq -c --arg d "$d" '.sites[]|select(.domain==$d)' "$STATE")
+    ask_valid e '证书联系邮箱' "$(jq -r '.email // ""' <<< "$s")" valid_email
+    ask_valid c '验证：http=公网80；dns_cf=Cloudflare；dns_dp=DNSPod' "$(jq -r '.challenge // "http"' <<< "$s")" choice 'http dns_cf dns_dp'
+    if [[ $c != http ]]; then ask_valid w '同时签发泛域名（需要DNS API权限）' "$(jq -r '.wildcard // false' <<< "$s")" valid_bool; fi
+    confirm "保存 $d 证书设置；当前证书不变，需另行选择签发" || return 0
+    begin_tx "cert-settings:$d"
+    json_update --arg d "$d" --arg e "$e" --arg c "$c" --argjson w "$w" '
+      (.sites[]|select(.domain==$d)) |= (. + {email:$e,challenge:$c,wildcard:$w,cert_settings_pending:true}) |
+      .preferences += {email:$e,challenge:$c,wildcard:$w}'
+    commit_tx
+}
+cert_import_interactive() {
+    local d cert key
+    site_select d
+    ask cert '完整证书链 PEM 文件绝对路径' ''
+    ask key '私钥 PEM 文件绝对路径（不会打印内容）' ''
+    [[ $cert == /* && $key == /* ]] || die '请提供绝对路径。'
+    cert_import "$d" "$cert" "$key"
+}
+site_edit_existing() { local d; site_select d "${1:-}"; site_configure "$d"; }
+node_set_credential() {
+    local id n p m value candidate="$WORK/credential.next.json"
+    node_select id "${1:-}"
+    n=$(jq -c --arg id "$id" '.nodes[]|select(.id==$id)' "$STATE")
+    p=$(jq -r .protocol <<< "$n"); m=$(jq -r '.method // ""' <<< "$n")
+    info 'VLESS/VMess需标准UUID；SS2022需对应长度Base64密钥；其他密码8–256字符且无空白。'
+    secret value '输入新UUID/密码；留空自动生成'
+    [[ -n $value ]] || value=$(node_credential "$p" "$m")
+    jq --arg id "$id" --arg c "$value" '(.nodes[]|select(.id==$id)).credential=$c' "$STATE" > "$candidate"
+    validate_state "$candidate" no
+    confirm "修改 $id 的凭据；需要更新客户端，可能中断现有代理连接" || return 0
+    begin_tx "node-credential:$id"; install -m 600 "$candidate" "$STATE"; apply_config; commit_tx
+}
+node_set_listen() {
+    local id n value entry
+    node_select id "${1:-}"
+    n=$(jq -c --arg id "$id" '.nodes[]|select(.id==$id)' "$STATE")
+    case $(jq -r .mode <<< "$n") in ws|xhttp) die 'WS/XHTTP后端固定为127.0.0.1；公网由Nginx监听。';; esac
+    ask_valid value '监听：0.0.0.0=IPv4；::=IPv6/双栈；127.0.0.1或::1=仅本机' "$(jq -r '.listen // "0.0.0.0"' <<< "$n")" choice '0.0.0.0 :: 127.0.0.1 ::1'
+    if [[ $value == *:* ]]; then [[ -s /proc/net/if_inet6 ]] || die '系统未提供可用IPv6接口。'; fi
+    entry=$(jq -r .entry <<< "$n")
+    confirm "同步修改整个共享入口 $entry 的监听地址为 $value" || return 0
+    begin_tx "node-listen:$id"
+    json_update --arg e "$entry" --arg l "$value" '(.nodes[]|select(.entry==$e)).listen=$l'
+    apply_config; commit_tx
+}
+component_update() {
+    local name=$1 version=${2:-}
+    choice "$name" 'xray nginx acme' || die '组件名称无效。'
+    ensure_component "$name"
+    if [[ $name == xray && -z $version ]]; then
+        ask_valid version 'Xray版本（回车保留已装版本；latest显式选择最新）' "$(get '.versions.xray // "v26.3.27"')" valid_version
+    fi
+    version=${version:-$XRAY_DEFAULT_VERSION}
+    confirm "更新组件 $name；配置保留，必要时重启相关服务" || return 0
+    install_dependencies; install_component "$name" "$version" yes
+}
+update_all() {
+    local name version="$XRAY_DEFAULT_VERSION"
+    warn '逐组件提交，不是整机原子升级；后续失败不会撤销已成功的组件更新。'
+    confirm '更新全部已安装组件；可能多次短暂中断连接' || return 0
+    if component_ready xray; then
+        ask_valid version 'Xray目标版本（latest为显式最新版）' "$(get '.versions.xray // "v26.3.27"')" valid_version
+    fi
+    install_dependencies
+    for name in nginx xray acme; do
+        if component_ready "$name"; then install_component "$name" "$version" yes; else info "$name 未安装，跳过。"; fi
+    done
+    if confirm '组件更新完成；是否继续单独更新管理代码'; then update_manager; fi
+}
+service_control() {
+    local name=$1 action=$2
+    # Accept both the 1.6 order (action name) and 1.7 order (name action).
+    if choice "$name" 'start stop restart reload'; then local tmp=$name; name=$action; action=$tmp; fi
+    if [[ $name == nginx && $action == reload ]]; then
+        ensure_component nginx
+        [[ -f $SYSTEMD/vpskit-nginx.service && ! -L $SYSTEMD/vpskit-nginx.service ]] && grep -Fq '# VPSKIT_OWNED' "$SYSTEMD/vpskit-nginx.service" || die '服务归属不匹配。'
+        nginx_cmd -t -p "$ROOT/" -c "$ROOT/config/nginx.conf"
+        confirm '配置检查成功，重载本工具Nginx（不重新生成配置）' || return 0
+        systemctl reload vpskit-nginx.service
+        verify_nginx_runtime ''
+    else service_action "$name" "$action"; fi
+}
+network_check() {
+    local d code failed=0
+    need curl; need getent
+    while IFS= read -r d; do
+        printf '\n域名：%s\n' "$d"
+        if ! getent ahosts "$d"; then warn '当前系统未能解析该域名。'; failed=1; fi
+        if code=$(curl --proto '=https' --connect-timeout 5 --max-time 12 -sS -o /dev/null -w '%{http_code}' "https://$d/"); then
+            printf '公网 HTTPS 状态码：%s（未忽略证书验证）\n' "$code"
+        else warn '公网HTTPS检查失败；检查DNS、证书、网络及Cloudflare回源。'; failed=1; fi
+    done < <(jq -r '.sites[].domain' "$STATE")
+    info 'Cloudflare解析返回边缘IP是正常情况；此检查不修改DNS，不等于节点客户端验收。'
+    return "$failed"
+}
+edge_status_all() {
+    local s d
+    while IFS= read -r s; do d=$(jq -r .domain <<< "$s"); printf '\n%s\n' "$d"; edge_settings "$s" | jq .; done < <(jq -c '.sites[]' "$STATE")
+    [[ ! -f $ROOT/config/edge/updated.epoch ]] || printf '\n官方资料刷新时间戳：%s\n' "$(cat "$ROOT/config/edge/updated.epoch")"
+}
+edge_probe_check() {
+    local d=$1 token response
+    token=$(get '.edge.probe // ""')
+    [[ $token =~ ^[a-f0-9]{32}$ ]] || { warn '尚无探测标识；请先切换AOP到observe。'; return 1; }
+    if ! response=$(curl --proto '=https' --connect-timeout 5 --max-time 15 --fail --silent --show-error \
+      -H 'Cache-Control: no-cache' "https://$d/.well-known/vpskit-aop-$token?nonce=$(randhex 6)"); then
+        warn '公网AOP检查失败；未关闭TLS校验，也未强制直连源站。'; return 1
+    fi
+    [[ $response == SUCCESS ]] || { warn "本次回源未返回SUCCESS（不输出未验证响应正文）。"; return 1; }
+    ok "$d 本次公网请求的AOP证书检查为SUCCESS；不代表所有边缘永久可用。"
+}
+edge_probe() {
+    local d; site_select d "${1:-}"
+    jq -e --arg d "$d" '.sites[]|select(.domain==$d and .access=="cloudflare" and .issued and (.protection.aop // "off")!="off")' "$STATE" >/dev/null || die '需Cloudflare站点、有效TLS证书以及observe/enforce模式。'
+    edge_probe_check "$d"
+}
+edge_batch() {
+    local d=$1; shift
+    local candidate="$WORK/edge-batch.json" key value s probe enforce=false current
+    site_select d "$d"
+    (($#>0 && $#%2==0)) || die '防护参数必须为键值对。'
+    cp "$STATE" "$candidate"
+    while (($#)); do
+        key=$1; value=$2; shift 2
+        case "$key" in
+            bots) choice "$value" 'off ai common all' || die 'bots只能为off/ai/common/all。';;
+            aop) choice "$value" 'off observe enforce' || die 'aop只能为off/observe/enforce。'; [[ $value != enforce ]] || enforce=true;;
+            origin|gzip) valid_bool "$value" || die '开关值为true/false。';;
+            rate) number "$value" 0 100 || die 'rate范围0–100。';;
+            burst) number "$value" 1 200 || die 'burst范围1–200。';;
+            connections) number "$value" 0 200 || die 'connections范围0–200。';;
+            kbps) number "$value" 0 10240 || die 'kbps范围0–10240。';;
+            static_ttl) number "$value" 0 604800 || die 'static_ttl范围0–604800秒。';;
+            *) die '未知防护字段。';;
+        esac
+        if [[ $key == bots || $key == aop ]]; then
+            jq --arg d "$d" --arg k "$key" --arg v "$value" '(.sites[]|select(.domain==$d)).protection[$k]=$v' "$candidate" > "$candidate.next"
+        else jq --arg d "$d" --arg k "$key" --argjson v "$value" '(.sites[]|select(.domain==$d)).protection[$k]=$v' "$candidate" > "$candidate.next"; fi
+        mv "$candidate.next" "$candidate"
+    done
+    probe=$(get '.edge.probe // ""')
+    [[ -n $probe ]] || probe=$(randhex 16)
+    jq --arg p "$probe" '.edge.probe=$p' "$candidate" > "$candidate.next"; mv "$candidate.next" "$candidate"
+    s=$(jq -c --arg d "$d" '.sites[]|select(.domain==$d)' "$candidate")
+    current=$(jq -r --arg d "$d" '.sites[]|select(.domain==$d)|.protection.aop // "off"' "$STATE")
+    if [[ $enforce == true ]]; then
+        [[ $current == observe || $current == enforce ]] || die '先设置AOP为observe，在Cloudflare启用AOP并验证后才能enforce。'
+        edge_probe_check "$d" || die 'AOP验证未通过，未启用强制模式。'
+    fi
+    if [[ $(jq -r '.access // "direct"' <<< "$s") == cloudflare ]] && { ! cf_ready || [[ $(edge_settings "$s" | jq -r .aop) != off && ! -s $ROOT/config/edge/aop-ca.pem ]]; }; then cf_fetch; fi
+    printf '将保存 %s 的防护设置：\n' "$d"; edge_settings "$s" | jq .
+    warn '来源限制会拒绝直连；广泛UA拦截可能影响监控；网站限额不作用于节点代理。'
+    confirm '保存并应用此站点防护' || return 0
+    begin_tx "edge:$d"
+    [[ ! -d $WORK/edge ]] || cf_install_assets
+    install -m 600 "$candidate" "$STATE"
+    validate_state; apply_config web
+    if [[ $enforce == true ]]; then edge_probe_check "$d" || die '强制模式上线后复检失败，将回滚本次配置。'; fi
+    commit_tx
+}
+edge_set() { edge_batch "$1" "$2" "$3"; }
+edge_action() {
+    local action=$1 d=${2:-} s value rate burst connections kbps ttl gzip
+    site_select d "$d"; s=$(jq -c --arg d "$d" '.sites[]|select(.domain==$d)' "$STATE")
+    case "$action" in
+        profile) edge_batch "$d" bots ai rate 5 burst 30 connections 20 static_ttl 3600 gzip true;;
+        reset) edge_batch "$d" bots off rate 0 burst 30 connections 0 kbps 0 static_ttl 0 gzip false origin false aop off;;
+        limits)
+            ask_valid rate '每IP网站请求/秒（0关闭，最高100）' "$(edge_settings "$s" | jq -r .rate)" number 0 100
+            ask_valid burst '突发请求数（1–200）' "$(edge_settings "$s" | jq -r .burst)" number 1 200
+            ask_valid connections '每IP并发网站请求（0关闭，最高200）' "$(edge_settings "$s" | jq -r .connections)" number 0 200
+            ask_valid kbps '每响应限速KiB/s（0关闭，最高10240）' "$(edge_settings "$s" | jq -r .kbps)" number 0 10240
+            edge_batch "$d" rate "$rate" burst "$burst" connections "$connections" kbps "$kbps";;
+        cache)
+            ask_valid ttl '静态资源缓存秒数（0关闭，最高604800）' "$(edge_settings "$s" | jq -r .static_ttl)" number 0 604800
+            ask_valid gzip '站点静态文本gzip' "$(edge_settings "$s" | jq -r .gzip)" valid_bool
+            edge_batch "$d" static_ttl "$ttl" gzip "$gzip";;
+        bots) ask_valid value 'UA策略：off关闭/ai/common/all（all会影响SEO和监控）' "$(edge_settings "$s" | jq -r .bots)" choice 'off ai common all'; edge_set "$d" bots "$value";;
+        origin) ask_valid value '仅允许Cloudflare网段回源；true开启/false关闭' "$(edge_settings "$s" | jq -r .origin)" valid_bool; edge_set "$d" origin "$value";;
+        aop) ask_valid value 'AOP：off关闭/observe观察/enforce强制' "$(edge_settings "$s" | jq -r .aop)" choice 'off observe enforce'; edge_set "$d" aop "$value";;
+        *) die '防护操作无效。';;
+    esac
+}
+edge_guide() {
+    cat <<'EOF'
+Cloudflare 配置指引（只读；不调用外部账户API）
+1. 域名指向源站并开启橙云；源站证书有效后采用 Full (strict)。
+2. HTTP-01 要保证公网80挑战路径可达；DNS-01需要限定区域DNS编辑权限。
+3. 网站静态资源可缓存；XHTTP前缀、WS路径、ACME挑战、AOP探测路径必须绕过缓存。
+4. 先验证网站与节点，再开启Cloudflare来源限制；它不修改SSH和云安全组。
+5. AOP顺序：源站observe → 控制台Authenticated Origin Pulls → 公网probe → enforce。
+6. Cloudflare访客侧HTTP/3不等于源站QUIC；普通橙云不代理REALITY/任意TCP/SS。
+7. UA拦截并非强身份验证；每IP限额会被同一NAT下的访客共享。
+8. 代理路径与UUID不同，但仍属于部署信息；不要公开张贴完整配置。
+EOF
+}
+edge_traffic() {
+    local f iface rx tx r2 t2 delta_rx delta_tx
+    local -A before_rx=() before_tx=()
+    for f in /sys/class/net/*; do
+        iface=${f##*/}; [[ $iface != lo ]] || continue
+        read -r rx < "$f/statistics/rx_bytes"; read -r tx < "$f/statistics/tx_bytes"
+        before_rx[$iface]=$rx; before_tx[$iface]=$tx
+    done
+    sleep 1
+    printf '网卡\t累计接收MiB\t累计发送MiB\t采样接收KiB/s\t采样发送KiB/s\n'
+    for iface in "${!before_rx[@]}"; do
+        f="/sys/class/net/$iface"; [[ -d $f ]] || continue
+        read -r r2 < "$f/statistics/rx_bytes"; read -r t2 < "$f/statistics/tx_bytes"
+        delta_rx=$((r2-before_rx[$iface])); delta_tx=$((t2-before_tx[$iface]))
+        if ((delta_rx<0 || delta_tx<0)); then warn "$iface 计数器重置，忽略速率样本。"; continue; fi
+        awk -v n="$iface" -v rx="$r2" -v tx="$t2" -v dr="$delta_rx" -v dt="$delta_tx" 'BEGIN{printf "%s\t%.2f\t%.2f\t%.2f\t%.2f\n",n,rx/1048576,tx/1048576,dr/1024,dt/1024}'
+    done
+    info '约1秒采样，含网卡全部业务；不是精确计费，也不是每节点的流量。'
+}
+edge_maintenance() {
+    cf_needed || return 0
+    local epoch=0 now; now=$(date +%s)
+    if [[ -r $ROOT/config/edge/updated.epoch ]]; then read -r epoch < "$ROOT/config/edge/updated.epoch"; fi
+    [[ $epoch =~ ^[0-9]{1,12}$ ]] || epoch=0
+    if ((now-epoch<604800)); then return 0; fi
+    # Same maintenance lock, normal errexit scope; fetch first, apply transactionally.
+    edge_refresh
+}
+
+optimize_status() {
+    printf '内存与Swap：\n'; free -h
+    printf '\n当前拥塞控制和默认队列：\n'; sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc net.ipv4.tcp_available_congestion_control 2>/dev/null || true
+    printf '\n网卡MTU：\n'; ip -brief link
+    printf '\n连接概况：\n'; ss -s
+    info '不自动增大TCP缓冲、不改网卡MTU；BBR与gzip均需主动选择。'
+}
+bbr_enable() {
+    local file="$ROOT/data/bbr-v2.json" conf=/etc/sysctl.d/90-vpskit.conf oldcc oldq available tmp
+    need sysctl
+    [[ ! -L $conf && ! -L $file ]] || die '现有BBR配置/记录为链接，拒绝覆盖；旧版配置请先人工核对。'
+    if [[ -e $conf ]]; then
+        grep -Fxq '# VPSKIT_OWNED BBR_V2' "$conf" && [[ -s $file ]] || die '同名sysctl文件不属于本版，未覆盖。'
+    fi
+    if [[ -e $file ]]; then
+        jq -e '.owner=="VPSKIT_BBR_V2" and (.before.cc|type=="string") and (.before.qdisc|type=="string")' "$file" >/dev/null || die 'BBR记录损坏，停止。'
+    fi
+    confirm '显式启用BBR和fq（不改接口MTU/SSH）；新连接收益需自行测试' || return 0
+    available=$(sysctl -n net.ipv4.tcp_available_congestion_control)
+    if [[ " $available " != *' bbr '* ]]; then
+        command -v modprobe >/dev/null && modprobe tcp_bbr || die '无法加载tcp_bbr；内核/容器可能不支持，未改sysctl。'
+        available=$(sysctl -n net.ipv4.tcp_available_congestion_control)
+        [[ " $available " == *' bbr '* ]] || die '内核未提供bbr。'
+    fi
+    oldcc=$(sysctl -n net.ipv4.tcp_congestion_control); oldq=$(sysctl -n net.core.default_qdisc)
+    if [[ ! -e $file ]]; then
+        jq -n --arg c "$oldcc" --arg q "$oldq" '{owner:"VPSKIT_BBR_V2",before:{cc:$c,qdisc:$q},stage:"pending"}' > "$file"
+        chmod 600 "$file"
+    fi
+    if ! sysctl -w net.core.default_qdisc=fq || ! sysctl -w net.ipv4.tcp_congestion_control=bbr; then
+        sysctl -w "net.core.default_qdisc=$oldq" "net.ipv4.tcp_congestion_control=$oldcc" || true
+        die '应用失败，已尝试还原本次前的运行值；保留记录以便检查。'
+    fi
+    tmp=$(mktemp /etc/sysctl.d/.vpskit.XXXXXXXX)
+    printf '# VPSKIT_OWNED BBR_V2\nnet.core.default_qdisc = fq\nnet.ipv4.tcp_congestion_control = bbr\n' > "$tmp"
+    chmod 644 "$tmp"; mv -f "$tmp" "$conf"
+    record_update "$file" '.stage="active"'
+    ok '已设置BBR与默认fq；未重设现有接口队列，也未修改MTU。'
+}
+bbr_restore() {
+    local approved=${1:-no} file="$ROOT/data/bbr-v2.json" conf=/etc/sysctl.d/90-vpskit.conf cc q current
+    [[ -e $file ]] || { info '没有本版BBR恢复记录；外部/旧版sysctl配置未改动。'; return; }
+    [[ ! -L $file && ! -L $conf ]] || die 'BBR配置路径为链接，拒绝处理。'
+    jq -e '.owner=="VPSKIT_BBR_V2"' "$file" >/dev/null || die 'BBR记录归属不匹配。'
+    if [[ -e $conf ]]; then grep -Fxq '# VPSKIT_OWNED BBR_V2' "$conf" || die '持久化配置被外部改写，未删除。'; fi
+    cc=$(jq -r .before.cc "$file"); q=$(jq -r .before.qdisc "$file")
+    [[ $cc =~ ^[a-zA-Z0-9_-]+$ && $q =~ ^[a-zA-Z0-9_-]+$ ]] || die '旧参数格式无效。'
+    [[ $approved == yes ]] || confirm "撤销本工具BBR设置，原值为 $cc / $q" || return 0
+    current=$(sysctl -n net.ipv4.tcp_congestion_control)
+    if [[ $current == bbr ]]; then sysctl -w "net.ipv4.tcp_congestion_control=$cc"; else warn '拥塞控制已被其他操作修改，不覆盖其当前值。'; fi
+    current=$(sysctl -n net.core.default_qdisc)
+    if [[ $current == fq ]]; then sysctl -w "net.core.default_qdisc=$q"; else warn '默认队列已被其他操作修改，不覆盖其当前值。'; fi
+    rm -f -- "$conf" "$file"
+    ok '本版BBR持久化设置已移除；不卸载内核模块、不改网卡。'
+}
+mtu_probe() {
+    local target=${1:-} rc=0
+    command -v tracepath >/dev/null || die '缺少tracepath；可先执行 apt-get install iputils-tracepath，再运行此只读探测。'
+    [[ -n $target ]] || ask_valid target '探测目标域名/IPv4/IPv6（不修改本机MTU）' www.microsoft.com valid_host
+    valid_host "$target" || die '探测目标无效。'
+    timeout 20 tracepath -n "$target" || rc=$?
+    if ((rc!=0)); then warn "探测退出码=$rc；ICMP过滤或超时不等于MTU配置错误。"; fi
+    info '未修改任何接口MTU；不要把单次路径结果直接当作全局网卡设置。'
+}
+# Firewall V2 records are intentionally separate from legacy records. We do not
+# guess ownership from an unrecognized historical schema and delete external rules.
+fw_record_file() { printf '%s/data/firewall-v2.json' "$ROOT"; }
+fw_records_init() {
+    local f; f=$(fw_record_file)
+    [[ ! -L $f ]] || die '防火墙记录不能为链接。'
+    if [[ ! -e $f ]]; then printf '{"owner":"VPSKIT_FIREWALL_V2","schema":2,"rules":[]}\n' > "$f"; chmod 600 "$f"; fi
+    jq -e '.owner=="VPSKIT_FIREWALL_V2" and .schema==2 and (.rules|type=="array")' "$f" >/dev/null || die '本版防火墙记录损坏，拒绝接管。'
+}
+fw_backend() {
+    local uf=0 ff=0
+    if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q '^Status: active'; then uf=1; fi
+    if command -v firewall-cmd >/dev/null && firewall-cmd --state 2>/dev/null | grep -qx running; then ff=1; fi
+    if ((uf && ff)); then die 'UFW与firewalld同时启用，拒绝修改；请由管理员明确使用一个。'; fi
+    if ((uf)); then printf ufw; elif ((ff)); then printf firewalld; else die '未检测到已启用的UFW或firewalld；不会自动安装、启用或重置防火墙。'; fi
+}
+ssh_ports() {
+    printf '22\n'
+    local p
+    if [[ -n ${SSH_CONNECTION:-} ]]; then p=${SSH_CONNECTION##* }; valid_port "$p" && printf '%s\n' "$p"; fi
+    if command -v sshd >/dev/null; then sshd -T 2>/dev/null | awk '$1=="port"{print $2}' || true; fi
+    ss -H -lntp 2>/dev/null | awk '/sshd/{n=split($4,a,":");print a[n]}' || true
+}
+fw_guard_port() {
+    local port=$1 proto=$2 p
+    valid_port "$port" && choice "$proto" 'tcp udp both' || die '端口/协议不合法。'
+    if [[ $proto != udp ]]; then
+        while IFS= read -r p; do
+            [[ $p != "$port" ]] || die "端口 $port 是22或检测到的SSH端口；本工具不会为其开关或撤销规则。"
+        done < <(ssh_ports | sort -un)
+    fi
+}
+fw_choose_zone() {
+    local dest=$1 backend=$2 z=''
+    if [[ $backend == firewalld ]]; then
+        printf 'firewalld活动zone：\n' >&2; firewall-cmd --get-active-zones >&2
+        ask z '明确选择公网接口/来源所属zone（不能只凭默认值猜测）' "$(firewall-cmd --get-default-zone)"
+        [[ $z =~ ^[a-zA-Z0-9_-]+$ ]] && choice "$z" "$(firewall-cmd --get-zones)" || die 'zone不存在。'
+    fi
+    printf -v "$dest" '%s' "$z"
+}
+fw_id() { printf '%s:%s:%s:%s' "$1" "$2" "$3" "$4" | sha256sum | cut -c1-16; }
+fw_rich_rule() {
+    local family=$1 port=$2 proto=$3 action=$4 id=$5 decision=accept
+    [[ $action != deny ]] || decision=drop
+    # Limited log prefix provides a distinguishable ownership marker in rich rules.
+    printf 'rule family="%s" priority="-100" port port="%s" protocol="%s" log prefix="VPSKIT-%s " limit value="1/m" %s' "$family" "$port" "$proto" "$id" "$decision"
+}
+fw_ufw_remove_tag() {
+    local tag=$1 n output
+    [[ $tag =~ ^VPSKIT-[a-f0-9]{16}$ ]] || die '规则标签格式无效。'
+    output=$(ufw status numbered)
+    while IFS= read -r n; do
+        [[ $n =~ ^[0-9]+$ ]] || die 'UFW规则编号解析异常。'
+        ufw --force delete "$n"
+    done < <(awk -v tag="$tag" '$0 ~ ("# "tag"[[:space:]]*$") {line=$0;sub(/^\[ */,"",line);sub(/\].*$/,"",line);if(line~/^[0-9]+$/)print line}' <<< "$output" | sort -rn)
+}
+fw_remove_rule() {
+    local backend=$1 zone=$2 port=$3 proto=$4 action=$5 id=$6 family rule
+    [[ $id == "$(fw_id "$backend" "$zone" "$port" "$proto")" ]] || die '防火墙规则归属摘要不匹配。'
+    fw_guard_port "$port" "$proto"
+    if [[ $backend == ufw ]]; then fw_ufw_remove_tag "VPSKIT-$id"
+    else
+        for family in ipv4 ipv6; do
+            rule=$(fw_rich_rule "$family" "$port" "$proto" "$action" "$id")
+            if firewall-cmd --zone="$zone" --query-rich-rule="$rule" >/dev/null; then firewall-cmd --zone="$zone" --remove-rich-rule="$rule"; fi
+            if firewall-cmd --permanent --zone="$zone" --query-rich-rule="$rule" >/dev/null; then firewall-cmd --permanent --zone="$zone" --remove-rich-rule="$rule"; fi
+        done
+    fi
+}
+fw_apply_rule() {
+    local backend=$1 zone=$2 port=$3 proto=$4 action=$5 id tag f old family rule status existing
+    fw_guard_port "$port" "$proto"
+    choice "$backend" 'ufw firewalld' && choice "$proto" 'tcp udp' && choice "$action" 'allow deny' || die '防火墙规则字段错误。'
+    [[ $backend != firewalld || $zone =~ ^[a-zA-Z0-9_-]+$ ]] || die 'zone字段无效。'
+    fw_records_init; f=$(fw_record_file); id=$(fw_id "$backend" "$zone" "$port" "$proto"); tag="VPSKIT-$id"
+    old=$(jq -r --arg id "$id" '.rules[]|select(.id==$id)|.action' "$f")
+    if [[ $backend == ufw ]]; then
+        status=$(ufw status numbered)
+        # Avoid UFW silently re-labelling an existing unowned rule on the same port.
+        existing=$(awk -v p="$port/$proto" -v tag="$tag" 'index($0,p) && index($0,"# "tag)==0 {print}' <<< "$status")
+        [[ -z $existing ]] || die "检测到 $port/$proto 的外部UFW规则；为避免更改归属，请先人工核对规则顺序。"
+    fi
+    record_update "$f" --arg id "$id" --arg b "$backend" --arg z "$zone" --argjson p "$port" --arg pr "$proto" --arg a "$action" --arg old "${old:-}" '
+      .rules=([.rules[]|select(.id!=$id)]+[{id:$id,backend:$b,zone:$z,port:$p,proto:$pr,action:$a,previous_action:$old,stage:"pending"}])'
+    # Both possible actions are removed for crash recovery; only exact tagged/recorded rules.
+    if [[ $backend == ufw ]]; then fw_ufw_remove_tag "$tag"
+    else
+        fw_remove_rule "$backend" "$zone" "$port" "$proto" allow "$id"
+        fw_remove_rule "$backend" "$zone" "$port" "$proto" deny "$id"
+    fi
+    if [[ $backend == ufw ]]; then
+        ufw insert 1 "$action" in proto "$proto" to any port "$port" comment "$tag"
+        ufw status numbered | grep -Fq "# $tag" || die 'UFW未返回预期规则标识；保留pending记录。'
+    else
+        for family in ipv4 ipv6; do
+            rule=$(fw_rich_rule "$family" "$port" "$proto" "$action" "$id")
+            firewall-cmd --zone="$zone" --add-rich-rule="$rule"
+            firewall-cmd --permanent --zone="$zone" --add-rich-rule="$rule"
+            firewall-cmd --zone="$zone" --query-rich-rule="$rule" >/dev/null
+            firewall-cmd --permanent --zone="$zone" --query-rich-rule="$rule" >/dev/null
+        done
+    fi
+    record_update "$f" --arg id "$id" '(.rules[]|select(.id==$id)).stage="applied"'
+    ok "$backend $zone：$port/$proto → $action（需外网及云安全组验收）"
+}
+firewall_required() {
+    state_basic "$STATE" 2>/dev/null || return 0
+    if component_ready nginx; then printf '80 tcp\n443 tcp\n'; fi
+    jq -r '[.nodes[]|select(.enabled and .mode!="ws" and .mode!="xhttp" and (.listen // "0.0.0.0")!="127.0.0.1" and (.listen // "0.0.0.0")!="::1")]|unique_by(.entry)[]|"\(.port) tcp"+(if .mode=="ss" then "\n\(.port) udp" else "" end)' "$STATE"
+}
+firewall_show() {
+    local f; f=$(fw_record_file)
+    info '只读：不启用/重置防火墙；SSH由管理员管理；云安全组需单独放行。'
+    if command -v ufw >/dev/null; then ufw status verbose || true; fi
+    if command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then firewall-cmd --get-active-zones; firewall-cmd --list-all-zones; fi
+    printf '\n本工具所需公网端口：\n'; firewall_required | sort -k1,1n -k2,2 -u
+    if [[ -f $f ]]; then printf '\n本版托管规则：\n'; jq . "$f"; fi
+    if [[ -f $ROOT/data/firewall.json ]]; then warn '另有旧版firewall.json；它保持原样，本版不会猜测并删除未知格式规则。'; fi
+    printf '\n受保护SSH端口：\n'; ssh_ports | sort -un
+}
+firewall_change() {
+    local action=$1 port=${2:-} proto=${3:-} backend zone p
+    [[ -n $port ]] || ask_valid port '端口（1–65535；拒绝SSH端口）' '' valid_port
+    [[ -n $proto ]] || ask_valid proto '协议：tcp/udp/both' tcp choice 'tcp udp both'
+    fw_guard_port "$port" "$proto"; backend=$(fw_backend); fw_choose_zone zone "$backend"
+    warn '关闭仅影响新入站连接；规则优先级、Docker及云安全组可能影响最终结果。'
+    confirm "$backend zone=$zone：对 $port/$proto 执行 $action" || return 0
+    if [[ $proto == both ]]; then for p in tcp udp; do fw_apply_rule "$backend" "$zone" "$port" "$p" "$action"; done
+    else fw_apply_rule "$backend" "$zone" "$port" "$proto" "$action"; fi
+}
+firewall_sync() {
+    local backend zone port proto rules
+    rules=$(firewall_required | sort -u)
+    [[ -n $rules ]] || { info '没有需同步的已配置公网端口。'; return; }
+    backend=$(fw_backend); fw_choose_zone zone "$backend"
+    printf '将放行以下端口；不自动关闭旧端口：\n%s\n' "$rules"
+    while read -r port proto; do fw_guard_port "$port" "$proto"; done <<< "$rules"
+    confirm '添加所需端口规则（多条规则非原子操作，失败可重试）' || return 0
+    while read -r port proto; do fw_apply_rule "$backend" "$zone" "$port" "$proto" allow; done <<< "$rules"
+}
+firewall_cleanup() {
+    local approved=${1:-no} f backend row b z p pr a id
+    f=$(fw_record_file)
+    [[ -s $f ]] || { info '没有本版托管规则记录；不删除外部或旧格式规则。'; return; }
+    fw_records_init
+    [[ $(jq '.rules|length' "$f") -gt 0 ]] || return 0
+    backend=$(fw_backend)
+    # Preflight all entries before removing anything.
+    while IFS= read -r row; do
+        b=$(jq -r .backend <<< "$row"); p=$(jq -r .port <<< "$row"); pr=$(jq -r .proto <<< "$row"); z=$(jq -r .zone <<< "$row")
+        [[ $b == "$backend" ]] || die '记录包含其他/已停用防火墙的规则；请恢复对应管理器后单独清理。'
+        [[ $b == ufw || $z =~ ^[a-zA-Z0-9_-]+$ ]] || die '记录zone异常。'
+        fw_guard_port "$p" "$pr"
+    done < <(jq -c '.rules[]' "$f")
+    [[ $approved == yes ]] || confirm '仅撤销本版带记录和标识的规则；可能改变端口可达性' || return 0
+    while IFS= read -r row; do
+        b=$(jq -r .backend <<< "$row"); z=$(jq -r .zone <<< "$row"); p=$(jq -r .port <<< "$row"); pr=$(jq -r .proto <<< "$row"); id=$(jq -r .id <<< "$row")
+        fw_remove_rule "$b" "$z" "$p" "$pr" allow "$id"
+        fw_remove_rule "$b" "$z" "$p" "$pr" deny "$id"
+        record_update "$f" --arg id "$id" '.rules|=map(select(.id!=$id))'
+    done < <(jq -c '.rules[]' "$f")
+    ok '本版托管规则已撤销；外部规则及旧格式归属记录未改动。'
+}
+
+swap_record() { printf '%s/data/swap-v2.json' "$ROOT"; }
+swap_active() { swapon --noheadings --raw --show=NAME | grep -Fxq "$1"; }
+swap_file_safe() {
+    local file=$1
+    [[ $file == "$ROOT/swap/swapfile" || $file == /var/lib/vpskit/swapfile ]] || return 1
+    [[ -f $file && ! -L $file && ! -L ${file%/*} && $(stat -c %u "$file") == 0 && $(stat -c %h "$file") == 1 ]]
+}
+swap_current() {
+    local f record file unit persistence='' matches=0
+    record=$(swap_record)
+    if [[ -e $record ]]; then
+        [[ ! -L $record ]] && jq -e '.owner=="VPSKIT_SWAP_V2" and (.size_mib|type=="number") and (.file|type=="string")' "$record" >/dev/null || die 'Swap记录损坏或为链接。'
+        file=$(jq -r .file "$record")
+        [[ $file == "$ROOT/swap/swapfile" || $file == /var/lib/vpskit/swapfile ]] || die 'Swap记录指向非托管路径。'
+        cat "$record"; return
+    fi
+    # Recognize both previous layouts only with concrete ownership evidence.
+    file=''
+    if [[ -e /var/lib/vpskit/swapfile ]]; then
+        [[ ! -L /var/lib/vpskit && -f /var/lib/vpskit/.owned && $(cat /var/lib/vpskit/.owned) == VPSKIT_SWAP ]] || die '发现无法确认归属的旧Swap，未创建重复文件。'
+        file=/var/lib/vpskit/swapfile; persistence=fstab; matches=$((matches+1))
+    fi
+    if [[ -e $ROOT/swap/swapfile ]]; then
+        unit=$(systemd-escape -p --suffix=swap "$ROOT/swap/swapfile")
+        [[ -f $ROOT/data/swap.json && -f $SYSTEMD/$unit && ! -L $SYSTEMD/$unit ]] && grep -Fq '# VPSKIT_OWNED' "$SYSTEMD/$unit" && grep -Fxq "What=$ROOT/swap/swapfile" "$SYSTEMD/$unit" || die '发现原版Swap但归属检查未通过；不会覆盖或重复创建。'
+        file="$ROOT/swap/swapfile"; persistence=systemd; matches=$((matches+1))
+    fi
+    ((matches<=1)) || die '检测到两套历史Swap文件，请先由管理员核对，避免重复或错误移除。'
+    [[ -n $file ]] || return 1
+    swap_file_safe "$file" || die '历史Swap文件不是root独占的普通单链接文件。'
+    [[ $(blkid -p -s TYPE -o value "$file" 2>/dev/null || true) == swap ]] || die '历史文件不是有效Swap，拒绝重新格式化。'
+    jq -n --arg f "$file" --arg p "$persistence" --argjson n "$(( $(stat -c %s "$file")/1048576 ))" '{owner:"VPSKIT_SWAP_V2",file:$f,size_mib:$n,persistence:$p,stage:"formatted",adopted:true}'
+}
+swap_show() {
+    local current unit
+    free -h; swapon --show
+    if [[ -e $(swap_record) || -e $ROOT/swap/swapfile || -e /var/lib/vpskit/swapfile ]]; then
+        current=$(swap_current) || die '历史Swap归属检查失败，未做任何更改。'
+        printf '\n识别到本工具Swap（不自动变更）：\n'; jq . <<< "$current"
+        unit=$(systemd-escape -p --suffix=swap "$(jq -r .file <<< "$current")")
+        printf '启动单元：%s\n' "$unit"; systemctl is-enabled "$unit" 2>/dev/null || true
+    else info '没有可识别的本工具Swap；现有系统Swap保持不变。'; fi
+}
+swap_create() {
+    local size=${1:-} current='' record file unit stage persistence fstype available expected temp
+    need mkswap; need swapon; need systemd-escape; need blkid
+    record=$(swap_record)
+    # Capture failure without confusing absence with an ownership error (die exits 1).
+    if [[ -e $record || -e $ROOT/swap/swapfile || -e /var/lib/vpskit/swapfile ]]; then
+        current=$(swap_current) || die '历史Swap检查失败；没有创建新文件。'
+        file=$(jq -r .file <<< "$current"); size=$(jq -r .size_mib <<< "$current")
+        persistence=$(jq -r .persistence <<< "$current"); stage=$(jq -r .stage <<< "$current")
+        warn "复用已有托管Swap $file（$size MiB），忽略新的容量请求；变更大小请先安全移除。"
+        confirm '恢复/修复已有Swap，不重新分配另一份文件' || return 0
+        printf '%s\n' "$current" > "$record"; chmod 600 "$record"
+    else
+        [[ -n $size ]] || ask_valid size 'Swap MiB（256–8192，256的倍数）' 1024 number 256 8192
+        number "$size" 256 8192 && ((size%256==0)) || die '容量必须为256–8192且为256的倍数。'
+        [[ ! -L $ROOT/swap ]] || die 'Swap目录不能为符号链接。'
+        fstype=$(stat -f -c %T "$ROOT")
+        case "$fstype" in ext2/ext3|xfs) ;; *) die "文件系统 $fstype 不在自动创建支持范围；Btrfs/ZFS/容器请自行核对。";; esac
+        available=$(df -Pk "$ROOT" | awk 'NR==2{print $4}')
+        ((available>=size*1024+1048576)) || die '磁盘不足；创建后要求至少保留1GiB可用空间。'
+        confirm "创建 $size MiB Swap；只用独立systemd .swap单元，不改fstab，不修改其他Swap" || return 0
+        file="$ROOT/swap/swapfile"; persistence=systemd; stage=allocating
+        mkdir -p "$ROOT/swap"; chown 0:0 "$ROOT/swap"; chmod 700 "$ROOT/swap"
+        jq -n --arg f "$file" --argjson n "$size" '{owner:"VPSKIT_SWAP_V2",file:$f,size_mib:$n,persistence:"systemd",stage:"allocating"}' > "$record"
+        chmod 600 "$record"
+        (set -C; : > "$file") || die 'Swap文件已被其他操作创建，停止。'
+        chmod 600 "$file"
+    fi
+    file=$(jq -r .file "$record"); stage=$(jq -r .stage "$record")
+    number "$size" 256 8192 || die '记录的Swap大小无效。'
+    swap_file_safe "$file" || die 'Swap文件缺失或权限归属异常；保留记录，未自动重建。'
+    if [[ $stage == allocating ]]; then
+        swap_active "$file" && die '标记为未完成分配的文件却已在使用；拒绝覆盖。'
+        dd if=/dev/zero of="$file" bs=1M count="$size" conv=fsync status=none
+        [[ $(stat -c %s "$file") == "$((size*1048576))" ]] || die '分配大小不完整；记录保留，可重试恢复。'
+        mkswap "$file"
+        record_update "$record" '.stage="formatted"'
+    fi
+    [[ $(blkid -p -s TYPE -o value "$file" 2>/dev/null || true) == swap ]] || die '文件签名不是Swap；拒绝覆盖格式化。'
+    chmod 600 "$file"
+    persistence=$(jq -r .persistence "$record")
+    if [[ $persistence == fstab ]]; then
+        [[ -f /etc/fstab && ! -L /etc/fstab ]] || die 'fstab异常。'
+        grep -Eq '^/var/lib/vpskit/swapfile[[:space:]].*# VPSKIT_SWAP$' /etc/fstab || die '旧版fstab归属行缺失；请人工核对，不自动写入未知启动配置。'
+        if ! swap_active "$file"; then swapon "$file" || die 'Swap启用失败；文件和记录保留。'; fi
+    else
+        [[ $persistence == systemd ]] || die 'Swap启动方式字段无效。'
+        unit=$(systemd-escape -p --suffix=swap "$file")
+        if [[ -e $SYSTEMD/$unit ]]; then [[ ! -L $SYSTEMD/$unit ]] && grep -Fq '# VPSKIT_OWNED' "$SYSTEMD/$unit" || die '同名swap服务不属于本工具。'; fi
+        cat > "$WORK/swap-unit" <<EOF
+# VPSKIT_OWNED SWAP_V2
+[Unit]
+Description=VPSKit managed swap (not system swap)
+[Swap]
+What=$file
+[Install]
+WantedBy=swap.target
+EOF
+        install -m 644 "$WORK/swap-unit" "$SYSTEMD/$unit"
+        record_update "$record" '.stage="unit-written"'
+        systemctl daemon-reload
+        systemctl enable --now "$unit" || die 'Swap单元启用失败；文件和阶段记录保留，修复权限后可重试。'
+    fi
+    swap_active "$file" || die '没有检测到实际激活的Swap；记录保留。'
+    record_update "$record" '.stage="active"'
+    ok '托管Swap已启用/恢复；没有额外创建第二份交换文件。'
+}
+swap_memory_guard() {
+    local file=$1 used available
+    used=$(swapon --bytes --noheadings --raw --show=NAME,USED | awk -v f="$file" '$1==f{print $2}')
+    [[ $used =~ ^[0-9]+$ ]] || die '无法读取该Swap实际使用量，拒绝盲目swapoff。'
+    available=$(awk '/MemAvailable:/{print $2*1024}' /proc/meminfo)
+    [[ $available =~ ^[0-9]+$ ]] || available=$(awk '/MemAvailable:/{printf "%.0f",$2*1024}' /proc/meminfo)
+    ((available>=used+134217728)) || die '可用RAM不足：至少需已用本工具Swap+128MiB；未关闭或删除任何文件。'
+}
+swap_remove() {
+    local approved=${1:-no} record current file persistence unit
+    record=$(swap_record)
+    if [[ ! -e $record && ! -e $ROOT/swap/swapfile && ! -e /var/lib/vpskit/swapfile ]]; then info '没有本工具Swap。'; return; fi
+    current=$(swap_current) || die '无法确认Swap归属。'
+    file=$(jq -r .file <<< "$current"); persistence=$(jq -r .persistence <<< "$current")
+    swap_file_safe "$file" || die 'Swap文件安全检查失败。'
+    [[ $approved == yes ]] || confirm "仅移除 $file；先检查可用RAM，失败则保留文件" || return 0
+    if swap_active "$file"; then swap_memory_guard "$file"; swapoff "$file" || die 'swapoff失败，文件及启动配置保持不变。'; fi
+    if [[ $persistence == fstab ]]; then
+        [[ -f /etc/fstab && ! -L /etc/fstab ]] || die 'fstab异常，文件保留。'
+        mkdir -p "$ROOT/backup/system"; cp -a /etc/fstab "$ROOT/backup/system/fstab-before-swap-remove-$(date +%s)"
+        sed -i '\|^/var/lib/vpskit/swapfile[[:space:]].*# VPSKIT_SWAP$|d' /etc/fstab
+    else
+        unit=$(systemd-escape -p --suffix=swap "$file")
+        if [[ -f $SYSTEMD/$unit ]]; then
+            [[ ! -L $SYSTEMD/$unit ]] && grep -Fq '# VPSKIT_OWNED' "$SYSTEMD/$unit" || die 'swap服务归属改变，未删除。'
+            systemctl disable --now "$unit"; rm -f "$SYSTEMD/$unit"; systemctl daemon-reload
+        fi
+    fi
+    swap_active "$file" && die 'Swap仍在使用，拒绝删除文件。'
+    rm -f -- "$file" "$record"
+    if [[ $file == /var/lib/vpskit/swapfile ]]; then rm -f /var/lib/vpskit/.owned; rmdir /var/lib/vpskit 2>/dev/null || true
+    else
+        if [[ -f $ROOT/data/swap.json ]]; then mkdir -p "$ROOT/backup/system"; mv "$ROOT/data/swap.json" "$ROOT/backup/system/swap-legacy-removed-$(date +%s).json"; fi
+        rmdir "$ROOT/swap" 2>/dev/null || true
+    fi
+    ok '只移除了可验证的本工具Swap，其他系统Swap保持不变。'
+}
+uninstall_component() {
+    local name=$1
+    choice "$name" 'nginx xray acme' || die '组件无效。'; ensure_component "$name"
+    case "$name" in
+        nginx) [[ $(get '.sites|length') == 0 ]] && ! jq -e '.nodes[]|select(.mode=="ws" or .mode=="xhttp")' "$STATE" >/dev/null || die '仍有网站/网关节点依赖Nginx，请先移除这些绑定。';;
+        acme) ! jq -e '.sites[]|select(.issued and (.certificate_source // "acme")!="manual")' "$STATE" >/dev/null || die '仍有自动续期证书依赖ACME；先移除网站或明确改为手动证书。';;
+    esac
+    warn '单组件卸载保留其他组件与网站文件；Xray卸载会删除全部节点。'
+    confirm "卸载 $name，并按剩余配置重新应用" || return 0
+    begin_tx "uninstall:$name" components
+    json_update --arg n "$name" '.components[$n]=false | del(.versions[$n]) | if $n=="xray" then .nodes=[] else . end'
+    apply_config
+    case "$name" in
+        xray) rm -f "$XRAY" "$ROOT/config/xray.json";;
+        nginx) rm -rf -- "$ROOT/nginx"; mkdir -m 700 "$ROOT/nginx"; rm -f "$ROOT/config/nginx.conf";;
+        acme) rm -rf -- "$ROOT/acme"; mkdir -m 700 "$ROOT/acme";;
+    esac
+    if [[ $name != acme && -f $SYSTEMD/vpskit-$name.service ]]; then
+        systemctl disable --now "vpskit-$name.service"; rm -f "$SYSTEMD/vpskit-$name.service"; systemctl daemon-reload
+    fi
+    commit_tx
+    ok "已卸载 $name；系统共享依赖未卸载。"
+}
+uninstall_all() {
+    local answer u f target mounts
+    [[ $ROOT == /opt/vpskit && $TX == 0 ]] || die '完整卸载仅允许正式安装路径且无活动事务。'
+    [[ -f $ROOT/.vpskit-owned && $(cat "$ROOT/.vpskit-owned") == VPSKIT_V1 && ! -L $ROOT ]] || die '安装目录归属不匹配。'
+    if [[ -f $ROOT/data/firewall.json ]]; then
+        die '发现旧格式firewall.json；无法安全推断其规则归属。先用原管理器核对清理，或选择保留数据停用；本版拒绝丢弃清理记录。'
+    fi
+    if [[ -e /etc/sysctl.d/90-vpskit.conf || -L /etc/sysctl.d/90-vpskit.conf ]]; then
+        [[ ! -L /etc/sysctl.d/90-vpskit.conf ]] && grep -Fxq '# VPSKIT_OWNED BBR_V2' /etc/sysctl.d/90-vpskit.conf && [[ -f $ROOT/data/bbr-v2.json ]] || die '存在旧版/外部sysctl文件，需先核对迁移或清理；未删除目录。'
+    fi
+    mounts=$(findmnt -rn -o TARGET)
+    if grep -Fq "$ROOT/" <<< "$mounts"; then die '安装目录内存在子挂载，拒绝递归删除。'; fi
+    for u in "${UNITS[@]}"; do
+        [[ ! -e $SYSTEMD/$u ]] || { [[ ! -L $SYSTEMD/$u ]] && grep -Fq '# VPSKIT_OWNED' "$SYSTEMD/$u"; } || die "服务 $u 不属于本工具。"
+    done
+    warn "将删除 $ROOT 下的网站、节点、证书、日志和全部历史备份，以及本工具服务和入口。"
+    warn '会撤销可识别的本版防火墙/BBR设置，并安全移除托管Swap；共享软件包和SSH不变。'
+    confirm '已经另行备份，并确认执行完整卸载' || return 0
+    ask answer '再次输入 DELETE VPSKIT 才会真正删除' ''
+    [[ $answer == 'DELETE VPSKIT' ]] || { warn '删除口令不匹配，未执行卸载。'; return 0; }
+    # Resource cleanup occurs before removing ownership records. Failures stop deletion.
+    swap_remove yes
+    firewall_cleanup yes
+    bbr_restore yes
+    for u in "${UNITS[@]}"; do
+        if [[ -f $SYSTEMD/$u ]]; then systemctl disable --now "$u"; rm -f "$SYSTEMD/$u"; fi
+    done
+    if [[ -L $ENTRY && $(readlink "$ENTRY") == "$ROOT/vpskit.sh" ]]; then rm -f "$ENTRY"; fi
+    systemctl daemon-reload
+    [[ $ROOT == /opt/vpskit ]] || die '最终删除仅允许正式安装路径 /opt/vpskit。'
+    [[ $TX == 0 ]] || die '存在活动配置事务，拒绝完整删除。'
+    LOGFILE=''
+    rm -rf --one-file-system -- "$ROOT"
+    ok 'VPSKit完整资料已删除；没有卸载共享依赖、修改SSH或清空防火墙。'
+}
+
+log() {
+    local level=$1 color='' reset=''; shift
+    if [[ -t 2 || ${COLOR_MODE:-auto} == always ]]; then
+        case "$level" in OK) color=$GREEN;; WARN) color=$YELLOW;; ERROR) color=$RED;; *) color=$CYAN;; esac
+        reset=$RESET
+    fi
+    printf '%s[%s]%s %s\n' "$color" "$level" "$reset" "$*" >&2
+    if [[ -n $LOGFILE && -d ${LOGFILE%/*} ]]; then
+        printf '[%s] [%s] %s\n' "$(date -u '+%FT%TZ')" "$level" "$*" >> "$LOGFILE"
+    fi
+}
+ask() {
+    local ap_dest=$1 ap_label=$2 ap_default=${3:-} ap_reply
+    [[ -n $TTY_FD ]] || die '此操作需要交互终端；输入 :q 可取消。'
+    printf '%s%s%s' "$BOLD" "$ap_label" "$RESET" >&2
+    [[ -z $ap_default ]] || printf ' %s[%s]%s' "$CYAN" "$ap_default" "$RESET" >&2
+    printf ': ' >&2
+    IFS= read -r -u "$TTY_FD" ap_reply || die '输入已关闭。'
+    [[ $ap_reply != :q ]] || exit 130
+    printf -v "$ap_dest" '%s' "${ap_reply:-$ap_default}"
+}
+secret() {
+    local sp_dest=$1 sp_label=$2 sp_reply
+    [[ -n $TTY_FD ]] || die '凭据输入需要终端。'
+    printf '%s%s%s（不回显；:q取消）: ' "$YELLOW" "$sp_label" "$RESET" >&2
+    IFS= read -r -s -u "$TTY_FD" sp_reply || die '输入已关闭。'
+    printf '\n' >&2
+    [[ $sp_reply != :q ]] || exit 130
+    printf -v "$sp_dest" '%s' "$sp_reply"
+}
+advanced_edit() {
+    local key=${1:-} value workers connections nofile description=''
+    ui_title '高级参数修改'
+    if [[ -z $key || $key == capacity ]]; then
+        ui_note '用途：同时设置进程数、连接槽位与文件数预算，避免逐项修改造成临时不一致。'
+        ui_note '要求：小内存从1个Worker开始；反向代理连接包括客户端和上游，不等于用户人数。'
+        ask_valid workers 'Worker数量（auto或1～64）' "$(ng_value workers)" valid_worker_count
+        ask_valid connections '每个Worker连接上限（128～65535）' "$(ng_value connections)" number 128 65535
+        ask_valid nofile 'Nginx文件数上限（2048～1048576，至少为连接数+1024）' "$(ng_value nofile)" number 2048 1048576
+        advanced_set nginx.workers "$workers" nginx.connections "$connections" nginx.nofile "$nofile"
+        return
+    fi
+    case "$key" in
+        nginx.worker_user)
+            worker_users
+            ui_note '要求：已有非root、禁止交互登录的服务账户；auto复用合格账户，不创建新用户。'
+            value=$(ng_value worker_user);;
+        xray.nofile)
+            ui_note '用途：Xray进程文件描述符上限；要求2048～1048576且不超过内核nr_open；应用会按需重启Xray。'
+            value=$(xray_nofile);;
+        nginx.*)
+            description=$(menu_catalog | awk -F'|' -v k="param:${key#nginx.}" '$7==k{print "用途："$4"；要求："$5}')
+            [[ -n $description ]] || die '该参数请通过 advanced set 修改，或从高级面板选择有效选项。'
+            ui_note "$description"; value=$(ng_value "${key#nginx.}");;
+        *) die '未知高级参数。';;
+    esac
+    ask value "设置 $key（true/false用于开关；:q取消）" "$value"
+    advanced_set "$key" "$value"
+}
+paths_show() {
+    cat <<EOF_PATHS
+管理代码：$ROOT/vpskit.sh
+快捷命令：$ENTRY
+持久配置：$STATE（含凭据，禁止公开）
+生成配置：$ROOT/config/nginx.conf / xray.json
+网站文件：$ROOT/www/<domain>/
+证书/私钥：$ROOT/certs/<domain>/current/
+ACME账户与DNS凭据：$ROOT/acme/config/
+历史快照：$ROOT/backup/history/（最近$HISTORY_KEEP份，包含敏感资料）
+最近事务回滚：$ROOT/backup/last/
+代码备份：$ROOT/backup/code/
+服务文件：$SYSTEMD/vpskit-*.service / vpskit-maintain.timer
+日志：$ROOT/logs/
+防火墙归属：$ROOT/data/firewall-v2.json（旧版firewall.json保持原样）
+BBR归属：$ROOT/data/bbr-v2.json；持久化：/etc/sysctl.d/90-vpskit.conf
+新Swap文件：$ROOT/swap/swapfile；记录：$ROOT/data/swap-v2.json
+旧增强版Swap：/var/lib/vpskit/swapfile（仅确认归属后复用）
+不要直接编辑生成配置；使用节点、网站和高级配置菜单。
+配置快照不包含网站内容、组件二进制、防火墙、BBR或Swap，不能代替整机备份。
+EOF_PATHS
+}
+logs_show() {
+    local name=${1:-nginx} lines=${2:-100} file
+    number "$lines" 1 2000 || die '日志行数应为1～2000。'
+    warn '日志可能包含IP、路径和错误信息，分享前请脱敏。'
+    if [[ $name == cert ]]; then journalctl -u vpskit-maintain.service -n "$lines" --no-pager; return; fi
+    case "$name" in nginx) file=nginx.log;; xray) file=xray.log;; manager) file=manage.log;; service) file=nginx-service.log;; access) file=access.log;; *) die '日志类型：nginx/xray/manager/service/access/cert。';; esac
+    [[ -f $ROOT/logs/$file && ! -L $ROOT/logs/$file ]] || { info '日志文件尚不存在；访问日志需在高级配置中先开启。'; return; }
+    tail -n "$lines" "$ROOT/logs/$file"
+}
+usage() {
+    case "${1:-}" in
+        workflow)
+            cat <<'TEXT'
+已有部署：先下载完整文件 → bash -n → selftest → update manager 本地文件 → 进入面板。
+只换面板/代码不改state.json、不调用重启或reload；之后明确修改配置才应用。
+新装：1部署向导 → 选择A或B → 安装组件 → 网站/证书（B）→ 节点 → 导出客户端。
+中断恢复：14历史 → 查看快照/恢复中断事务；不要删除state.json重新开始。
+高级参数：13 → 当前值 → 修改 → 确认；连接数提升必须同时检查文件数与RAM。
+网站/节点：修改前自动创建配置快照；恢复范围不含网站内容、防火墙、Swap或BBR。
+危险操作：红色提示 + yes确认；完整删除额外要求输入DELETE VPSKIT。
+TEXT
+            return;;
+        colors)
+            cat <<'TEXT'
+紫色：面板标题；蓝色：选项编号/菜单；青色：参数与当前值。
+绿色：正常/只读；黄色：注意/敏感/需检查；红色：失败/危险删除；灰色：说明。
+默认仅在支持颜色的交互终端输出ANSI颜色，重定向输出自动关闭。
+关闭：vpskit --no-color；强制：vpskit --color=always；环境变量NO_COLOR优先关闭。
+演示：bash ./vpskit.sh preview；全部面板：bash ./vpskit.sh preview all。
+preview/help/version/selftest不要求root或systemd，不创建安装目录。
+TEXT
+            return;;
+        '') ;; *) die '帮助主题可选 workflow 或 colors。';;
+    esac
+    cat <<'TEXT'
+VPSKit 1.7.1-panel 完整单文件管理器（独立增强版，非上游官方发布）
+用法：sudo bash ./vpskit.sh [选项] [命令] / sudo vpskit [选项] [命令]
+不带命令进入彩色管理面板；每项均显示用途、要求和风险类别。
+选项：--no-color / --color=auto|always|never（位于命令之前）
+
+version | help [workflow|colors] | selftest | preview [面板|all]  只读，无需root
+install [xray|nginx|acme] [Xray版本]         新装/继续向导或单独组件
+wizard configure|status                   默认方案配置/已保存进度
+apply | status | doctor | paths | network-check
+node list|add|share|export|client [名称]
+node enable|disable|delete|rotate|edit|listen [名称]
+node rename|port|host|address [名称] [值]    地址/端口同步共享入口
+site list|add|edit|remove [域名]
+cert issue|settings [域名] | cert status | cert renew
+cert import [域名 /证书链.pem /私钥.pem]    无参数时交互选择
+advanced show|users|defaults | advanced edit [参数键|capacity]
+advanced set nginx.workers 2 nginx.connections 2048 nginx.nofile 8192
+advanced set nginx.worker_user auto | advanced set xray.nofile 16384
+history list | history save [备注]
+history restore [快照ID] [full|state|advanced] | rollback | repair
+update manager [/新版.sh|HTTPS地址] [独立确认的SHA256]  仅替换代码
+update nginx|xray|acme [Xray版本] | update all           单独更新组件
+optimize status|bbr|restore|mtu [目标] | performance gzip [true|false]
+edge status|show [域名] | edge edit | edge refresh | edge guide | edge traffic
+edge profile|bots|limits|cache|origin|aop|probe|reset [域名]
+edge set 域名 bots|rate|burst|connections|kbps|static_ttl|gzip|origin|aop 值
+service nginx|xray start|stop|restart | service nginx reload
+logs [nginx|xray|manager|service|access|cert] [行数]
+firewall status | firewall open|close [端口] [tcp|udp|both]
+firewall sync | firewall cleanup           支持已启用的UFW或firewalld
+swap status | swap enable | swap custom [MiB] | swap remove
+maintenance                               证书、日志、官方Cloudflare资料维护
+uninstall [keep|xray|nginx|acme|all]         停用保留/分组件/完整删除
+
+Xray版本沿用固定默认v26.3.27；显式指定latest才查询最新版。
+代码更新不会重置配置或重启服务；应用新配置需要明确执行apply/保存设置。
+操作默认不批准；:q取消；完整卸载有二次口令。不要公开state.json和备份。
+TEXT
+}
+explain() {
+    cat <<'TEXT'
+方案 A：VLESS REALITY 直接连接VPS；无需网站域名证书，但需要合适且可达的TLS目标。
+方案 B：域名 → Nginx TLS → XHTTP/WS的127.0.0.1后端；可选Cloudflare橙云。
+网站支持静态文件/模板、本机HTTP反向代理和HTTPS重定向。
+可另行添加VMess、Trojan、直接TLS和Shadowsocks；共享入口用户共用监听配置。
+Nginx主进程保留root，Worker复用已有合格非root服务账户，私钥和状态文件保持私有。
+worker_connections计算客户端及上游连接，不等于可用用户数；提高限额不保证吞吐提升。
+默认不抢占外部服务端口、不改SSH、不启用/重置防火墙、不自动设置BBR。
+部署需Debian/Ubuntu、root、systemd及软件源/组件源连通；公网需自行配置DNS及云安全组。
+TEXT
+}
 main() {
-    local command=${1:-menu} action=${2:-} rc
-    case "$command" in version|--version|-V) printf '%s\n' "$VERSION"; return;; help|--help|-h) usage; return;; selftest) selftest; return;; esac
-    if [[ $command == _service ]]; then service_runner "${2:-}"; return; fi
+    local command action flag
+    while (($#)); do
+        case "$1" in
+            --no-color) COLOR_MODE=never; shift;;
+            --color=*) COLOR_MODE=${1#--color=}; shift;;
+            --color) (($#>=2)) || die '--color需要auto/always/never。'; COLOR_MODE=$2; shift 2;;
+            --) shift; break;;
+            *) break;;
+        esac
+    done
+    choice "$COLOR_MODE" 'auto always never' || die '颜色模式只能为auto/always/never。'
+    export VPSKIT_COLOR="$COLOR_MODE"
+    colors
+    command=${1:-menu}; action=${2:-}
+    case "$command" in
+        version|--version|-V) printf '%s\n' "$VERSION"; return;;
+        help|--help|-h) usage "$action"; return;;
+        explain) explain; return;;
+        edge) if [[ $action == guide ]]; then edge_guide; return; fi;;
+        selftest) selftest; return;;
+        preview) menu_preview "${2:-main}"; return;;
+        _service) service_runner "$action"; return;;
+        menu|install|wizard|apply|status|doctor|paths|node|site|cert|advanced|history|rollback|repair|update|edge|performance|optimize|service|logs|firewall|swap|maintenance|uninstall|network-check) ;;
+        *) die '未知命令；使用help查看。';;
+    esac
     system_check
-    [[ -f $SELF && $SELF != /dev/fd/* && $SELF != /proc/* ]] || die '请先把完整脚本下载为本地普通文件，再执行 sudo bash ./vpskit.sh；不依赖在线旧脚本。'
+    [[ -f $SELF && $SELF != /dev/fd/* && $SELF != /proc/* ]] || die '请先下载完整脚本为本地普通文件，再运行sudo bash ./vpskit.sh。'
     SELF=$(realpath -- "$SELF")
-    # /dev/tty is optional for status/maintenance; mutations that need approval
-    # refuse to invent approval when no terminal is attached.
     if { exec {TTY_FD}<>/dev/tty; } 2>/dev/null; then :; else TTY_FD=''; fi
     if [[ $command == menu ]]; then main_menu; return; fi
+    if [[ -z $action ]]; then
+        case "$command" in
+            node) menu_group nodes; return;; site|cert) menu_group websites; return;;
+            advanced|history|update|edge|firewall|swap|optimize) menu_group "$command"; return;;
+        esac
+    fi
     safe_layout
     trap cleanup EXIT
     trap 'error_trap "$?" "$LINENO"' ERR
@@ -2070,47 +2989,61 @@ main() {
     if [[ $command == install ]]; then install_dependencies; fi
     need jq; need openssl
     if [[ $command == update && $action == manager ]]; then
-        # Never initialize, migrate, render or reload state on code-only update.
         update_manager "${3:-}" "${4:-}"; return
     fi
-    if [[ $command == repair ]]; then repair_transaction; return; fi
-    if [[ $command == rollback ]]; then rollback_last; return; fi
-    if [[ $command == history ]]; then
-        case "$action" in list) history_list;; save) history_save "${3:-manual}";; restore) history_restore "${3:-}" "${4:-full}";; *) die 'history: list/save/restore。';; esac
-        return
-    fi
-    if [[ -d $ROOT/backup/transaction ]]; then die '检测到未完成事务；先运行repair再变更配置。'; fi
-    if [[ $command == status ]]; then status_show; return; fi
-    if [[ $command == paths ]]; then paths_show; return; fi
-    if [[ $command == install ]]; then init_state
-    else state_basic "$STATE" || die '没有可用state.json；新装请运行install，已有部署请从history恢复。'; fi
+    case "$command" in
+        repair) repair_transaction; return;; rollback) rollback_last; return;;
+        history)
+            case "$action" in list) history_list;; save) history_save "${3:-manual}";; restore) history_restore "${3:-}" "${4:-full}";; *) die 'history: list/save/restore。';; esac
+            return;;
+        status) status_show; return;; paths) paths_show; return;;
+    esac
+    if [[ -d $ROOT/backup/transaction ]]; then die '发现未完成事务；先运行repair，不要覆盖原配置。'; fi
+    case "$command" in
+        firewall)
+            case "$action" in status) firewall_show;; open|allow) firewall_change allow "${3:-}" "${4:-}";; close|deny) firewall_change deny "${3:-}" "${4:-}";; sync) firewall_sync;; cleanup|clean) firewall_cleanup;; *) die 'firewall: status/open/close/sync/cleanup。';; esac; return;;
+        swap)
+            case "$action" in status) swap_show;; enable) swap_create 1024;; custom|create) swap_create "${3:-}";; remove|disable) swap_remove;; *) die 'swap: status/enable/custom/remove。';; esac; return;;
+        optimize)
+            case "$action" in status) optimize_status;; bbr) bbr_enable;; restore) bbr_restore;; mtu) mtu_probe "${3:-}";; gzip) state_basic "$STATE" || die '请先部署。'; performance_gzip "${3:-}";; *) die 'optimize: status/bbr/restore/mtu/gzip。';; esac; return;;
+        wizard) if [[ $action == status ]]; then wizard_status; return; fi;;
+        logs) logs_show "${2:-nginx}" "${3:-100}"; return;;
+    esac
+    if [[ $command == install || ( $command == wizard && $action == configure ) ]]; then init_state
+    else state_basic "$STATE" || die '没有有效state.json；新装运行install，已有部署请从history恢复。'; fi
     case "$command" in
         install) if [[ -z $action ]]; then install_wizard; else install_component "$action" "${3:-$XRAY_DEFAULT_VERSION}"; fi;;
-        apply) apply_existing;;
-        doctor) doctor;;
+        wizard) [[ $action == configure ]] || die 'wizard: configure/status。'; wizard_configure;;
+        apply) apply_existing;; doctor) doctor;; network-check) network_check;;
         node)
             case "$action" in
                 list) node_list;; add) node_add;; share) node_share "${3:-}";; export) node_export "${3:-}";; client) node_client "${3:-}";;
+                edit|credential) node_set_credential "${3:-}";; listen) node_set_listen "${3:-}";; address) node_change host "${3:-}" "${4:-}";;
                 enable|disable|delete|rotate|rename|port|host) node_change "$action" "${3:-}" "${4:-}";;
-                *) die 'node: list/add/share/enable/disable/delete/rotate/rename/port/host/export/client。';;
+                *) die 'node: list/add/share/edit/listen/enable/disable/delete/rotate/rename/port/host/export/client。';;
             esac;;
-        site) case "$action" in list) site_list;; add|edit) site_configure "${3:-}";; remove) site_remove "${3:-}";; *) die 'site: list/add/edit/remove。';; esac;;
-        cert) case "$action" in issue) cert_issue "${3:-}";; status) cert_status;; renew) cert_renew;; import) (($#==5)) || die 'cert import需要域名、证书路径、私钥路径。'; cert_import "$3" "$4" "$5";; *) die 'cert: issue/status/renew/import。';; esac;;
-        advanced)
-            case "$action" in show) advanced_show;; edit) advanced_edit "${3:-}";; defaults) advanced_defaults;; set) shift 2; advanced_set "$@";; *) die 'advanced: show/edit/set/defaults。';; esac;;
-        update)
-            choice "$action" 'nginx xray acme' || die 'update: manager/nginx/xray/acme。'
-            confirm "更新组件$action，保留配置；必要时重启相关服务" || return 0
-            install_dependencies; install_component "$action" "${3:-$XRAY_DEFAULT_VERSION}" yes;;
-        edge) case "$action" in show) edge_show "${3:-}";; edit) edge_edit;; refresh) edge_refresh;; set) (($#==5)) || die 'edge set需要域名、键、值。'; edge_set "$3" "$4" "$5";; *) die 'edge: show/edit/refresh/set。';; esac;;
-        performance) [[ $action == gzip ]] || die 'performance仅支持gzip；不自动改动BBR或内核。'; performance_gzip "${3:-}";;
-        service) service_action "$action" "${3:-}";;
-        logs) logs_show "${2:-nginx}" "${3:-100}";;
-        firewall) case "$action" in status) firewall_show;; allow) firewall_allow "${3:-}" "${4:-tcp}";; *) die 'firewall: status/allow。';; esac;;
-        swap) case "$action" in status) swap_show;; create) swap_create "${3:-}";; remove) swap_remove;; *) die 'swap: status/create/remove。';; esac;;
-        maintenance) cert_renew; rotate_logs;;
-        uninstall) uninstall_keep_data;;
-        *) die '未知命令；运行help查看。';;
+        site) case "$action" in list) site_list;; add) site_configure "${3:-}";; edit) site_edit_existing "${3:-}";; remove) site_remove "${3:-}";; *) die 'site: list/add/edit/remove。';; esac;;
+        cert)
+            case "$action" in
+                issue) cert_issue "${3:-}";; settings) cert_settings "${3:-}";; status) cert_status;; renew) cert_renew;;
+                import) if (($#==2)); then cert_import_interactive; else (($#==5)) || die 'cert import需要域名、证书路径、私钥路径。'; cert_import "$3" "$4" "$5"; fi;;
+                *) die 'cert: issue/settings/status/renew/import。';;
+            esac;;
+        advanced) case "$action" in show) advanced_show;; users) worker_users;; edit) advanced_edit "${3:-}";; defaults) advanced_defaults;; set) shift 2; advanced_set "$@";; *) die 'advanced: show/users/edit/set/defaults。';; esac;;
+        update) if [[ $action == all ]]; then update_all; else component_update "$action" "${3:-}"; fi;;
+        edge)
+            case "$action" in
+                status) edge_status_all;; show) if [[ -n ${3:-} ]]; then edge_show "$3"; else edge_status_all; fi;;
+                edit) edge_edit;; refresh) edge_refresh;; guide) edge_guide;; traffic) edge_traffic;; probe) edge_probe "${3:-}";;
+                profile|bots|limits|cache|origin|aop|reset) edge_action "$action" "${3:-}";;
+                set) (($#==5)) || die 'edge set需要域名、键、值。'; edge_set "$3" "$4" "$5";;
+                *) die 'edge: status/edit/refresh/guide/traffic/probe/profile/bots/limits/cache/origin/aop/reset/set。';;
+            esac;;
+        performance) [[ $action == gzip ]] || die 'performance: gzip。'; performance_gzip "${3:-}";;
+        service) service_control "$action" "${3:-}";;
+        maintenance) cert_renew; rotate_logs; edge_maintenance;;
+        uninstall) case "${action:-keep}" in keep) uninstall_keep_data;; all) uninstall_all;; nginx|xray|acme) uninstall_component "$action";; *) die 'uninstall: keep/xray/nginx/acme/all。';; esac;;
     esac
 }
+
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then main "$@"; fi
