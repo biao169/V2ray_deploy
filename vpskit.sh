@@ -1,433 +1,936 @@
 #!/usr/bin/env bash
-# VPSKIT_SINGLE_FILE - MIT License - Copyright (c) 2026 VPSKit contributors
-# VPSKit 1.6.0 | Debian 12+, Ubuntu 18.04+, systemd, amd64/arm64, Bash 4.4+.
-# 单文件交付；运行配置/上游程序/证书在 /opt/vpskit；不创建系统账户。
-# 使用: sudo bash vpskit.sh ; 安装后: sudo vpskit
-# 上传为 biao169/V2ray_deploy/main/vpskit.sh 后:
-# bash <(curl -fsSL https://raw.githubusercontent.com/biao169/V2ray_deploy/main/vpskit.sh)
-# Root安装及服务运行。现有外部程序不接管、不卸载；防火墙仅按用户菜单选择修改。
-# 支持: VLESS XHTTP H2/Cloudflare H3、VLESS REALITY/Vision、VMess/VLESS/Trojan WS+TLS或TCP+TLS、Shadowsocks AEAD/2022。
-# 不声称支持Xray所有实验协议、传输或客户端。配置修改可能重启Xray并中断连接。
-# 完整卸载删除本工具资料；系统共享依赖仅在检查无其他依赖后可选移除。
-# 真实域名ACME、防火墙实际规则、云安全组及网络吞吐必须在目标VPS验收。
-
-# jq filters and Nginx variables below deliberately use literal single quotes.
+# VPSKIT_SINGLE_FILE
+# VPSKIT_FEATURE_LEVEL=2
+# VPSKIT_STATE_SCHEMA=1
+# VPSKit 1.7.0-enhanced — complete, standalone manager; not an upstream release.
+# Based on the public VPSKit 1.6.0 data model and deployment layout.
+# MIT License — Copyright (c) 2026 VPSKit contributors.
+# Run: sudo bash ./vpskit.sh ; help: bash ./vpskit.sh help
+# Debian 12+ / Ubuntu 18.04+, Bash 4.4+, systemd, amd64/arm64.
+# No useradd/adduser, no automatic firewall reset, no automatic SSH changes.
+# JSON is data, never sourced. The manager/master require root; Nginx workers do not.
 # shellcheck disable=SC2016
 set -Eeuo pipefail
+shopt -s inherit_errexit
 umask 077
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export LC_ALL=C
-VERSION='1.6.0'
-XRAY_TESTED_VERSION='v26.3.27'
+VERSION='1.7.0-enhanced'
+FEATURE_LEVEL=2
 ROOT='/opt/vpskit'
-ENTRY='/usr/local/bin/vpskit'
 STATE="$ROOT/data/state.json"
-SELF_URL='https://raw.githubusercontent.com/biao169/V2ray_deploy/main/vpskit.sh'
+ENTRY='/usr/local/bin/vpskit'
 SYSTEMD='/etc/systemd/system'
-SYSCTL_LINK='/etc/sysctl.d/90-vpskit.conf'
 XRAY="$ROOT/bin/xray"
 NGINX="$ROOT/nginx/usr/sbin/nginx"
 ACME="$ROOT/acme/acme.sh"
-NO_COLOR_FLAG=0
-TX=0
-WIZARD_ACTIVE=0
-WIZARD_STEP=''
-PANEL_IDLE=0
-UNINSTALLING=0
-WORK=''
-LOCK_FD=''
-HAVE_LOCK=0
-TTY_FD=''
-LOGFILE=''
-RED='' GREEN='' YELLOW='' BLUE='' CYAN='' MAGENTA='' BOLD='' DIM='' RESET=''
+SELF_URL='https://raw.githubusercontent.com/biao169/V2ray_deploy/main/vpskit.sh'
+XRAY_DEFAULT_VERSION='v26.3.27'
+SELF="${BASH_SOURCE[0]}"
+WORK='' LOCK_FD='' TTY_FD='' TX=0 LOGFILE='' BOOTSTRAP_DIR=''
+HISTORY_KEEP=20
+UNITS=(vpskit-xray.service vpskit-nginx.service vpskit-maintain.service vpskit-maintain.timer)
 
-author_note() { printf '%s\n' 'VPSKit: 本地管理工具，不修改SSH、不创建用户、不清空防火墙；可显式管理端口。'; }
-colors() {
-    if [[ -t 1 && ${TERM:-dumb} != dumb && -z ${NO_COLOR:-} && $NO_COLOR_FLAG == 0 ]]; then
-        RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; BLUE=$'\033[94m'; CYAN=$'\033[96m'; MAGENTA=$'\033[95m'; BOLD=$'\033[1m'; DIM=$'\033[2m'; RESET=$'\033[0m'
-    fi
-}
 log() {
-    local level=$1 color=$2; shift 2
-    printf '%s[%s] [%s] %s%s\n' "$color" "$(date '+%F %T')" "$level" "$*" "$RESET" >&2
+    local level=$1; shift
+    printf '[%s] %s\n' "$level" "$*" >&2
     if [[ -n $LOGFILE && -d ${LOGFILE%/*} ]]; then
-        printf '[%s] [%s] %s\n' "$(date '+%F %T')" "$level" "$*" >> "$LOGFILE"
+        printf '[%s] [%s] %s\n' "$(date -u '+%FT%TZ')" "$level" "$*" >> "$LOGFILE"
     fi
 }
-info() { log INFO "$BLUE" "$@"; }
-ok() { log OK "$GREEN" "$@"; }
-warn() { log WARN "$YELLOW" "$@"; }
-die() { log ERROR "$RED" "$@"; exit 1; }
-run() {
-    # Do not pass credentials to this logger; credential commands use their own output policy.
-    info "执行: $1"
-    if [[ -n $LOGFILE ]]; then "$@" 2>&1 | tee -a "$LOGFILE"; else "$@"; fi
-}
+info() { log INFO "$@"; }
+warn() { log WARN "$@"; }
+ok() { log OK "$@"; }
+die() { log ERROR "$@"; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "缺少命令 $1。"; }
+root_check() { (( EUID == 0 )) || die '请使用 sudo bash ./vpskit.sh 或 sudo vpskit。'; }
 ask() {
-    local var=$1 label=$2 default=${3:-} _reply
-    [[ -n $TTY_FD ]] || die '此操作需要终端。使用交互菜单，或先运行 vpskit help。'
-    printf '%s%s%s' "$BLUE" "$label" "$RESET" >&2
-    [[ -z $default ]] || printf ' [%s]' "$default" >&2
+    local ap_dest=$1 ap_label=$2 ap_default=${3:-} ap_reply
+    [[ -n $TTY_FD ]] || die '此操作需要交互终端；输入 :q 可取消。'
+    printf '%s' "$ap_label" >&2
+    [[ -z $ap_default ]] || printf ' [%s]' "$ap_default" >&2
     printf ': ' >&2
-    IFS= read -r -u "$TTY_FD" _reply || die '输入已关闭。'
-    if [[ $_reply == :q ]]; then warn '已取消本次操作；已保存的偏好保留。'; exit 130; fi
-    _reply=${_reply:-$default}
-    printf -v "$var" '%s' "$_reply"
+    IFS= read -r -u "$TTY_FD" ap_reply || die '输入已关闭。'
+    [[ $ap_reply != :q ]] || exit 130
+    printf -v "$ap_dest" '%s' "${ap_reply:-$ap_default}"
 }
 secret() {
-    local var=$1 label=$2 hint=${3:-留空自动生成} answer
-    [[ -n $TTY_FD ]] || die '需要终端输入凭据。'
-    printf '%s（%s；:q取消）: ' "$label" "$hint" >&2
-    IFS= read -r -s -u "$TTY_FD" answer || die '输入已关闭。'
+    local sp_dest=$1 sp_label=$2 sp_reply
+    [[ -n $TTY_FD ]] || die '凭据输入需要终端。'
+    printf '%s（不回显；:q取消）: ' "$sp_label" >&2
+    IFS= read -r -s -u "$TTY_FD" sp_reply || die '输入已关闭。'
     printf '\n' >&2
-    if [[ $answer == :q ]]; then warn '已取消本次操作。'; exit 130; fi
-    printf -v "$var" '%s' "$answer"
+    [[ $sp_reply != :q ]] || exit 130
+    printf -v "$sp_dest" '%s' "$sp_reply"
 }
-confirm() {
-    local answer
-    ask_valid answer "$1；输入 yes 确认" no valid_choice '请输入yes或no。' 'yes no'
-    [[ $answer == yes ]]
+confirm() { local cp_answer; ask cp_answer "$1；输入 yes 确认" no; [[ $cp_answer == yes ]]; }
+ask_valid() {
+    local av_dest=$1 av_label=$2 av_default=$3 av_validator=$4 av_value
+    shift 4
+    while :; do
+        ask av_value "$av_label" "$av_default"
+        if "$av_validator" "$av_value" "$@"; then printf -v "$av_dest" '%s' "$av_value"; return 0; fi
+        warn '输入不合法，请重新输入；:q取消。'
+    done
 }
-
-validate_cli() {
-    local cmd=${1:-menu} sub=${2:-}
-    case "$cmd" in
-        help|--help|-h|version|--version|explain|selftest|menu|status|paths|doctor|repair|rollback|maintenance)
-            (($#<=1)) || die '此命令不接受额外参数。';;
-        install|update|uninstall|logs|site|cert|optimize|wizard|firewall|swap|edge) (($#<=2)) || die '额外参数不支持；参数由交互向导收集。';;
-        service) (($#==3)) || die '用法: vpskit service start|stop|restart xray|nginx';;
-        node)
-            (($#<=3)) || die '节点参数由交互向导收集，不支持额外选项。'
-            if [[ $sub == add || $sub == list ]]; then (($#<=2)) || die '用法: vpskit node add 或 node list'; fi;;
-    esac
-}
+choice() { [[ -n $1 && $1 != *[[:space:]]* && " $2 " == *" $1 "* ]]; }
+number() { [[ $1 =~ ^(0|[1-9][0-9]{0,7})$ ]] && (( $1 >= $2 && $1 <= $3 )); }
+valid_port() { number "$1" 1 65535; }
+valid_name() { [[ $1 =~ ^[a-zA-Z0-9_-]{1,48}$ ]]; }
+valid_user_name() { [[ $1 =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; }
+valid_uuid() { [[ $1 =~ ^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$ ]]; }
 valid_domain() {
-    local d=$1 part
-    [[ ${#d} -le 253 && $d == *.* && $d != *..* && $d != .* && $d != *. ]] || return 1
-    [[ $d =~ ^[a-z0-9.-]+$ && ! $d =~ ^[0-9.]+$ ]] || return 1
-    local -a labels; IFS=. read -r -a labels <<< "$d"
-    for part in "${labels[@]}"; do
-        [[ ${#part} -le 63 && $part =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || return 1
+    local label; local -a labels=()
+    [[ ${#1} -le 253 && $1 == *.* && $1 != *..* && $1 != .* && $1 != *. && $1 =~ ^[a-z0-9.-]+$ && ! $1 =~ ^[0-9.]+$ ]] || return 1
+    IFS=. read -r -a labels <<< "$1"
+    for label in "${labels[@]}"; do
+        [[ ${#label} -le 63 && $label =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || return 1
     done
 }
 valid_host() {
     valid_domain "$1" && return 0
-    local part octets
+    local x rest count=0 compressed=0; local -a parts=()
     if [[ $1 =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
-        IFS=. read -r -a octets <<< "$1"
-        for part in "${octets[@]}"; do ((10#$part<=255)) || return 1; done
+        IFS=. read -r -a parts <<< "$1"
+        for x in "${parts[@]}"; do ((10#$x <= 255)) || return 1; done
         return 0
     fi
-    [[ $1 =~ ^[0-9a-fA-F:]+$ && $1 == *:* && $1 != *:::* ]] || return 1
-    [[ $1 != :* || $1 == ::* ]] || return 1
-    [[ $1 != *: || $1 == *:: ]] || return 1
-    # getent with AI_NUMERICHOST is unavailable in shell; use a bounded IPv6 syntax check.
-    local rest=$1 doubles=0 count=0
-    if [[ $rest == *::* ]]; then
-        rest=${rest/::/X}; [[ $rest != *::* ]] || return 1; doubles=1
-        rest=${rest/X/:}
-    fi
-    IFS=: read -r -a octets <<< "$rest"
-    for part in "${octets[@]}"; do
-        [[ -z $part ]] && continue
-        [[ $part =~ ^[0-9a-fA-F]{1,4}$ ]] || return 1
+    [[ $1 == *:* && $1 =~ ^[a-fA-F0-9:]+$ && $1 != *:::* ]] || return 1
+    [[ $1 != :* || $1 == ::* ]] && [[ $1 != *: || $1 == *:: ]] || return 1
+    rest=$1
+    if [[ $rest == *::* ]]; then compressed=1; rest=${rest/::/X}; [[ $rest != *::* ]] || return 1; rest=${rest/X/:}; fi
+    IFS=: read -r -a parts <<< "$rest"
+    for x in "${parts[@]}"; do
+        [[ -n $x ]] || continue
+        [[ $x =~ ^[a-fA-F0-9]{1,4}$ ]] || return 1
         count=$((count+1))
     done
-    if ((doubles)); then ((count<8)); else [[ $1 != :* && $1 != *: ]] && ((count==8)); fi
+    if ((compressed)); then ((count<8)); else ((count==8)); fi
 }
-valid_port() { [[ $1 =~ ^[0-9]{1,5}$ ]] && ((10#$1 > 0 && 10#$1 < 65536)); }
-valid_uuid() { [[ $1 =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; }
-valid_name() { [[ $1 =~ ^[a-zA-Z0-9_-]{1,48}$ ]]; }
-valid_ws_path() { [[ $1 =~ ^/[a-zA-Z0-9_-]{8,80}$ && $1 != /\.well-known* ]]; }
-valid_upstream() { [[ -z $1 || $1 =~ ^http://127\.0\.0\.1:([0-9]{1,5})$ ]] && { [[ -z $1 ]] || valid_port "${1##*:}"; }; }
-# Input errors are recoverable; :q cancels the current action, keeping saved defaults.
-ask_valid() {
-    local av_dest=$1 av_label=$2 av_default=$3 av_validator=$4 av_hint=$5 av_value
-    shift 5
-    while :; do
-        ask av_value "$av_label" "$av_default"
-        av_value=${av_value#"${av_value%%[![:space:]]*}"}
-        av_value=${av_value%"${av_value##*[![:space:]]}"}
-        case "$av_validator" in valid_domain|valid_host|valid_scheme) av_value=${av_value,,};; esac
-        if "$av_validator" "$av_value" "$@"; then printf -v "$av_dest" '%s' "$av_value"; return 0; fi
-        warn "$av_hint 请重新输入，或输入 :q 取消本次操作。"
-    done
-}
-valid_choice() { [[ -n $1 && $1 != *[[:space:]]* && " $2 " == *" $1 "* ]]; }
-valid_scheme() { [[ $1 == a || $1 == b ]]; }
-valid_email() {
-    local email_domain=${1#*@}
-    [[ ${#1} -le 254 && $1 =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]] && valid_domain "${email_domain,,}"
+valid_email() { [[ $1 =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ && ${#1} -le 254 ]] && valid_domain "${1#*@}"; }
+valid_path() { [[ $1 =~ ^/[a-zA-Z0-9_-]{8,80}$ ]]; }
+valid_upstream() { [[ $1 =~ ^http://127\.0\.0\.1:([0-9]{1,5})$ ]] && valid_port "${1##*:}" && [[ ${1##*:} != 80 && ${1##*:} != 443 ]]; }
+valid_redirect() {
+    local host=${1#https://}; host=${host%%/*}
+    [[ $1 =~ ^https://[a-z0-9.-]+(/[a-zA-Z0-9._~/%?\&=+#-]*)?$ && $host != "${2:-}" ]] && valid_domain "$host"
 }
 valid_version() { [[ $1 == latest || $1 =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; }
-valid_proxy_upstream() {
-    [[ -n $1 ]] && valid_upstream "$1" || return 1
-    local upstream_port=${1##*:}
-    ((10#$upstream_port != 80 && 10#$upstream_port != 443))
-}
-valid_redirect() {
-    local url=$1 host_part
-    [[ $url =~ ^https://[a-z0-9.-]+(/[a-zA-Z0-9._~/%?\&=+#-]*)?$ ]] || return 1
-    host_part=${url#https://}; host_part=${host_part%%/*}
-    valid_domain "$host_part" && [[ $host_part != "${2:-}" ]]
-}
-valid_new_node_name() {
-    valid_name "$1" || return 1
-    ! jq -e --arg n "$1" --arg old "${2:-}" '.nodes[]|select(.id==$n and .id!=$old)' "$STATE" >/dev/null
-}
-valid_existing_node() { valid_name "$1" && jq -e --arg n "$1" '.nodes[]|select(.id==$n)' "$STATE" >/dev/null; }
-valid_share_node() {
-    [[ -n $1 ]] || return 0
-    valid_name "$1" && jq -e --arg n "$1" '.nodes[]|select(.id==$n and .protocol!="shadowsocks")' "$STATE" >/dev/null
-}
-valid_node_port() {
-    valid_port "$1" || return 1
-    local p=$((10#$1)) except=${2:-}
-    [[ $p != 22 && $p != 80 && $p != 443 ]] || return 1
-    ! jq -e --argjson p "$p" --arg e "$except" '.nodes[]|select(.port==$p and .entry!=$e)' "$STATE" >/dev/null
-}
-ask_node_port() {
-    local np_dest=$1 np_label=$2 np_default=$3 np_except=${4:-} np_value np_choice
-    while :; do
-        ask_valid np_value "$np_label" "$np_default" valid_node_port '端口应为1～65535，避开22/80/443及已保留节点端口。' "$np_except"
-        np_value=$((10#$np_value))
-        # A retained entry can keep its own current listener. Final checks still
-        # run inside the transaction, where stopped external services can recover.
-        if [[ -n $np_except ]] && jq -e --arg e "$np_except" --argjson p "$np_value" '.nodes[]|select(.entry==$e and .port==$p)' "$STATE" >/dev/null; then
-            printf -v "$np_dest" '%s' "$np_value"; return 0
-        fi
-        if port_free "$np_value"; then printf -v "$np_dest" '%s' "$np_value"; return 0; fi
-        warn "端口 $np_value 当前有程序监听。"
-        port_lines "$np_value" >&2
-        ask_valid np_choice '1=重新输入端口，2=保留此端口并在应用时确认清理占用' 1 valid_choice '请选择1或2。' '1 2'
-        if [[ $np_choice == 2 ]]; then printf -v "$np_dest" '%s' "$np_value"; return 0; fi
-    done
-}
-valid_new_ws_path() {
-    valid_ws_path "$1" || return 1
-    ! jq -e --arg p "$1" --arg d "${2:-}" '.nodes[]|select(.path==$p and .domain==$d)' "$STATE" >/dev/null
-}
-
-# UI preferences are saved before configuration transactions. A failed install
-# can roll back its runtime files while retaining already accepted answers.
-init_preferences() {
-    if jq -e '.ui_version==2' "$STATE" >/dev/null; then return 0; fi
-    local inferred_host; inferred_host=$(get '.host // ""')
-    valid_domain "$inferred_host" || inferred_host=''
-    json_update --arg h "$inferred_host" '
-      (.sites[0] // {}) as $s |
-      .preferences = ({domain:($s.domain // $h),email:($s.email // ""),challenge:($s.challenge // "http"),wildcard:($s.wildcard // false),
-        site_kind:(if ($s|length)==0 then "template" elif ($s.upstream // "")!="" then "proxy" else "custom" end),
-        site_access:($s.access // (if ($s|length)>0 then "direct" elif .scheme=="B" then "cloudflare" else "direct" end)),template:"welcome",upstream:($s.upstream // ""),redirect:"https://www.microsoft.com/",reality_target:"www.microsoft.com",protocol:"vless"} + (.preferences // {})) |
-      .wizard = ({selected:((.scheme=="B") or (.sites|length)>0 or (.nodes|length)>0 or (.components.xray // false)),
-        website:((.scheme=="B") or (.sites|length)>0 or ((.nodes|length)==0)),domain:($s.domain // $h),defaults_ready:true,last_step:"",last_result:""} + (.wizard // {})) |
-      .ui_version=2'
-}
-remember_domain() { json_update --arg d "$1" '.preferences.domain=$d'; }
-default_domain() {
-    local d
-    d=$(get '[.preferences.domain,.wizard.domain,.sites[0].domain,.host]|map(select(type=="string" and length>0))|.[0] // ""')
-    if valid_domain "$d"; then printf '%s' "$d"; fi
-}
-component_ready() {
-    local file
-    case "$1" in xray) file=$XRAY;; nginx) file=$NGINX;; acme) file=$ACME;; *) return 1;; esac
-    [[ $(get ".components.$1 // false") == true && -x $file ]]
-}
-plan_needs_site() { [[ $(get .scheme) == B || $(get '.wizard.website != false') == true ]]; }
-plan_nodes() {
-    jq -r --arg enabled "${1:-all}" '. as $s | .nodes[] | select(($enabled!="enabled" or .enabled) and
-      (if $s.scheme=="A" then (.protocol=="vless" and .mode=="reality" and .host==$s.host)
-       else ((.mode=="ws" or .mode=="xhttp") and .domain==($s.wizard.domain // $s.preferences.domain // "")) end)) | .id' "$STATE"
-}
-certificate_good() {
-    local d=$1
-    valid_domain "$d" || return 1
-    jq -e --arg d "$d" '.sites[]|select(.domain==$d and .issued)' "$STATE" >/dev/null || return 1
-    [[ -s $ROOT/certs/$d/current/fullchain.pem && -s $ROOT/certs/$d/current/key.pem ]] || return 1
-    openssl x509 -in "$ROOT/certs/$d/current/fullchain.pem" -noout -checkend 0 >/dev/null 2>&1 &&
-      openssl x509 -in "$ROOT/certs/$d/current/fullchain.pem" -noout -checkhost "$d" >/dev/null 2>&1
-}
-certificate_ready() {
-    certificate_good "$1" && ! jq -e --arg d "$1" '.sites[]|select(.domain==$d and .cert_settings_pending==true)' "$STATE" >/dev/null
-}
-remember_step() {
-    WIZARD_STEP=$1
-    json_update --arg s "$1" --arg r "${2:-进行中}" '.wizard.last_step=$s | .wizard.last_result=$r'
-    info "部署步骤：$1；已完成的步骤会自动跳过。"
-}
-
+valid_bool() { [[ $1 == true || $1 == false ]]; }
+valid_worker_count() { [[ $1 == auto ]] || number "$1" 1 64; }
+randhex() { openssl rand -hex "${1:-12}"; }
 new_uuid() { cat /proc/sys/kernel/random/uuid; }
-randhex() { openssl rand -hex "${1:-16}"; }
 get() { jq -r "$1" "$STATE"; }
 json_update() {
-    jq "$@" "$STATE" > "$ROOT/data/state.new"
-    chmod 600 "$ROOT/data/state.new"
-    mv -f "$ROOT/data/state.new" "$STATE"
+    local tmp; tmp=$(mktemp "$ROOT/data/.state.XXXXXXXX")
+    if ! jq "$@" "$STATE" > "$tmp"; then rm -f -- "$tmp"; die 'JSON变更失败，原配置保留。'; fi
+    chmod 600 "$tmp"; chown 0:0 "$tmp"
+    mv -f -- "$tmp" "$STATE"
 }
-fetch() {
-    local url=$1 dest=$2
-    [[ $url == https://* ]] || die '下载地址必须是HTTPS。'
-    info "下载: $url"
-    curl --proto '=https' --proto-redir '=https' -fSL --connect-timeout 15 --max-time 300 --retry 2 --retry-delay 2 -o "$dest" "$url"
-    [[ -s $dest ]] || die '下载结果为空。'
+state_basic() {
+    [[ -s $1 && ! -L $1 && $(stat -c %s "$1") -le 16777216 ]] || return 1
+    jq -e 'type=="object" and .schema==1 and (.nodes|type=="array") and (.sites|type=="array") and (.components|type=="object")' "$1" >/dev/null
 }
-check_root() { ((EUID == 0)) || die '需要root权限。请先 sudo -i，再执行一键命令；或 sudo bash ./vpskit.sh。'; }
-detect_system() {
-    [[ -r /etc/os-release ]] || die '无法识别系统。'
-    # os-release also assigns VERSION (e.g. "13 (trixie)"). Keep it local:
-    # the manager VERSION must survive system detection for self-persistence.
-    local ID='' VERSION_ID='' VERSION=''
-    # OS-owned metadata, never source our JSON state or user input.
-    . /etc/os-release
-    case "$ID" in debian) (( ${VERSION_ID%%.*} >= 12 )) || die '需要Debian 12或更新版本。';; ubuntu) (( ${VERSION_ID%%.*} >= 18 )) || die '需要Ubuntu 18.04或更新版本。';; *) die "已检测到 $ID；本版本仅支持Debian/Ubuntu，未修改系统。";; esac
-    (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )) || die '需要Bash 4.4或更新版本。'
-    [[ -d /run/systemd/system ]] || die '需要以systemd为PID 1的VPS；不支持普通Docker/无systemd容器。'
-    command -v apt-get >/dev/null || die '缺少apt-get。'
-    command -v flock >/dev/null || die '需要系统自带util-linux/flock。'
-    case "$(uname -m)" in x86_64) ARCH='64';; aarch64|arm64) ARCH='arm64-v8a';; *) die '仅支持amd64/arm64。';; esac
-    export ARCH
-    info "系统: $ID $VERSION_ID / $(uname -m)；有效账户: $(id -un)"
-    [[ $(id -un) == root ]] || die '此版本只支持root安装与运行，不创建其他账户。'
+nginx_defaults() {
+    cat <<'JSON'
+{"worker_user":"auto","workers":1,"connections":1024,"nofile":8192,"keepalive":30,"keepalive_requests":1000,"ssl_cache":4,"ssl_timeout":10,"http2":true,"client_header_timeout":15,"client_body_timeout":60,"send_timeout":60,"proxy_connect_timeout":10,"proxy_read_timeout":3600,"proxy_send_timeout":3600,"site_proxy_timeout":60,"client_max_body_mb":16,"access_log":false,"worker_shutdown_timeout":0,"upstream_keepalive":8}
+JSON
 }
-safe_root() {
-    [[ ! -L /opt && ! -L $ROOT ]] || die '安装路径为符号链接，拒绝写入。'
-    if [[ -e $ROOT ]]; then
-        [[ ! -L $ROOT/.vpskit-owned && -f $ROOT/.vpskit-owned && $(cat "$ROOT/.vpskit-owned") == VPSKIT_V1 ]] || die "$ROOT 已存在但不属于本工具，保留并停止。"
-        [[ $(stat -c %u "$ROOT") == 0 && $(stat -c %a "$ROOT") == 700 ]] || die '安装根目录必须归root所有且权限700。'
-        local p
-        for p in bin config data certs acme www logs backup tmp run nginx; do
-            [[ ! -L $ROOT/$p ]] || die "异常符号链接: $ROOT/$p"
-        done
-    else
-        mkdir -m 700 "$ROOT"
-        printf 'VPSKIT_V1\n' > "$ROOT/.vpskit-owned"
+nginx_settings() { jq -c --argjson d "$(nginx_defaults)" '$d * (.advanced.nginx // {})' "${1:-$STATE}"; }
+ng_value() { nginx_settings | jq -r --arg k "$1" '.[$k]'; }
+xray_nofile() { jq -r '.advanced.xray.nofile // 8192' "$STATE"; }
+init_state() {
+    if [[ -e $STATE ]]; then state_basic "$STATE" || die "配置损坏，未覆盖。请使用 history list / history restore 恢复：$STATE"; return; fi
+    if [[ -e $ROOT/config/nginx.conf || -e $ROOT/config/xray.json || -d $ROOT/backup/history ]] && [[ ${ALLOW_NEW_STATE:-0} != 1 ]]; then
+        die '发现部署资料但state.json缺失；拒绝创建空配置，请从历史恢复。'
     fi
-    mkdir -p "$ROOT"/{bin,config,data,certs,acme,www,logs,backup,tmp,run,nginx}
+    jq -n --arg v "$VERSION" '{schema:1,manager:$v,scheme:"A",host:"",performance:{gzip:false},components:{xray:false,nginx:false,acme:false},versions:{},nodes:[],sites:[],preferences:{},wizard:{selected:false}}' > "$STATE"
+    chmod 600 "$STATE"
+}
+migrate_state() {
+    # Defaults are merged, not substituted with jq // (which would lose false).
+    json_update --argjson d "$(nginx_defaults)" --arg v "$VERSION" '
+      .advanced=((.advanced // {}) + {version:1}) |
+      .advanced.nginx=($d * (.advanced.nginx // {})) |
+      .advanced.xray=({nofile:8192} * (.advanced.xray // {})) |
+      .preferences=(.preferences // {}) | .wizard=(.wizard // {}) | .manager=$v'
+}
+validate_advanced() {
+    local cfg="$1" n nr
+    n=$(nginx_settings "$cfg")
+    jq -e 'def i($lo;$hi): type=="number" and .==floor and .>=$lo and .<=$hi;
+      ((.workers=="auto") or (.workers|i(1;64))) and (.connections|i(128;65535)) and
+      (.nofile|i(2048;1048576)) and (.nofile >= (.connections+1024)) and
+      (.keepalive|i(5;300)) and (.keepalive_requests|i(100;100000)) and
+      (.ssl_cache|i(1;128)) and (.ssl_timeout|i(1;1440)) and (.http2|type=="boolean") and
+      (.client_header_timeout|i(5;300)) and (.client_body_timeout|i(5;3600)) and
+      (.send_timeout|i(5;3600)) and (.proxy_connect_timeout|i(1;60)) and
+      (.proxy_read_timeout|i(30;86400)) and (.proxy_send_timeout|i(30;86400)) and
+      (.site_proxy_timeout|i(5;3600)) and (.client_max_body_mb|i(1;4096)) and
+      (.access_log|type=="boolean") and (.worker_shutdown_timeout|i(0;3600)) and
+      (.upstream_keepalive|i(0;128)) and (.worker_user|type=="string") and
+      ((.resolved_user // "")|type=="string")' <<< "$n" >/dev/null || die '高级配置类型/范围错误，或nofile小于connections+1024。'
+    local user; user=$(jq -r .worker_user <<< "$n")
+    [[ $user == auto ]] || valid_user_name "$user" || die 'Worker账户名称不合法。'
+    [[ $user != root ]] || die '禁止设置root Worker。'
+    jq -e '(.advanced.xray.nofile // 8192) as $n | ($n|type=="number") and $n==($n|floor) and $n>=2048 and $n<=1048576' "$cfg" >/dev/null || die 'Xray文件描述符上限无效。'
+    nr=$(cat /proc/sys/fs/nr_open 2>/dev/null || printf 1048576)
+    (( $(jq -r .nofile <<< "$n") <= nr && $(jq -r '.advanced.xray.nofile // 8192' "$cfg") <= nr )) || die "nofile超过当前内核nr_open=$nr；未自动改变内核。"
+}
+service_user_valid() {
+    local row name password uid gid gecos home shell group
+    valid_user_name "$1" || return 1
+    row=$(getent passwd "$1") || return 1
+    IFS=: read -r name password uid gid gecos home shell <<< "$row"
+    [[ $uid =~ ^[0-9]+$ && $gid =~ ^[0-9]+$ && $uid != 0 && $gid != 0 ]] || return 1
+    case "$shell" in */nologin|*/false) ;; *) return 1;; esac
+    for group in $(id -Gn "$name"); do
+        case "$group" in root|sudo|wheel|docker|lxd|disk|shadow|admin) return 1;; esac
+    done
+    valid_user_name "$(id -gn "$name")"
+}
+resolve_worker() {
+    local cfg=${1:-$STATE} requested saved candidate saved_uid
+    requested=$(nginx_settings "$cfg" | jq -r .worker_user)
+    saved=$(nginx_settings "$cfg" | jq -r '.resolved_user // ""')
+    saved_uid=$(nginx_settings "$cfg" | jq -r '.resolved_uid // ""')
+    if [[ $requested != auto ]]; then
+        service_user_valid "$requested" || die "账户 $requested 不符合非特权、非登录服务账户要求。"
+        printf '%s' "$requested"; return
+    fi
+    if [[ -n $saved ]]; then
+        service_user_valid "$saved" || die "已记录Worker账户 $saved 不可用；请在高级配置中重新选择auto或已有服务账户。"
+        [[ -z $saved_uid || $(id -u "$saved") == "$saved_uid" ]] || die '记录的Worker UID已变化；请显式重新选择账户。'
+        printf '%s' "$saved"; return
+    fi
+    for candidate in vpskit-www www-data nginx http nobody; do
+        if service_user_valid "$candidate"; then printf '%s' "$candidate"; return; fi
+    done
+    die '没有可复用的安全服务账户；不会新建用户或退回root。请先由管理员准备非登录服务账户。'
+}
+remember_worker() {
+    local user; user=$(resolve_worker)
+    [[ $user != nobody ]] || warn '复用nobody；该UID可能与其他服务共享，隔离弱于专用服务账户。'
+    json_update --arg u "$user" --argjson id "$(id -u "$user")" '.advanced.nginx.resolved_user=$u | .advanced.nginx.resolved_uid=$id'
+}
+worker_permissions() {
+    local user=$1 group path
+    service_user_valid "$user" || die 'Worker身份不安全。'
+    group=$(id -gn "$user")
+    # Group traversal only at the root. All secret directories stay root:root 0700.
+    # This deliberately avoids an ACL dependency and never creates OS accounts.
+    chown "0:$group" "$ROOT"; chmod 0710 "$ROOT"
+    for path in data config certs acme backup tmp bin nginx logs; do
+        [[ -d $ROOT/$path && ! -L $ROOT/$path ]] || die "异常私有目录 $path"
+        chown 0:0 "$ROOT/$path"; chmod 0700 "$ROOT/$path"
+    done
+    [[ ! -L $ROOT/www && ! -L $ROOT/run ]] || die '网站/运行目录不能为符号链接。'
+    # Do not follow symlinks, hard links or mounted subtrees during permission repair.
+    if [[ -n $(find -P "$ROOT/www" -xdev \( -type l -o \( -type f -links +1 \) \) -print -quit) ]]; then
+        die '网站目录含符号链接或硬链接；请改为实际文件，避免权限修复影响目录外资料。'
+    fi
+    if findmnt -rn -o TARGET 2>/dev/null | grep -Fq "$ROOT/www/"; then die '网站目录内有子挂载，拒绝递归调整权限。'; fi
+    find -P "$ROOT/www" -xdev -type d -exec chown "0:$group" {} + -exec chmod 2750 {} +
+    find -P "$ROOT/www" -xdev -type f -exec chown "0:$group" {} + -exec chmod 0640 {} +
+    chown "0:$group" "$ROOT/run"; chmod 0710 "$ROOT/run"
+    mkdir -p "$ROOT/run/nginx"
+    chown "0:$group" "$ROOT/run/nginx"; chmod 0710 "$ROOT/run/nginx"
+    for path in client proxy fastcgi uwsgi scgi; do
+        [[ ! -L $ROOT/run/nginx/$path ]] || die 'Nginx临时目录不能为链接。'
+        mkdir -p "$ROOT/run/nginx/$path"
+        chown "$user:$group" "$ROOT/run/nginx/$path"; chmod 0700 "$ROOT/run/nginx/$path"
+    done
+    if command -v runuser >/dev/null; then
+        runuser -u "$user" -- test -x "$ROOT/www" || die 'Worker无法访问网站目录。'
+        if runuser -u "$user" -- test -r "$STATE"; then die 'Worker不应能读取state.json。'; fi
+        if runuser -u "$user" -- test -x "$ROOT/certs"; then die 'Worker不应能遍历证书私钥目录。'; fi
+    fi
+}
+
+system_check() {
+    root_check
+    (( BASH_VERSINFO[0]>4 || (BASH_VERSINFO[0]==4 && BASH_VERSINFO[1]>=4) )) || die '需要Bash 4.4+。'
+    local ID='' VERSION_ID='' VERSION=''
+    [[ -r /etc/os-release ]] || die '无法识别系统。'
+    . /etc/os-release
+    case "$ID" in debian) (( ${VERSION_ID%%.*}>=12 )) || die '需要Debian 12+。';; ubuntu) (( ${VERSION_ID%%.*}>=18 )) || die '需要Ubuntu 18.04+。';; *) die '只支持Debian/Ubuntu。';; esac
+    [[ -d /run/systemd/system ]] || die '需要以systemd为PID 1的VPS；普通容器不能进行部署。'
+    case $(uname -m) in x86_64|aarch64|arm64) ;; *) die '只支持amd64/arm64。';; esac
+    need flock; need apt-get
+}
+safe_layout() {
+    local p mode
+    [[ ! -L /opt && ! -L $ROOT ]] || die '安装根目录不能为符号链接。'
+    if [[ -e $ROOT ]]; then
+        [[ -f $ROOT/.vpskit-owned && ! -L $ROOT/.vpskit-owned && $(cat "$ROOT/.vpskit-owned") == VPSKIT_V1 ]] || die "$ROOT 已存在且不属于VPSKit，未接管。"
+        [[ $(stat -c %u "$ROOT") == 0 ]] || die '安装目录必须归root所有。'
+        mode=$(stat -c %a "$ROOT")
+        (( (8#$mode & 0027)==0 )) || die '安装目录不得允许组写入或其他用户访问。'
+    else
+        mkdir -m 700 "$ROOT"; printf 'VPSKIT_V1\n' > "$ROOT/.vpskit-owned"
+    fi
+    for p in bin config data certs acme www logs backup tmp run nginx; do
+        [[ ! -L $ROOT/$p ]] || die "拒绝符号链接目录 $p"
+        mkdir -p "$ROOT/$p"
+    done
+    for p in data config certs acme backup tmp logs bin nginx; do chown 0:0 "$ROOT/$p"; chmod 700 "$ROOT/$p"; done
+    [[ ! -L $STATE && ! -L $ROOT/run/manage.lock ]] || die '状态文件/锁文件不能为链接。'
     exec {LOCK_FD}> "$ROOT/run/manage.lock"
-    flock -w 5 "$LOCK_FD" || die '另一个管理或续期任务正在运行，请稍后再试。'
-    HAVE_LOCK=1
-    # Only this private transient tree is disposable, never certificates/site files.
-    find "$ROOT/tmp" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+    flock -w 10 "$LOCK_FD" || die '另一个VPSKit操作正在运行。'
     WORK=$(mktemp -d "$ROOT/tmp/job.XXXXXXXX")
     LOGFILE="$ROOT/logs/manage.log"
-    rotate_logs
-    if [[ ! -e $ROOT/data/packages.before ]]; then
-        dpkg-query -W -f='${binary:Package}\t${db:Status-Status}\n' | awk '$2=="installed"{print $1}' | sort -u > "$ROOT/data/packages.before"
+}
+cleanup() {
+    local rc=$?
+    trap - EXIT ERR INT TERM
+    set +e
+    if ((TX)); then
+        warn '操作失败或中断，开始恢复事务前状态。'
+        if restore_transaction "$ROOT/backup/transaction"; then rm -rf -- "$ROOT/backup/transaction"; else warn '自动恢复失败，保留事务；运行 vpskit repair。'; rc=1; fi
     fi
+    [[ -z $WORK || ! -d $WORK ]] || rm -rf -- "$WORK"
+    [[ -z $BOOTSTRAP_DIR || ! -d $BOOTSTRAP_DIR ]] || rm -rf -- "$BOOTSTRAP_DIR"
+    exit "$rc"
 }
-rotate_logs() {
-    local f
-    for f in "$ROOT"/logs/*.log; do
-        [[ -f $f && ! -L $f ]] || continue
-        if (( $(stat -c %s "$f") > 2097152 )); then
-            cp -- "$f" "$f.1"
-            : > "$f"
-        fi
-    done
+error_trap() { local rc=$1 line=$2; warn "第 $line 行执行失败（退出码 $rc）；不打印可能含凭据的命令。"; exit "$rc"; }
+fetch() {
+    local url=$1 dest=$2
+    [[ $url == https://* && $url != *[[:space:]]* ]] || die '下载地址必须是无空白的HTTPS URL。'
+    curl --proto '=https' --proto-redir '=https' --fail --show-error --location --connect-timeout 15 --max-time 300 --retry 2 --output "$dest" "$url"
+    [[ -s $dest ]] || die '下载结果为空。'
 }
-record_packages() {
-    dpkg-query -W -f='${binary:Package}\t${db:Status-Status}\n' | awk '$2=="installed"{print $1}' | sort -u > "$ROOT/data/packages.now"
-    comm -13 "$WORK/packages.pre" "$ROOT/data/packages.now" > "$WORK/packages.delta"
-    touch "$ROOT/data/packages.added"
-    cat "$ROOT/data/packages.added" "$WORK/packages.delta" | sort -u > "$WORK/packages.union"
-    mv "$WORK/packages.union" "$ROOT/data/packages.added"
-}
-install_deps() {
-    local -a need=("$@") proposed=(); local cmd pkg d
+install_dependencies() {
+    local cmd pkg; local -a packages=()
     for cmd in curl jq openssl unzip ss free sysctl; do
         if ! command -v "$cmd" >/dev/null; then
             case "$cmd" in ss) pkg=iproute2;; free|sysctl) pkg=procps;; *) pkg=$cmd;; esac
-            need+=("$pkg")
+            packages+=("$pkg")
         fi
     done
-    [[ -s /etc/ssl/certs/ca-certificates.crt ]] || need+=(ca-certificates)
-    ((${#need[@]})) || return 0
-    dpkg-query -W -f='${binary:Package}\t${db:Status-Status}\n' | awk '$2=="installed"{print $1}' | sort -u > "$WORK/packages.pre"
-    info '预检查依赖包，拒绝包含新增系统账户操作的维护脚本。'
-    run apt-get update
-    local cache="$WORK/apt-cache"
-    mkdir -p "$cache/partial"
-    run apt-get -o "Dir::Cache::archives=$cache" --download-only --no-install-recommends -y install "${need[@]}"
-    for d in "$cache"/*.deb; do
-        [[ -f $d ]] || continue
-        mkdir -p "$WORK/control"; dpkg-deb -e "$d" "$WORK/control"
-        if grep -ERq '(^|[^[:alnum:]_])(adduser|useradd|addgroup|groupadd|systemd-sysusers)([^[:alnum:]_]|$)' "$WORK/control"; then
-            die "依赖包可能创建账户，已在安装前停止: ${d##*/}。请先准备必要系统依赖。"
-        fi
-        rm -rf "$WORK/control"
-    done
-    # Install exactly downloaded versions; no second network resolution race.
-    for d in "$cache"/*.deb; do [[ ! -f $d ]] || proposed+=("$d"); done
-    ((${#proposed[@]})) && run apt-get --no-download --no-install-recommends -y install "${proposed[@]}"
-    record_packages
-    for cmd in curl jq openssl unzip ss free sysctl; do command -v "$cmd" >/dev/null || die "依赖缺失: $cmd"; done
+    [[ -s /etc/ssl/certs/ca-certificates.crt ]] || packages+=(ca-certificates)
+    ((${#packages[@]})) || return 0
+    info "安装基础依赖：${packages[*]}（不安装系统Nginx服务，不创建VPSKit账户）。"
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${packages[@]}"
 }
-init_state() {
-    [[ ! -L $STATE ]] || die '状态文件不能是符号链接。'
-    [[ -f $STATE ]] && { jq -e '.schema == 1 and (.nodes|type=="array") and (.sites|type=="array")' "$STATE" >/dev/null || die '状态损坏，保留资料，请恢复备份。'; return; }
-    jq -n --arg version "$VERSION" '{schema:1,manager:$version,scheme:"A",host:"",performance:{gzip:false},components:{xray:false,nginx:false,acme:false},versions:{},nodes:[],sites:[]}' > "$STATE"
+# History snapshots contain configuration, certificates and ACME account data,
+# never binaries, the manager source, website contents, firewall rules or swap.
+snapshot_copy() {
+    local dest=$1 reason=$2 p
+    mkdir -p "$dest"
+    [[ ! -f $STATE ]] || cp -a "$STATE" "$dest/state.json"
+    for p in config certs; do cp -a "$ROOT/$p" "$dest/$p"; done
+    mkdir -p "$dest/acme"
+    for p in config certstore; do [[ ! -d $ROOT/acme/$p ]] || cp -a "$ROOT/acme/$p" "$dest/acme/$p"; done
+    jq -n --arg v "$VERSION" --arg r "$reason" --arg t "$(date -u '+%FT%TZ')" '{snapshot_schema:1,manager:$v,created:$t,reason:$r,includes:["state","config","certs","acme/config","acme/certstore"],excludes:["website files","binaries","manager code","firewall","swap"]}' > "$dest/meta.json"
+    (cd "$dest"; find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 -r sha256sum > SHA256SUMS)
+    chmod 700 "$dest"
+}
+history_prune() {
+    local f count=0
+    while IFS= read -r f; do
+        count=$((count+1)); ((count<=HISTORY_KEEP)) && continue
+        [[ $f =~ ^[0-9]{8}T[0-9]{6}Z-[a-f0-9]{8}$ ]] || continue
+        rm -rf -- "$ROOT/backup/history/$f"
+    done < <(find "$ROOT/backup/history" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort -r)
+}
+history_save() {
+    local reason=${1:-manual} id dest
+    state_basic "$STATE" || die '当前状态无效，不能创建正常历史快照。'
+    mkdir -p "$ROOT/backup/history"
+    id="$(date -u '+%Y%m%dT%H%M%SZ')-$(randhex 4)"
+    dest="$ROOT/backup/history/.pending-$id"
+    snapshot_copy "$dest" "$reason"
+    mv -- "$dest" "$ROOT/backup/history/$id"
+    history_prune
+    info "历史快照：$id（含凭据/私钥，仅root可读；保留最近$HISTORY_KEEP份）"
+}
+history_list() {
+    local dir
+    [[ -d $ROOT/backup/history ]] || { printf '暂无历史快照。\n'; return; }
+    while IFS= read -r dir; do
+        [[ -f $dir/meta.json ]] || continue
+        printf '%s  ' "${dir##*/}"
+        jq -r '[.created,.reason,.manager]|@tsv' "$dir/meta.json"
+    done < <(find "$ROOT/backup/history" -mindepth 1 -maxdepth 1 -type d ! -name '.*' | sort -r)
+}
+snapshot_verify() {
+    local dir=$1 f target line path
+    [[ -d $dir && ! -L $dir && -s $dir/SHA256SUMS ]] || die '快照不存在或不完整。'
+    state_basic "$dir/state.json" || die '快照state.json结构无效。'
+    jq -e '.snapshot_schema==1' "$dir/meta.json" >/dev/null || die '快照版本不支持。'
+    while IFS= read -r line; do
+        [[ $line =~ ^[a-f0-9]{64}\ \ \./ ]] || die '校验清单格式无效。'
+        path=${line:66}
+        [[ $path != *'/../'* && $path != *'/..' && $path != *$'\n'* ]] || die '快照清单路径越界。'
+    done < "$dir/SHA256SUMS"
+    while IFS= read -r -d '' f; do
+        target=$(realpath -m -- "$f")
+        [[ $target == "$dir/"* ]] || die '快照内存在越界符号链接。'
+    done < <(find -P "$dir" -type l -print0)
+    (cd "$dir"; sha256sum --status -c SHA256SUMS) || die '快照校验失败，未恢复。'
+}
+begin_tx() {
+    local reason=${1:-configuration} scope=${2:-state} dir="$ROOT/backup/transaction" u p
+    ((TX==0)) || die '禁止嵌套事务。'
+    [[ ! -e $dir ]] || die '发现未完成事务，请先执行 vpskit repair。'
+    # Ready marker is written only after the complete pre-change backup exists.
+    mkdir -p "$dir/units"
+    snapshot_copy "$dir/snapshot" "$reason"
+    stat -c '%a %g' "$ROOT" > "$dir/root-permissions"
+    printf '%s\n' "$scope" > "$dir/scope"
+    if [[ $scope == components ]]; then
+        mkdir -p "$dir/programs"
+        for p in bin nginx acme; do cp -a "$ROOT/$p" "$dir/programs/$p"; done
+    fi
+    for u in "${UNITS[@]}"; do
+        if [[ -e $SYSTEMD/$u ]]; then
+            [[ ! -L $SYSTEMD/$u ]] && grep -Fq '# VPSKIT_OWNED' "$SYSTEMD/$u" || die "同名外部服务 $u，拒绝接管。"
+            cp -a "$SYSTEMD/$u" "$dir/units/$u"
+        fi
+        if systemctl is-active --quiet "$u"; then printf '%s\n' "$u" >> "$dir/active"; fi
+        if systemctl is-enabled --quiet "$u" 2>/dev/null; then printf '%s\n' "$u" >> "$dir/enabled"; fi
+    done
+    printf 'ready\n' > "$dir/ready"
+    TX=1
+    if state_basic "$STATE"; then history_save "before:$reason"; fi
+}
+restore_transaction() {
+    local dir=$1 p u mode gid failed=0 worker
+    if [[ -f $dir/state.json && -d $dir/tree ]]; then legacy_restore_transaction "$dir"; return; fi
+    [[ -f $dir/ready && -d $dir/snapshot ]] || return 1
+    systemctl stop vpskit-xray.service vpskit-nginx.service >/dev/null 2>&1 || true
+    for p in config certs; do
+        [[ -d $dir/snapshot/$p ]] || return 1
+        rm -rf -- "$ROOT/$p"; cp -a "$dir/snapshot/$p" "$ROOT/$p" || failed=1
+    done
+    for p in config certstore; do
+        rm -rf -- "$ROOT/acme/$p"
+        [[ ! -d $dir/snapshot/acme/$p ]] || cp -a "$dir/snapshot/acme/$p" "$ROOT/acme/$p" || failed=1
+    done
+    if [[ -d $dir/programs ]]; then
+        for p in bin nginx acme; do
+            rm -rf -- "$ROOT/$p"; cp -a "$dir/programs/$p" "$ROOT/$p" || failed=1
+        done
+    fi
+    if [[ -f $dir/snapshot/state.json ]]; then cp -a "$dir/snapshot/state.json" "$STATE" || failed=1
+    else rm -f "$STATE"; fi
+    for u in "${UNITS[@]}"; do
+        if [[ -f $dir/units/$u ]]; then cp -a "$dir/units/$u" "$SYSTEMD/$u" || failed=1
+        elif [[ -f $SYSTEMD/$u ]] && grep -Fq '# VPSKIT_OWNED' "$SYSTEMD/$u"; then
+            systemctl disable --now "$u" >/dev/null 2>&1 || true; rm -f "$SYSTEMD/$u"
+        fi
+    done
+    read -r mode gid < "$dir/root-permissions"
+    chown "0:$gid" "$ROOT" || failed=1; chmod "$mode" "$ROOT" || failed=1
+    # Permissions must match the restored worker, not the failed new selection.
+    worker=$(sed -n 's/^user \([a-z_][a-z0-9_-]*\).*/\1/p' "$ROOT/config/nginx.conf" 2>/dev/null | head -1 || true)
+    if [[ -n $worker && $worker != root ]]; then worker_permissions "$worker" || failed=1; fi
+    systemctl daemon-reload || failed=1
+    for u in "${UNITS[@]}"; do
+        if [[ -f $dir/enabled ]] && grep -Fxq "$u" "$dir/enabled"; then systemctl enable "$u" >/dev/null 2>&1 || failed=1
+        else systemctl disable "$u" >/dev/null 2>&1 || true; fi
+    done
+    if [[ -f $dir/active ]]; then
+        while IFS= read -r u; do systemctl start "$u" || failed=1; done < "$dir/active"
+    fi
+    ((failed==0))
+}
+commit_tx() {
+    ((TX==1)) || die '没有待提交事务。'
+    rm -rf -- "$ROOT/backup/last"
+    mv -- "$ROOT/backup/transaction" "$ROOT/backup/last"
+    TX=0
+    ok '配置已验证并提交；操作前历史和最近事务均可恢复。'
+}
+repair_transaction() {
+    if [[ -d $ROOT/backup/transaction ]]; then
+        if [[ ! -f $ROOT/backup/transaction/ready ]]; then
+            rm -rf -- "$ROOT/backup/transaction"; ok '已清理未完成备份；正式配置未被该事务修改。'
+        else
+            restore_transaction "$ROOT/backup/transaction" || die '恢复失败，事务已保留。'
+            rm -rf -- "$ROOT/backup/transaction"; ok '已恢复未完成事务。'
+        fi
+    else ok '没有未完成事务。'; fi
 }
 
-# Ubuntu 18/20 Nginx predates -e (1.19.5). Old bootstrap diagnostics go to
-# stderr; configured runtime logs remain inside ROOT. Do not create /var/log/nginx.
+component_ready() {
+    local f
+    case "$1" in xray) f=$XRAY;; nginx) f=$NGINX;; acme) f=$ACME;; *) return 1;; esac
+    [[ $(get ".components.$1 // false") == true && -x $f && ! -L $f ]]
+}
+ensure_component() { component_ready "$1" || die "组件 $1 未安装或缺失，请运行 vpskit install $1。"; }
+latest_release() {
+    fetch "https://api.github.com/repos/$1/releases/latest" "$2"
+    jq -er '.tag_name|select(test("^[A-Za-z0-9._-]+$"))' "$2"
+}
+install_xray_binary() {
+    local ver=${1:-$XRAY_DEFAULT_VERSION} asset meta="$WORK/xray-release.json" url digest
+    valid_version "$ver" || die 'Xray版本应为v数字.数字.数字，或latest。'
+    case $(uname -m) in x86_64) asset=Xray-linux-64.zip;; aarch64|arm64) asset=Xray-linux-arm64-v8a.zip;; esac
+    if [[ $ver == latest ]]; then ver=$(latest_release XTLS/Xray-core "$meta")
+    else fetch "https://api.github.com/repos/XTLS/Xray-core/releases/tags/$ver" "$meta"; fi
+    url=$(jq -er --arg n "$asset" '.assets[]|select(.name==$n)|.browser_download_url' "$meta")
+    [[ $url == https://github.com/XTLS/Xray-core/releases/download/* ]] || die 'Xray下载来源异常。'
+    fetch "$url" "$WORK/xray.zip"
+    digest=$(jq -r --arg n "$asset" '.assets[]|select(.name==$n)|.digest // ""' "$meta")
+    if [[ $digest == sha256:* ]]; then digest=${digest#sha256:}
+    else
+        fetch "$url.dgst" "$WORK/xray.dgst"
+        digest=$(grep -Ei 'sha(2[-_])?256' "$WORK/xray.dgst" | grep -oE '[a-fA-F0-9]{64}' | head -1 || true)
+    fi
+    [[ $digest =~ ^[a-fA-F0-9]{64}$ ]] || die '没有有效的Xray SHA256摘要。'
+    printf '%s  %s\n' "$digest" "$WORK/xray.zip" | sha256sum -c -
+    unzip -p "$WORK/xray.zip" xray > "$ROOT/bin/xray.new"
+    chmod 700 "$ROOT/bin/xray.new"; "$ROOT/bin/xray.new" version
+    mv -f "$ROOT/bin/xray.new" "$XRAY"
+    json_update --arg v "$ver" '.components.xray=true | .versions.xray=$v'
+    ok "Xray $ver 已安装；官方同源摘要用于完整性检查，不是独立签名。"
+}
+install_nginx_binary() {
+    local pkg deb version='' soname; local -a libs=()
+    local dl="$WORK/nginx-download" tree="$WORK/nginx-extract"
+    mkdir -p "$dl" "$tree"
+    apt-get update
+    for pkg in nginx nginx-core nginx-light; do
+        apt-cache show "$pkg" >/dev/null 2>&1 || continue
+        rm -f -- "$dl"/*.deb
+        if ! (cd "$dl"; apt-get download "$pkg"); then continue; fi
+        for deb in "$dl"/*.deb; do
+            [[ -f $deb ]] || continue
+            dpkg-deb -x "$deb" "$tree"
+            if [[ -x $tree/usr/sbin/nginx ]]; then version=$(dpkg-deb -f "$deb" Version); break; fi
+        done
+        [[ -z $version ]] || break
+    done
+    [[ -n $version ]] || die '发行版软件源中未找到可提取的Nginx。'
+    while read -r soname; do
+        case "$soname" in
+            libpcre.so.3) libs+=(libpcre3);; libpcre2-8.so.0) libs+=(libpcre2-8-0);;
+            libssl.so.1.1|libcrypto.so.1.1) libs+=(libssl1.1);;
+            libssl.so.3|libcrypto.so.3)
+                if apt-cache show libssl3t64 >/dev/null 2>&1; then libs+=(libssl3t64); else libs+=(libssl3); fi;;
+            libssl.so.1.0.0|libcrypto.so.1.0.0) libs+=(libssl1.0.0);;
+            libz.so.1) libs+=(zlib1g);; libcrypt.so.1) libs+=(libcrypt1);; libGeoIP.so.1) libs+=(libgeoip1);;
+            *) die "未识别的动态库 $soname，请由系统包管理器补齐。";;
+        esac
+    done < <(ldd "$tree/usr/sbin/nginx" | awk '/not found/{print $1}')
+    if ((${#libs[@]})); then DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${libs[@]}"; fi
+    if ldd "$tree/usr/sbin/nginx" | grep -q 'not found'; then die 'Nginx动态库依赖仍不完整。'; fi
+    mkdir -p "$ROOT/nginx/usr/sbin"
+    install -m 700 "$tree/usr/sbin/nginx" "$NGINX.new"
+    "$NGINX.new" -V
+    mv -f "$NGINX.new" "$NGINX"
+    json_update --arg v "$version" '.components.nginx=true | .versions.nginx=$v'
+    ok "Nginx $version 已独立提取；未运行Nginx包维护脚本或创建账户。"
+}
+install_acme_binary() {
+    local version meta="$WORK/acme-release.json"
+    version=$(latest_release acmesh-official/acme.sh "$meta")
+    fetch "https://github.com/acmesh-official/acme.sh/archive/refs/tags/$version.tar.gz" "$WORK/acme.tar.gz"
+    tar -tzf "$WORK/acme.tar.gz" | awk '/(^\/|(^|\/)\.\.(\/|$))/{bad=1} END{exit bad}' || die 'ACME归档路径异常。'
+    if tar -tvzf "$WORK/acme.tar.gz" | awk 'substr($1,1,1)=="l" || substr($1,1,1)=="h"{bad=1} END{exit !bad}'; then die 'ACME归档含链接，拒绝自动解压。'; fi
+    mkdir -p "$WORK/acme-source" "$ROOT/acme/config" "$ROOT/acme/certstore"
+    tar --no-same-owner --no-same-permissions -xzf "$WORK/acme.tar.gz" --strip-components=1 -C "$WORK/acme-source"
+    sh -n "$WORK/acme-source/acme.sh"
+    install -m 700 "$WORK/acme-source/acme.sh" "$ACME"
+    rm -rf -- "$ROOT/acme/dnsapi"
+    cp -a "$WORK/acme-source/dnsapi" "$ROOT/acme/dnsapi"
+    chmod -R go-rwx "$ROOT/acme"
+    json_update --arg v "$version" '.components.acme=true | .versions.acme=$v'
+    ok "acme.sh $version 已安装；保留原有账户与续期数据，不启用其自动代码升级。"
+}
 nginx_cmd() {
-    local help
-    help=$("$NGINX" -h 2>&1 || true)
+    local help; help=$("$NGINX" -h 2>&1 || true)
     local -a args=()
     [[ $help != *'-e filename'* ]] || args=(-e "$ROOT/logs/nginx.log")
     "$NGINX" "${args[@]}" "$@"
 }
 nginx_tls_protocols() {
-    local build
-    build=$("$NGINX" -V 2>&1 || true)
-    # Prefer the runtime OpenSSL version when Nginx reports both versions.
+    local build; build=$("$NGINX" -V 2>&1)
     if [[ $build == *'running with OpenSSL '* ]]; then build=${build##*running with OpenSSL }; else build=${build#*built with OpenSSL }; fi
     if [[ $build =~ ^(1\.1\.1|[3-9]\.) ]]; then printf 'TLSv1.2 TLSv1.3'; else printf 'TLSv1.2'; fi
 }
-service_runner() {
-    check_root
-    [[ -f $ROOT/.vpskit-owned && $(cat "$ROOT/.vpskit-owned") == VPSKIT_V1 && ! -L $ROOT ]] || die '服务根目录验证失败。'
-    # Bash redirection works on systemd 237; append: needs systemd 240+.
-    # These internal entry points intentionally do not acquire the manager lock.
-    case "$1" in
-        xray) exec "$XRAY" run -config "$ROOT/config/xray.json" >> "$ROOT/logs/xray.log" 2>&1;;
-        nginx-test) nginx_cmd -t -p "$ROOT/" -c "$ROOT/config/nginx.conf" >> "$ROOT/logs/nginx-service.log" 2>&1;;
-        nginx-reload) nginx_cmd -p "$ROOT/" -c "$ROOT/config/nginx.conf" -s reload >> "$ROOT/logs/nginx-service.log" 2>&1;;
-        nginx)
-            local help; help=$("$NGINX" -h 2>&1 || true)
-            local -a args=(); [[ $help != *'-e filename'* ]] || args=(-e "$ROOT/logs/nginx.log")
-            exec "$NGINX" "${args[@]}" -p "$ROOT/" -c "$ROOT/config/nginx.conf" -g 'daemon off;' >> "$ROOT/logs/nginx-service.log" 2>&1;;
-        *) die '无效的内部服务命令。';;
-    esac
-}
-persist_self() {
-    local src=${BASH_SOURCE[0]} stage="$WORK/vpskit.sh" existing
-    if [[ -f $src && $src != /dev/fd/* && $src != /proc/* ]]; then
-        cp -- "$src" "$stage"
-    else
-        fetch "$SELF_URL" "$stage"
-        grep -Fxq "VERSION='$VERSION'" "$stage" || die '远程落地版本与当前版本不同；请下载到本地后重新运行。'
+edge_settings() { jq -c '{bots:"off",rate:0,burst:30,connections:0,kbps:0,static_ttl:0,gzip:false,origin:false,aop:"off"} * (.protection // {})' <<< "$1"; }
+edge_zone() { printf '%s' "$1" | sha256sum | cut -c1-12; }
+edge_validate() {
+    local cfg=${2:-$STATE} s; s=$(edge_settings "$1")
+    jq -e 'def i($a;$b): type=="number" and .==floor and .>=$a and .<=$b;
+      (.bots=="off" or .bots=="ai" or .bots=="common" or .bots=="all") and
+      (.rate|i(0;100)) and (.burst|i(1;200)) and (.connections|i(0;200)) and
+      (.kbps|i(0;10240)) and (.static_ttl|i(0;604800)) and
+      (.gzip|type=="boolean") and (.origin|type=="boolean") and
+      (.aop=="off" or .aop=="observe" or .aop=="enforce")' <<< "$s" >/dev/null || die '网站防护设置无效。'
+    if [[ $(jq -r .origin <<< "$s") == true || $(jq -r .aop <<< "$s") != off ]]; then
+        [[ $(jq -r '.access // "direct"' <<< "$1") == cloudflare ]] || die '来源限制/AOP只能用于Cloudflare站点。'
     fi
-    bash -n "$stage"
-    grep -Fq 'VPSKIT_SINGLE_FILE' "$stage" || die '不是有效的VPSKit脚本。'
-    if [[ -e $ENTRY || -L $ENTRY ]]; then
-        existing=$(readlink "$ENTRY" || true)
-        [[ $existing == "$ROOT/vpskit.sh" ]] || die "$ENTRY 已被其他程序使用。"
+    if [[ $(jq -r .aop <<< "$s") != off ]]; then
+        [[ $(jq -r .issued <<< "$1") == true && -s $ROOT/config/edge/aop-ca.pem ]] || die 'AOP缺少网站TLS证书或回源CA。'
+        local token; token=$(jq -r '.edge.probe // ""' "$cfg"); [[ $token =~ ^[a-f0-9]{32}$ ]] || die 'AOP探测标识不合法。'
     fi
-    install -m 700 "$stage" "$ROOT/vpskit.sh.new"
-    mv -f "$ROOT/vpskit.sh.new" "$ROOT/vpskit.sh"
-    ln -sfn "$ROOT/vpskit.sh" "$ENTRY"
 }
-unit_write() {
-    local name=$1 path="$SYSTEMD/$1"
-    [[ ! -L $path ]] || die "服务文件为符号链接: $path"
-    if [[ -e $path ]]; then grep -Fq '# VPSKIT_OWNED' "$path" || die "同名外部服务存在: $path"; fi
-    cat > "$path"
-    chmod 644 "$path"
+cert_files_valid() {
+    local d=$1 file="$ROOT/certs/$1/current/fullchain.pem" key="$ROOT/certs/$1/current/key.pem" base
+    [[ -s $file && -s $key ]] || return 1
+    base=$(realpath -m -- "$ROOT/certs/$d/current")
+    [[ $base == "$ROOT/certs/$d/"* ]] || return 1
+    openssl x509 -in "$file" -noout -checkend 0 >/dev/null 2>&1 &&
+      openssl x509 -in "$file" -noout -checkhost "$d" >/dev/null 2>&1 &&
+      [[ $(openssl x509 -in "$file" -pubkey -noout | openssl pkey -pubin -outform DER | sha256sum) == $(openssl pkey -in "$key" -pubout -outform DER | sha256sum) ]]
 }
-write_units() {
-    unit_write vpskit-xray.service <<EOF
+validate_state() {
+    local cfg=${1:-$STATE} resources=${2:-yes} site node domain kind upstream protocol mode name port entry cred listen target
+    state_basic "$cfg" || die '配置结构无效，原文件未被重置。'
+    validate_advanced "$cfg"
+    jq -e '([.nodes[].id]|length==(unique|length)) and ([.sites[].domain]|length==(unique|length)) and
+      ([.components.xray,.components.nginx,.components.acme]|all(type=="boolean")) and
+      (.nodes|all(type=="object" and (.enabled|type=="boolean") and (.port|type=="number") and .port==(.port|floor))) and
+      (.sites|all(type=="object" and (.issued|type=="boolean")))' "$cfg" >/dev/null || die '节点/网站字段类型或唯一性错误。'
+    while IFS= read -r site; do
+        domain=$(jq -r .domain <<< "$site"); valid_domain "$domain" || die '网站域名无效。'
+        kind=$(jq -r '.kind // (if (.upstream // "")!="" then "proxy" else "custom" end)' <<< "$site")
+        upstream=$(jq -r '.upstream // ""' <<< "$site")
+        choice "$(jq -r '.access // "direct"' <<< "$site")" 'direct cloudflare' || die '网站访问方式无效。'
+        choice "$(jq -r '.challenge // "http"' <<< "$site")" 'http dns_cf dns_dp' || die '证书验证方式无效。'
+        case "$kind" in
+            template) choice "$(jq -r '.template // "welcome"' <<< "$site")" 'welcome notes blog' || die '模板无效。';;
+            custom) ;;
+            proxy) valid_upstream "$upstream" || die '上游必须是本机HTTP端口，且不能为80/443。';;
+            redirect) valid_redirect "$(jq -r .redirect <<< "$site")" "$domain" || die '跳转地址无效。';;
+            *) die '网站类型无效。';;
+        esac
+        [[ $kind == proxy || -z $upstream ]] || die '网站类型与反代地址不一致。'
+        edge_validate "$site" "$cfg"
+        if [[ $resources == yes && $(jq -r .issued <<< "$site") == true ]]; then cert_files_valid "$domain" || die "域名 $domain 的证书缺失、过期或密钥不匹配。请先恢复/续期证书。"; fi
+    done < <(jq -c '.sites[]' "$cfg")
+    while IFS= read -r node; do
+        name=$(jq -r .id <<< "$node"); entry=$(jq -r .entry <<< "$node"); port=$(jq -r .port <<< "$node")
+        protocol=$(jq -r .protocol <<< "$node"); mode=$(jq -r .mode <<< "$node"); cred=$(jq -r .credential <<< "$node")
+        valid_name "$name" && valid_name "$entry" && valid_port "$port" && [[ $port != 22 && $port != 80 && $port != 443 ]] || die '节点名称、入口或端口无效。'
+        valid_host "$(jq -r .host <<< "$node")" || die '节点连接地址无效。'
+        listen=$(jq -r '.listen // "0.0.0.0"' <<< "$node")
+        choice "$listen" '0.0.0.0 127.0.0.1 :: ::1' || die '节点监听地址不在允许列表。'
+        case "$protocol:$mode" in vless:reality|vless:xhttp|vless:ws|vless:tls|vmess:ws|vmess:ws-plain|vmess:tls|trojan:ws|trojan:tls|shadowsocks:ss) ;; *) die '不支持的协议/传输组合。';; esac
+        if [[ $protocol == vless || $protocol == vmess ]]; then valid_uuid "$cred" || die 'UUID无效。'
+        else [[ ${#cred} -ge 8 && ${#cred} -le 256 && $cred != *[[:space:]]* ]] || die '密码长度/格式无效。'; fi
+        if [[ $protocol == shadowsocks ]]; then
+            choice "$(jq -r .method <<< "$node")" 'aes-128-gcm aes-256-gcm chacha20-ietf-poly1305 2022-blake3-aes-128-gcm 2022-blake3-aes-256-gcm 2022-blake3-chacha20-poly1305' || die 'Shadowsocks算法无效。'
+            if [[ $(jq -r .method <<< "$node") == 2022-* ]]; then
+                local wanted=32 actual
+                [[ $(jq -r .method <<< "$node") != 2022-blake3-aes-128-gcm ]] || wanted=16
+                actual=$(printf '%s' "$cred" | base64 -d | wc -c) || die 'SS2022密钥不是有效Base64。'
+                ((actual==wanted)) || die 'SS2022密钥长度与算法不匹配。'
+            fi
+        fi
+        if [[ $mode == ws || $mode == xhttp || $mode == ws-plain ]]; then valid_path "$(jq -r .path <<< "$node")" || die '节点路径无效。'; fi
+        if [[ $mode == ws || $mode == xhttp || $mode == tls ]]; then
+            domain=$(jq -r .domain <<< "$node"); valid_domain "$domain" || die '节点TLS域名无效。'
+            jq -e --arg d "$domain" '.sites[]|select(.domain==$d and .issued)' "$cfg" >/dev/null || die 'TLS节点引用了未签发证书的站点。'
+        fi
+        if [[ $mode == xhttp ]]; then
+            choice "$(jq -r '.http_version // "h2"' <<< "$node")" 'h2 h3' || die 'XHTTP协议版本无效。'
+            if [[ $(jq -r '.http_version // "h2"' <<< "$node") == h3 ]]; then
+                jq -e --arg d "$domain" '.sites[]|select(.domain==$d and .access=="cloudflare")' "$cfg" >/dev/null || die 'H3出口要求Cloudflare站点。'
+                [[ $(jq -r .host <<< "$node") == "$domain" ]] || die 'H3出口必须连接Cloudflare域名。'
+            fi
+        fi
+        if [[ $mode == reality ]]; then
+            valid_domain "$(jq -r .sni <<< "$node")" || die 'REALITY SNI无效。'
+            target=$(jq -r .target <<< "$node"); valid_domain "${target%:*}" && valid_port "${target##*:}" || die 'REALITY目标无效。'
+            [[ $(jq -r .privateKey <<< "$node") =~ ^[A-Za-z0-9_-]{43}$ && $(jq -r .publicKey <<< "$node") =~ ^[A-Za-z0-9_-]{43}$ && $(jq -r .shortId <<< "$node") =~ ^([a-fA-F0-9]{2}){1,8}$ ]] || die 'REALITY密钥或ShortID无效。'
+        fi
+    done < <(jq -c '.nodes[]' "$cfg")
+    jq -e '[.nodes|group_by(.entry)[]|select(.[0].protocol=="shadowsocks")|length==1]|all' "$cfg" >/dev/null || die 'Shadowsocks入口不支持共享多个用户，请拆分入口。'
+    jq -e '[.nodes|group_by(.entry)[]|(map(del(.id,.credential,.enabled))|unique|length)==1]|all' "$cfg" >/dev/null || die '同入口用户的传输参数不一致。'
+    jq -e '[.nodes|group_by(.entry)[]|.[0].port]|length==(unique|length)' "$cfg" >/dev/null || die '不同入口使用了重复端口。'
+    jq -e '[.nodes[]|select(.mode=="ws" or .mode=="xhttp")]|group_by([.domain,.path])|map(map(.entry)|unique|length==1)|all' "$cfg" >/dev/null || die '不同入口使用了同一网站代理路径。'
+    # A WS exact path must not fall under another XHTTP prefix.
+    jq -e '.nodes as $a | [ $a[]|select(.mode=="xhttp") as $x | $a[]|select(.entry!=$x.entry and .domain==$x.domain and (.mode=="xhttp" or .mode=="ws")) | (.path|startswith($x.path+"/")) ] | any | not' "$cfg" >/dev/null || die 'XHTTP路径前缀冲突。'
+}
+render_xray() {
+    jq --arg root "$ROOT" '
+      {log:{access:"none",error:($root+"/logs/xray.log"),loglevel:"warning"},
+       inbounds:([.nodes[]|select(.enabled)]|group_by(.entry)|map(. as $g|.[0] as $n|
+        {tag:$n.entry,listen:(if ($n.mode=="ws" or $n.mode=="xhttp") then "127.0.0.1" else $n.listen end),port:$n.port,protocol:$n.protocol,
+         settings:(if $n.protocol=="vless" then {decryption:"none",clients:($g|map({id:.credential,email:.id,flow:(if .mode=="reality" then "xtls-rprx-vision" else "" end)}))}
+          elif $n.protocol=="vmess" then {clients:($g|map({id:.credential,email:.id})),disableInsecureEncryption:true}
+          elif $n.protocol=="trojan" then {clients:($g|map({password:.credential,email:.id}))}
+          else {method:$n.method,password:$n.credential,network:"tcp,udp"} end)} +
+        (if $n.mode=="ss" then {} else {streamSettings:({network:(if ($n.mode=="ws" or $n.mode=="ws-plain") then "ws" elif $n.mode=="xhttp" then "xhttp" else "tcp" end),
+          security:(if ($n.mode=="ws" or $n.mode=="xhttp" or $n.mode=="ws-plain") then "none" elif $n.mode=="reality" then "reality" else "tls" end)} +
+          (if $n.mode=="reality" then {realitySettings:{show:false,target:$n.target,xver:0,serverNames:[$n.sni],privateKey:$n.privateKey,shortIds:[$n.shortId]}}
+           elif $n.mode=="tls" then {tlsSettings:{minVersion:"1.2",certificates:[{certificateFile:($root+"/certs/"+$n.domain+"/current/fullchain.pem"),keyFile:($root+"/certs/"+$n.domain+"/current/key.pem")}]}}
+           elif $n.mode=="xhttp" then {xhttpSettings:{path:($n.path+"/"),mode:"packet-up"}}
+           else {wsSettings:{path:$n.path}} end))} end))),
+       outbounds:[{tag:"direct",protocol:"freedom"},{tag:"blocked",protocol:"blackhole"}],
+       routing:{domainStrategy:"IPIfNonMatch",rules:[{type:"field",ip:["0.0.0.0/8","10.0.0.0/8","127.0.0.0/8","169.254.0.0/16","172.16.0.0/12","192.168.0.0/16","224.0.0.0/4","::/128","::1/128","fc00::/7","fe80::/10","ff00::/8"],outboundTag:"blocked"}]}}
+    ' "$STATE" > "$1"
+}
+cf_cidrs_valid() {
+    local file=$1 family=$2 line address prefix count=0
+    [[ -s $file && $(stat -c %s "$file") -le 65536 ]] || return 1
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ $line == */* && $line != *[[:space:]]* ]] || return 1
+        address=${line%/*}; prefix=${line##*/}
+        valid_host "$address" && number "$prefix" 1 128 || return 1
+        if [[ $family == 4 ]]; then [[ $address =~ ^[0-9.]+$ ]] && number "$prefix" 8 32 || return 1
+        else [[ $address == *:* ]] && number "$prefix" 16 128 || return 1; fi
+        count=$((count+1)); ((count<=512)) || return 1
+    done < "$file"
+    ((count>0))
+}
+cf_ready() { cf_cidrs_valid "$ROOT/config/edge/cf-v4.txt" 4 && cf_cidrs_valid "$ROOT/config/edge/cf-v6.txt" 6; }
+cf_needed() { jq -e '.sites[]|select((.access // "direct")=="cloudflare")' "$STATE" >/dev/null; }
+cf_fetch() {
+    mkdir -p "$WORK/edge"
+    fetch https://www.cloudflare.com/ips-v4 "$WORK/edge/cf-v4.txt"
+    fetch https://www.cloudflare.com/ips-v6 "$WORK/edge/cf-v6.txt"
+    fetch https://developers.cloudflare.com/ssl/static/authenticated_origin_pull_ca.pem "$WORK/edge/aop-ca.pem"
+    cf_cidrs_valid "$WORK/edge/cf-v4.txt" 4 && cf_cidrs_valid "$WORK/edge/cf-v6.txt" 6 || die 'Cloudflare网段无效，旧配置保留。'
+    openssl x509 -in "$WORK/edge/aop-ca.pem" -noout -checkend 2592000 >/dev/null || die 'AOP CA无效或即将到期。'
+    openssl x509 -in "$WORK/edge/aop-ca.pem" -text -noout | grep -q 'CA:TRUE' || die '下载文件不是CA证书。'
+}
+cf_install_assets() { mkdir -p "$ROOT/config/edge"; install -m 600 "$WORK/edge/"* "$ROOT/config/edge/"; date +%s > "$ROOT/config/edge/updated.epoch"; }
+bot_pattern() {
+    local pattern='GPTBot|ChatGPT-User|OAI-SearchBot|ClaudeBot|Claude-User|Claude-SearchBot|anthropic-ai|CCBot|Bytespider|Amazonbot|Applebot-Extended|Google-Extended|cohere-ai|PerplexityBot|Perplexity-User|Diffbot|FacebookBot|meta-externalagent|meta-externalfetcher'
+    case "$1" in common) pattern+='|AhrefsBot|SemrushBot|MJ12bot|DotBot|BLEXBot|DataForSeoBot|SeekportBot';;
+        all) pattern+='|bot|spider|crawler|scrapy|python-requests|curl|wget|go-http-client|headlesschrome';; esac
+    printf '%s' "$pattern"
+}
+edge_origin_guard() { if [[ $(jq -r .origin <<< "$1") == true ]]; then printf '            if ($vpskit_cf_peer = 0) { return 403; }\n'; fi; }
+edge_web_guard() {
+    local settings=$1 domain=$2 bots rate burst conn kbps zone
+    bots=$(jq -r .bots <<< "$settings"); rate=$(jq -r .rate <<< "$settings"); burst=$(jq -r .burst <<< "$settings")
+    conn=$(jq -r .connections <<< "$settings"); kbps=$(jq -r .kbps <<< "$settings"); zone=$(edge_zone "$domain")
+    edge_origin_guard "$settings"
+    [[ $bots == off ]] || printf '            if ($vpskit_bot_%s) { return 403; }\n' "$bots"
+    ((rate==0)) || printf '            limit_req zone=vr_%s burst=%s nodelay;\n            limit_req_status 429;\n' "$zone" "$burst"
+    ((conn==0)) || printf '            limit_conn vc_%s %s;\n            limit_conn_status 429;\n' "$zone" "$conn"
+    ((kbps==0)) || printf '            limit_rate %sk;\n' "$kbps"
+}
+static_gzip() {
+    [[ $1 == true ]] || return 0
+    cat <<'NGINX'
+            gzip on;
+            gzip_vary on;
+            gzip_comp_level 2;
+            gzip_min_length 1024;
+            gzip_types text/plain text/css application/javascript application/json image/svg+xml application/xml;
+NGINX
+}
+render_nginx() {
+    local dest=$1 a user group version build h2 modern=false ipv6=false site domain kind upstream issued settings zone rate conn cidr policy ttl gzip node path port aop probe
+    a=$(nginx_settings); user=$(resolve_worker); group=$(id -gn "$user")
+    build=$("$NGINX" -V 2>&1); version=$("$NGINX" -v 2>&1 | sed -n 's@.*nginx/\([0-9.]*\).*@\1@p')
+    h2=$(jq -r .http2 <<< "$a")
+    if jq -e '.nodes[]|select(.enabled and .mode=="xhttp")' "$STATE" >/dev/null; then h2=true; fi
+    if [[ $h2 == true && $build != *--with-http_v2_module* ]]; then die 'HTTP/2或XHTTP需要带http_v2模块的Nginx；请升级组件或关闭网站HTTP/2。'; fi
+    if dpkg --compare-versions "${version:-0}" ge 1.25.1; then modern=true; fi
+    if [[ -r /proc/sys/net/ipv6/conf/all/disable_ipv6 && $(cat /proc/sys/net/ipv6/conf/all/disable_ipv6) == 0 ]]; then ipv6=true; fi
+    if cf_needed; then
+        cf_ready || die 'Cloudflare网站缺少官方IP网段，请运行 vpskit edge refresh。'
+        [[ $build == *--with-http_realip_module* ]] || die 'Cloudflare访客识别需要Nginx realip模块。'
+    fi
+    {
+        cat <<EOF
+# VPSKIT_OWNED — generated; edit state using vpskit advanced, not this file.
+user $user $group;
+worker_processes $(jq -r .workers <<< "$a");
+worker_rlimit_nofile $(jq -r .nofile <<< "$a");
+pid $ROOT/run/nginx.pid;
+error_log $ROOT/logs/nginx.log warn;
+EOF
+        if (( $(jq -r .worker_shutdown_timeout <<< "$a") > 0 )); then printf 'worker_shutdown_timeout %ss;\n' "$(jq -r .worker_shutdown_timeout <<< "$a")"; fi
+        cat <<EOF
+ events { worker_connections $(jq -r .connections <<< "$a"); }
+http {
+    types { text/html html htm; text/css css; application/javascript js mjs; application/json json; image/png png; image/jpeg jpg jpeg; image/gif gif; image/webp webp; image/avif avif; image/svg+xml svg; image/x-icon ico; text/plain txt; font/woff woff; font/woff2 woff2; font/ttf ttf; application/pdf pdf; video/mp4 mp4; application/xml xml; }
+    default_type application/octet-stream;
+    server_tokens off;
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
+    keepalive_timeout $(jq -r .keepalive <<< "$a")s;
+    keepalive_requests $(jq -r .keepalive_requests <<< "$a");
+    client_header_timeout $(jq -r .client_header_timeout <<< "$a")s;
+    client_body_timeout $(jq -r .client_body_timeout <<< "$a")s;
+    send_timeout $(jq -r .send_timeout <<< "$a")s;
+    reset_timedout_connection on;
+    client_max_body_size $(jq -r .client_max_body_mb <<< "$a")m;
+    client_body_temp_path $ROOT/run/nginx/client;
+    proxy_temp_path $ROOT/run/nginx/proxy;
+    fastcgi_temp_path $ROOT/run/nginx/fastcgi;
+    uwsgi_temp_path $ROOT/run/nginx/uwsgi;
+    scgi_temp_path $ROOT/run/nginx/scgi;
+    ssl_session_cache shared:VPSKITSSL$(jq -r .ssl_cache <<< "$a"):$(jq -r .ssl_cache <<< "$a")m;
+    ssl_session_timeout $(jq -r .ssl_timeout <<< "$a")m;
+    ssl_protocols $(nginx_tls_protocols);
+EOF
+        if [[ $(jq -r .access_log <<< "$a") == true ]]; then printf '    access_log %s/logs/access.log combined buffer=32k flush=5s;\n' "$ROOT"; else printf '    access_log off;\n'; fi
+        cat <<'NGINX'
+    map $http_upgrade $vpskit_is_ws { default 0; ~*^websocket$ 1; }
+    map $http_upgrade $vpskit_connection { default upgrade; '' ''; }
+NGINX
+        for policy in ai common all; do printf '    map $http_user_agent $vpskit_bot_%s { default 0; ~*(%s) 1; }\n' "$policy" "$(bot_pattern "$policy")"; done
+        if cf_needed; then
+            printf '    geo $realip_remote_addr $vpskit_cf_peer { default 0;\n'
+            while IFS= read -r cidr; do printf '        %s 1;\n' "$cidr"; done < <(cat "$ROOT/config/edge/cf-v4.txt" "$ROOT/config/edge/cf-v6.txt")
+            printf '    }\n'
+        fi
+        while IFS= read -r site; do
+            domain=$(jq -r .domain <<< "$site"); settings=$(edge_settings "$site"); zone=$(edge_zone "$domain")
+            rate=$(jq -r .rate <<< "$settings"); conn=$(jq -r .connections <<< "$settings")
+            if ((rate>0)); then printf '    limit_req_zone $binary_remote_addr zone=vr_%s:1m rate=%sr/s;\n' "$zone" "$rate"; fi
+            if ((conn>0)); then printf '    limit_conn_zone $binary_remote_addr zone=vc_%s:1m;\n' "$zone"; fi
+            upstream=$(jq -r '.upstream // ""' <<< "$site")
+            if [[ -n $upstream ]]; then
+                printf '    upstream va_%s { server %s;' "$zone" "${upstream#http://}"
+                if (( $(jq -r .upstream_keepalive <<< "$a")>0 )); then printf ' keepalive %s;' "$(jq -r .upstream_keepalive <<< "$a")"; fi
+                printf ' }\n'
+            fi
+        done < <(jq -c '.sites[]' "$STATE")
+        printf '    server {\n        listen 80 default_server;\n'
+        [[ $ipv6 != true ]] || printf '        listen [::]:80 default_server;\n'
+        printf '        server_name _;\n        location ^~ /.well-known/acme-challenge/ { root %s/www/acme; default_type text/plain; }\n        location / { return 404; }\n    }\n' "$ROOT"
+        while IFS= read -r site; do
+            domain=$(jq -r .domain <<< "$site"); issued=$(jq -r .issued <<< "$site"); settings=$(edge_settings "$site"); zone=$(edge_zone "$domain")
+            kind=$(jq -r '.kind // (if (.upstream // "")!="" then "proxy" else "custom" end)' <<< "$site")
+            upstream=$(jq -r '.upstream // ""' <<< "$site"); ttl=$(jq -r .static_ttl <<< "$settings")
+            gzip=$(jq -r --argjson global "$(get '.performance.gzip // false')" 'if ((.protection // {})|has("gzip")) then .protection.gzip else $global end' <<< "$site")
+            printf '    server {\n        listen 80;\n'
+            [[ $ipv6 != true ]] || printf '        listen [::]:80;\n'
+            printf '        server_name %s;\n        if ($host != %s) { return 404; }\n' "$domain" "$domain"
+            printf '        location ^~ /.well-known/acme-challenge/ { root %s/www/acme; default_type text/plain; }\n' "$ROOT"
+            if [[ $issued == true ]]; then
+                printf '        location / { return 301 https://%s$request_uri; }\n    }\n' "$domain"
+                printf '    server {\n'
+                if [[ $h2 == true && $modern == false ]]; then
+                    printf '        listen 443 ssl http2;\n'; [[ $ipv6 != true ]] || printf '        listen [::]:443 ssl http2;\n'
+                else
+                    printf '        listen 443 ssl;\n'; [[ $ipv6 != true ]] || printf '        listen [::]:443 ssl;\n'
+                    [[ $h2 != true ]] || printf '        http2 on;\n'
+                fi
+                printf '        server_name %s;\n        if ($host != %s) { return 404; }\n' "$domain" "$domain"
+                printf '        ssl_certificate %s/certs/%s/current/fullchain.pem;\n        ssl_certificate_key %s/certs/%s/current/key.pem;\n' "$ROOT" "$domain" "$ROOT" "$domain"
+            fi
+            if [[ $(jq -r '.access // "direct"' <<< "$site") == cloudflare ]]; then
+                while IFS= read -r cidr; do printf '        set_real_ip_from %s;\n' "$cidr"; done < <(cat "$ROOT/config/edge/cf-v4.txt" "$ROOT/config/edge/cf-v6.txt")
+                printf '        real_ip_header CF-Connecting-IP;\n        real_ip_recursive on;\n'
+            fi
+            aop=$(jq -r .aop <<< "$settings")
+            if [[ $issued == true && $aop != off ]]; then
+                printf '        ssl_client_certificate %s/config/edge/aop-ca.pem;\n        ssl_verify_client %s;\n        ssl_verify_depth 2;\n' "$ROOT" "$([[ $aop == enforce ]] && printf on || printf optional)"
+                probe=$(get .edge.probe)
+                printf '        location = /.well-known/vpskit-aop-%s { default_type text/plain; add_header Cache-Control "no-store" always; return 200 "$ssl_client_verify"; }\n' "$probe"
+            fi
+            printf '        root %s/www/%s;\n' "$ROOT" "$domain"
+            if [[ $kind == template ]]; then printf '        index vpskit-%s.html index.html;\n' "$(jq -r '.template // "welcome"' <<< "$site")"
+            else printf '        index index.html;\n'; fi
+            printf '        location ~ /\\. { deny all; }\n'
+            if [[ $issued == true ]]; then
+                while IFS= read -r node; do
+                    path=$(jq -r .path <<< "$node"); port=$(jq -r .port <<< "$node")
+                    if [[ $(jq -r .mode <<< "$node") == xhttp ]]; then
+                        printf '        location ^~ %s/ {\n' "$path"
+                        edge_origin_guard "$settings"
+                        printf '            proxy_http_version 1.1;\n            proxy_set_header Connection "";\n            proxy_set_header Host $host;\n            client_max_body_size 0;\n'
+                    else
+                        printf '        location = %s {\n' "$path"
+                        edge_origin_guard "$settings"
+                        printf '            if ($vpskit_is_ws = 0) { return 404; }\n            if ($request_method != GET) { return 404; }\n            proxy_http_version 1.1;\n            proxy_set_header Upgrade $http_upgrade;\n            proxy_set_header Connection "upgrade";\n            proxy_set_header Host $host;\n'
+                    fi
+                    cat <<EOF
+            proxy_pass http://127.0.0.1:$port;
+            proxy_buffering off;
+            proxy_request_buffering off;
+            proxy_cache off;
+            gzip off;
+            add_header Cache-Control "no-store" always;
+            proxy_connect_timeout $(jq -r .proxy_connect_timeout <<< "$a")s;
+            proxy_read_timeout $(jq -r .proxy_read_timeout <<< "$a")s;
+            proxy_send_timeout $(jq -r .proxy_send_timeout <<< "$a")s;
+            client_body_timeout $(jq -r .proxy_send_timeout <<< "$a")s;
+            send_timeout $(jq -r .proxy_read_timeout <<< "$a")s;
+        }
+EOF
+                done < <(jq -c --arg d "$domain" '[.nodes[]|select(.enabled and (.mode=="ws" or .mode=="xhttp") and .domain==$d)]|unique_by(.entry)[]' "$STATE")
+            fi
+            if [[ $kind == template || $kind == custom ]]; then
+                if ((ttl>0)); then
+                    printf '        location ~* \\.(css|js|png|jpe?g|gif|svg|webp|avif|ico|woff2?|ttf)$ {\n'
+                    edge_web_guard "$settings" "$domain"
+                    printf '            try_files $uri =404;\n            expires %ss;\n' "$ttl"; static_gzip "$gzip"; printf '        }\n'
+                fi
+            fi
+            printf '        location / {\n'; edge_web_guard "$settings" "$domain"
+            if [[ $kind == redirect ]]; then
+                printf '            return 302 "%s";\n' "$(jq -r .redirect <<< "$site")"
+            elif [[ $kind == proxy ]]; then
+                cat <<EOF
+            proxy_pass http://va_$zone;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade \$http_upgrade;
+            proxy_set_header Connection \$vpskit_connection;
+            proxy_set_header Host \$host;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_set_header X-Forwarded-For \$remote_addr;
+            proxy_set_header X-Forwarded-Proto \$scheme;
+            proxy_hide_header X-Powered-By;
+            proxy_connect_timeout $(jq -r .proxy_connect_timeout <<< "$a")s;
+            proxy_read_timeout $(jq -r .site_proxy_timeout <<< "$a")s;
+            proxy_send_timeout $(jq -r .site_proxy_timeout <<< "$a")s;
+EOF
+            else printf '            try_files $uri $uri/ =404;\n'; static_gzip "$gzip"; fi
+            printf '        }\n    }\n'
+        done < <(jq -c '.sites[]' "$STATE")
+        printf '}\n'
+    } > "$dest"
+}
+
+render_units() {
+    local dir=$1 user='not-installed' nglimit xrlimit
+    mkdir -p "$dir"
+    nglimit=$(ng_value nofile); xrlimit=$(xray_nofile)
+    if [[ $(get '.components.nginx // false') == true ]]; then user=$(resolve_worker); fi
+    cat > "$dir/vpskit-nginx.service" <<EOF
+# VPSKIT_OWNED
+# worker-user: $user
+[Unit]
+Description=VPSKit Nginx (root master, unprivileged workers)
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=simple
+User=root
+ExecStartPre=/bin/bash $ROOT/vpskit.sh _service nginx-test
+ExecStart=/bin/bash $ROOT/vpskit.sh _service nginx
+ExecReload=/bin/bash $ROOT/vpskit.sh _service nginx-reload
+KillSignal=SIGQUIT
+KillMode=mixed
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=$nglimit
+LimitCORE=0
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=$ROOT/logs $ROOT/run
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# CHOWN/DAC_OVERRIDE: temp paths; KILL: signal workers after setuid.
+# These are master capabilities; a normal setuid worker drops its capabilities.
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_SETUID CAP_SETGID CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_KILL
+StandardOutput=journal
+StandardError=journal
+[Install]
+WantedBy=multi-user.target
+EOF
+    cat > "$dir/vpskit-xray.service" <<EOF
 # VPSKIT_OWNED
 [Unit]
 Description=VPSKit Xray
@@ -441,3134 +944,1173 @@ ExecStart=/bin/bash $ROOT/vpskit.sh _service xray
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=20
-LimitNOFILE=8192
+LimitNOFILE=$xrlimit
+LimitCORE=0
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=$ROOT
+ProtectKernelTunables=true
+ProtectControlGroups=true
+ReadWritePaths=$ROOT/logs $ROOT/run
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-StandardOutput=null
-StandardError=null
+StandardOutput=journal
+StandardError=journal
 [Install]
 WantedBy=multi-user.target
 EOF
-    unit_write vpskit-nginx.service <<EOF
+    cat > "$dir/vpskit-maintain.service" <<EOF
 # VPSKIT_OWNED
 [Unit]
-Description=VPSKit isolated Nginx
-After=network-online.target
-Wants=network-online.target
-[Service]
-Type=simple
-User=root
-ExecStartPre=/bin/bash $ROOT/vpskit.sh _service nginx-test
-ExecStart=/bin/bash $ROOT/vpskit.sh _service nginx
-ExecReload=/bin/bash $ROOT/vpskit.sh _service nginx-reload
-KillSignal=SIGQUIT
-Restart=on-failure
-RestartSec=5
-TimeoutStopSec=30
-UMask=0077
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=$ROOT
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_SETUID CAP_SETGID
-StandardOutput=null
-StandardError=null
-[Install]
-WantedBy=multi-user.target
-EOF
-    unit_write vpskit-maintain.service <<EOF
-# VPSKIT_OWNED
-[Unit]
-Description=VPSKit certificate renewal and log maintenance
+Description=VPSKit certificate renewal and bounded log maintenance
 After=network-online.target
 [Service]
 Type=oneshot
 User=root
-ExecStart=$ENTRY maintenance
+ExecStart=/bin/bash $ROOT/vpskit.sh maintenance
 TimeoutStartSec=30min
 Nice=10
 UMask=0077
 EOF
-    unit_write vpskit-maintain.timer <<'EOF'
+    cat > "$dir/vpskit-maintain.timer" <<'EOF'
 # VPSKIT_OWNED
 [Unit]
-Description=VPSKit scheduled certificate and log check
+Description=VPSKit scheduled certificate and log maintenance
 [Timer]
-OnCalendar=hourly
-RandomizedDelaySec=600
+OnCalendar=daily
+RandomizedDelaySec=3600
 Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
+}
+service_runner() {
+    root_check
+    [[ ! -L $ROOT && -f $ROOT/.vpskit-owned && $(cat "$ROOT/.vpskit-owned") == VPSKIT_V1 ]] || die '服务根目录无效。'
+    case "$1" in
+        nginx-test) nginx_cmd -t -p "$ROOT/" -c "$ROOT/config/nginx.conf";;
+        nginx-reload) nginx_cmd -t -p "$ROOT/" -c "$ROOT/config/nginx.conf"; nginx_cmd -p "$ROOT/" -c "$ROOT/config/nginx.conf" -s reload;;
+        nginx) local help; help=$("$NGINX" -h 2>&1 || true); local -a args=()
+            [[ $help != *'-e filename'* ]] || args=(-e "$ROOT/logs/nginx.log")
+            exec "$NGINX" "${args[@]}" -p "$ROOT/" -c "$ROOT/config/nginx.conf" -g 'daemon off;' ;;
+        xray) exec "$XRAY" run -config "$ROOT/config/xray.json";;
+        *) die '未知内部服务入口。';;
+    esac
+}
+master_workers() {
+    local pid=$1
+    [[ $pid =~ ^[1-9][0-9]*$ ]] || return 0
+    ps --ppid "$pid" -o pid=,uid=,args= 2>/dev/null | awk '$3=="nginx:" && $4=="worker" && $5=="process" && NF==5 {print $1" "$2}' || true
+}
+verify_nginx_runtime() {
+    local old=${1:-} master=${2:-} desired uid pid actual_uid fd found=0 tries caps
+    desired=$(resolve_worker); uid=$(id -u "$desired")
+    for ((tries=0; tries<50; tries++)); do
+        if [[ -z ${2:-} ]]; then master=$(systemctl show -p MainPID --value vpskit-nginx.service); fi
+        [[ $master =~ ^[1-9][0-9]*$ && -r /proc/$master/status ]] || { sleep 0.1; continue; }
+        found=0
+        while read -r pid actual_uid; do
+            [[ -n $pid ]] || continue
+            [[ " $old " != *" $pid "* ]] || continue
+            ((actual_uid == uid && actual_uid != 0)) || die '发现新Nginx Worker身份不符合预期。'
+            fd=$(awk '/^Max open files/{print $4}' "/proc/$pid/limits")
+            [[ $fd == unlimited ]] || ((fd >= $(ng_value nofile))) || die 'Worker实际文件描述符上限未生效。'
+            caps=$(awk '/^CapEff:/{print $2}' "/proc/$pid/status")
+            [[ $caps =~ ^0+$ ]] || die 'Worker仍保留有效Linux capabilities，拒绝提交。'
+            found=$((found+1))
+        done < <(master_workers "$master")
+        if ((found>0)); then
+            local expected; expected=$(ng_value workers)
+            if [[ $expected == auto ]] || ((found>=expected)); then return 0; fi
+        fi
+        sleep 0.1
+    done
+    die '未观察到符合用户/权限/文件数要求的新Worker；可能reload失败，正在触发回滚。'
+}
+guard_port() {
+    local port=$1 service=$2 output pid
+    output=$(ss -H -lntup "sport = :$port")
+    [[ -n $output ]] || return 0
+    local -a pids=()
+    mapfile -t pids < <(printf '%s\n' "$output" | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u)
+    ((${#pids[@]})) || die "端口 $port 被占用且无法识别归属；不会自动杀进程。"
+    for pid in "${pids[@]}"; do
+        grep -Fq "/$service" "/proc/$pid/cgroup" || die "端口 $port 被其他进程占用；请换端口或人工处理，不会抢占外部服务。"
+    done
+}
+check_listener_ports() {
+    local port
+    if [[ $(get '.components.nginx // false') == true ]]; then
+        guard_port 80 vpskit-nginx.service
+        if jq -e '.sites[]|select(.issued)' "$STATE" >/dev/null; then guard_port 443 vpskit-nginx.service; fi
+    fi
+    while IFS= read -r port; do guard_port "$port" vpskit-xray.service; done < <(jq -r '[.nodes[]|select(.enabled)]|unique_by(.entry)[].port' "$STATE")
+}
+code_candidate_check() {
+    local file=$1 minimum=${2:-2}
+    [[ -s $file && ! -L $file && $(stat -c %s "$file") -le 4194304 ]] || die '脚本文件为空、为链接或大于4MiB。'
+    grep -Fq 'VPSKIT_SINGLE_FILE' "$file" || die '没有VPSKit单文件标识。'
+    grep -Fxq '# VPSKIT_STATE_SCHEMA=1' "$file" || die '候选脚本不兼容当前配置结构。'
+    local level ver
+    level=$(sed -n 's/^# VPSKIT_FEATURE_LEVEL=\([0-9][0-9]*\)$/\1/p' "$file")
+    [[ $level =~ ^[0-9]{1,3}$ ]] && ((level>=minimum)) || die '拒绝用缺少高级配置/恢复能力的旧脚本覆盖增强版。请先上传新版源码到更新源。'
+    ver=$(sed -n "s/^VERSION='\([A-Za-z0-9.+~-]*\)'$/\1/p" "$file")
+    [[ -n $ver && $ver != *$'\n'* ]] || die '版本字段无效。'
+    bash -n "$file" || die '候选脚本存在Bash语法错误，未安装。'
+    printf '%s' "$ver"
+}
+install_manager_file() {
+    local candidate=$1 dest="$ROOT/vpskit.sh" backup version
+    version=$(code_candidate_check "$candidate")
+    if [[ -e $ENTRY || -L $ENTRY ]]; then [[ $(readlink "$ENTRY" || true) == "$dest" ]] || die "$ENTRY 属于其他程序，拒绝覆盖。"; fi
+    if [[ -e $dest ]]; then
+        [[ ! -L $dest ]] && grep -Fq 'VPSKIT_SINGLE_FILE' "$dest" || die '已安装脚本不是本工具的普通文件。'
+        if cmp -s "$candidate" "$dest"; then ln -sfn "$dest" "$ENTRY"; ok '管理脚本内容相同，无需替换。'; return; fi
+        mkdir -p "$ROOT/backup/code"
+        backup="$ROOT/backup/code/$(date -u '+%Y%m%dT%H%M%SZ')-$(randhex 4).sh"
+        cp -a "$dest" "$backup"; chmod 600 "$backup"
+    fi
+    install -m 700 "$candidate" "$ROOT/vpskit.sh.new"
+    mv -f "$ROOT/vpskit.sh.new" "$dest"
+    ln -sfn "$dest" "$ENTRY"
+    printf '%s  %s\n' "$(sha256sum "$dest" | cut -d' ' -f1)" "$version" > "$ROOT/data/manager-installed.sha256"
+    ok "管理代码已安装：$version；未改写state.json或重启服务。"
+}
+ensure_manager_installed() {
+    [[ -f $SELF && $SELF != /dev/fd/* && $SELF != /proc/* ]] || die '请将完整脚本下载为文件后执行。'
+    if [[ ! -f $ROOT/vpskit.sh ]] || ! cmp -s "$SELF" "$ROOT/vpskit.sh"; then
+        install_manager_file "$SELF"
+    fi
+}
+update_manager() {
+    local source=${1:-} expected=${2:-} candidate="$WORK/manager.candidate.sh" version current='' digest
+    if [[ -z $source ]]; then
+        if [[ $(realpath -m "$SELF") != "$ROOT/vpskit.sh" ]]; then source=$SELF
+        else ask source '完整新版脚本本地路径或HTTPS地址' "$SELF_URL"; fi
+    fi
+    if [[ $source == https://* ]]; then fetch "$source" "$candidate"
+    else [[ -f $source && ! -L $source ]] || die '本地源码文件不存在或为符号链接。'; cp -- "$source" "$candidate"; fi
+    version=$(code_candidate_check "$candidate")
+    if [[ -f $ROOT/vpskit.sh ]]; then
+        current=$(sed -n "s/^VERSION='\([A-Za-z0-9.+~-]*\)'$/\1/p" "$ROOT/vpskit.sh")
+        [[ -z $current ]] || dpkg --compare-versions "$version" ge "$current" || die "候选版本 $version 低于已安装版本 $current；拒绝静默降级。"
+    fi
+    digest=$(sha256sum "$candidate" | cut -d' ' -f1)
+    if [[ -n $expected ]]; then
+        [[ $expected =~ ^[a-fA-F0-9]{64}$ && ${expected,,} == "$digest" ]] || die 'SHA256不匹配。'
+    fi
+    printf '候选版本：%s\nSHA256：%s\n' "$version" "$digest"
+    warn '语法/标识检查不证明来源可信；仅安装你审查过的源码或用可信渠道提供的SHA256校验。'
+    confirm '仅替换管理代码，保留当前配置、证书、节点和运行中的服务' || return 0
+    install_manager_file "$candidate"
+    info '旧进程配置不会因此改变。要启用非root Worker等新生成配置，请执行 vpskit apply 或在高级配置中保存。'
+}
+apply_config() {
+    local scope=${1:-all} force=${2:-none} xc="$WORK/xray.next.json" nc="$WORK/nginx.next.conf" u restart_ng=false restart_x=false old='' pid count
+    ((TX==1)) || die '应用配置必须处于事务中。'
+    migrate_state
+    if [[ $(get '.components.nginx // false') == true ]]; then remember_worker; fi
+    validate_state
+    check_listener_ports
+    if [[ $(get '.components.xray // false') == true && $scope == all ]]; then
+        ensure_component xray; render_xray "$xc"
+        "$XRAY" run -test -config "$xc"
+        if ! cmp -s "$xc" "$ROOT/config/xray.json"; then restart_x=true; fi
+    fi
+    if [[ $(get '.components.nginx // false') == true ]]; then
+        ensure_component nginx
+        mkdir -p "$ROOT/www/acme/.well-known/acme-challenge"
+        worker_permissions "$(resolve_worker)"
+        render_nginx "$nc"
+        nginx_cmd -t -p "$ROOT/" -c "$nc"
+    fi
+    render_units "$WORK/units"
+    for u in "${UNITS[@]}"; do
+        if [[ -e $SYSTEMD/$u ]]; then [[ ! -L $SYSTEMD/$u ]] && grep -Fq '# VPSKIT_OWNED' "$SYSTEMD/$u" || die "外部同名服务：$u"; fi
+        if ! cmp -s "$WORK/units/$u" "$SYSTEMD/$u"; then
+            [[ $u != vpskit-nginx.service ]] || restart_ng=true
+            [[ $u != vpskit-xray.service ]] || restart_x=true
+        fi
+    done
+    [[ $force != nginx ]] || restart_ng=true
+    [[ $force != xray ]] || restart_x=true
+    ensure_manager_installed
+    [[ ! -f $xc ]] || install -m 600 "$xc" "$ROOT/config/xray.json"
+    [[ ! -f $nc ]] || install -m 600 "$nc" "$ROOT/config/nginx.conf"
+    for u in "${UNITS[@]}"; do install -m 644 "$WORK/units/$u" "$SYSTEMD/$u"; done
     systemctl daemon-reload
-    systemctl enable --now vpskit-maintain.timer
-}
-
-# Transactions contain only files owned by VPSKit. Existing websites are never snapshotted/deleted.
-begin_tx() {
-    ((TX == 0)) || die '禁止嵌套事务。'
-    local tx="$ROOT/backup/transaction" part u
-    [[ ! -e $tx ]] || die '检测到待恢复事务，请先执行 vpskit repair。'
-    mkdir -p "$tx/tree" "$tx/units"
-    for part in bin nginx config certs acme; do cp -a "$ROOT/$part" "$tx/tree/"; done
-    cp "$STATE" "$tx/state.json"
-    for u in vpskit-xray.service vpskit-nginx.service vpskit-maintain.service vpskit-maintain.timer; do
-        if [[ -e $SYSTEMD/$u ]]; then cp -a "$SYSTEMD/$u" "$tx/units/"; fi
-        if systemctl is-active --quiet "$u"; then printf '%s\n' "$u" >> "$tx/active"; fi
-        if systemctl is-enabled --quiet "$u" 2>/dev/null; then printf '%s\n' "$u" >> "$tx/enabled"; fi
-    done
-    : > "$tx/stopped-external"
-    printf 'ready\n' > "$tx/ready"
-    TX=1
-}
-restore_tx() {
-    local tx=$1 part u failed=0
-    [[ -f $tx/ready && -f $tx/state.json ]] || { warn '事务快照未完成；未替换正式配置，可清理该暂存目录。'; return 1; }
-    warn '恢复操作前的程序、配置、证书和服务状态。'
-    systemctl stop vpskit-xray.service vpskit-nginx.service 2>/dev/null || true
-    for part in bin nginx config certs acme; do
-        [[ -d $tx/tree/$part ]] || return 1
-        rm -rf -- "${ROOT:?}/$part"
-        cp -a "$tx/tree/$part" "$ROOT/" || failed=1
-    done
-    cp "$tx/state.json" "$STATE" || failed=1
-    for u in vpskit-xray.service vpskit-nginx.service vpskit-maintain.service vpskit-maintain.timer; do
-        if [[ -e $tx/units/$u ]]; then
-            cp -a "$tx/units/$u" "$SYSTEMD/$u" || failed=1
-        elif [[ -e $SYSTEMD/$u ]] && grep -Fq '# VPSKIT_OWNED' "$SYSTEMD/$u"; then
-            systemctl disable --now "$u" 2>/dev/null || true
-            rm -f "$SYSTEMD/$u"
-        fi
-    done
-    systemctl daemon-reload || failed=1
-    for u in vpskit-xray.service vpskit-nginx.service vpskit-maintain.service vpskit-maintain.timer; do
-        if [[ -e $SYSTEMD/$u ]] && { [[ ! -f $tx/enabled ]] || ! grep -Fxq "$u" "$tx/enabled"; }; then
-            systemctl disable "$u" >/dev/null 2>&1 || true
-        fi
-    done
-    if [[ -f $tx/enabled ]]; then while read -r u; do systemctl enable "$u" >/dev/null 2>&1 || failed=1; done < "$tx/enabled"; fi
-    if [[ -f $tx/active ]]; then while read -r u; do systemctl start "$u" || failed=1; done < "$tx/active"; fi
-    while read -r u; do [[ -z $u ]] || systemctl start "$u" || failed=1; done < "$tx/stopped-external"
-    ((failed == 0))
-}
-commit_tx() {
-    ((TX == 1)) || die '没有待提交事务。'
-    rm -rf "$ROOT/backup/last"
-    mv "$ROOT/backup/transaction" "$ROOT/backup/last"
-    TX=0
-    ok '配置已验证并提交；保留一个回滚快照。'
-}
-on_exit() {
-    local rc=$?
-    trap - EXIT ERR INT TERM
-    set +e
-    if [[ $HAVE_LOCK == 1 && $PANEL_IDLE == 0 && -d $ROOT/backup/tuning-transaction ]]; then
-        tuning_recover || { warn "网络调优恢复失败；保留快照，请执行 vpskit repair。"; rc=1; }
-    fi
-    if ((TX == 1 && UNINSTALLING == 0)); then
-        if restore_tx "$ROOT/backup/transaction"; then
-            rm -rf "$ROOT/backup/transaction"
-        else
-            warn "恢复不完整，保留 $ROOT/backup/transaction，执行 vpskit repair。"
-        fi
-    fi
-    if ((WIZARD_ACTIVE == 1 && HAVE_LOCK == 1 && rc != 0)) && [[ -f $STATE ]]; then
-        json_update --arg s "$WIZARD_STEP" --arg r "中断/失败（退出码 $rc），可继续" '.wizard.last_step=$s | .wizard.last_result=$r' || true
-    fi
-    [[ -z $WORK || ! -d $WORK ]] || rm -rf -- "$WORK"
-    if ((rc != 0)); then warn "操作未完成，退出码 $rc。现有外部网站和SSH没有被自动删除。"; fi
-    exit "$rc"
-}
-on_error() { local rc=$1 line=$2; log ERROR "$RED" "步骤失败，行 $line，退出码 $rc（不打印可能含凭据的命令）。"; exit "$rc"; }
-recover() {
-    tuning_recover || die '网络调优恢复未完成，保留快照。'
-    local tx="$ROOT/backup/transaction"
-    if [[ -d $tx ]]; then
-        if [[ ! -f $tx/ready ]]; then
-            rm -rf "$tx"
-            warn '清理未完成的快照；该阶段尚未变更正式配置。'
-        elif restore_tx "$tx"; then
-            rm -rf "$tx"; ok '已自动恢复上次中断操作。'
-        else die '自动恢复失败，请检查 service 日志和事务目录。'; fi
-    fi
-}
-
-# Port handling is explicit and scoped. A force kill is never a hidden side effect.
-port_lines() { ss -H -lntup "sport = :$1" 2>/dev/null; }
-port_free() { [[ -z $(port_lines "$1") ]]; }
-protected_pid() {
-    local p=$1 cur=$$ exe
-    ((p > 1)) || return 0
-    while ((cur > 1)); do
-        [[ $p == "$cur" ]] && return 0
-        cur=$(awk '/^PPid:/{print $2}' "/proc/$cur/status" 2>/dev/null || printf 1)
-        [[ $cur =~ ^[0-9]+$ ]] || break
-    done
-    exe=$(readlink "/proc/$p/exe" 2>/dev/null || true)
-    case "${exe##*/}" in sshd|systemd|init|docker*|containerd*|apt*|dpkg*|dbus-daemon|systemd-resolved) return 0;; esac
-    return 1
-}
-pid_identity() {
-    local st
-    st=$(cat "/proc/$1/stat") || return 1
-    printf '%s %s\n' "$(printf '%s\n' "${st##*) }" | awk '{print $20}')" "$(readlink "/proc/$1/exe")"
-}
-release_port() {
-    local port=$1 lines p unit identity answer
-    local -a pids
-    lines=$(port_lines "$port")
-    printf '%s\n' "$lines" >&2
-    mapfile -t pids < <(printf '%s\n' "$lines" | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u)
-    ((${#pids[@]})) || die '无法识别占用者；请手工处理或更换端口。'
-    for p in "${pids[@]}"; do
-        protected_pid "$p" && die "PID $p 为管理链路或关键服务，禁止强制清理。"
-        [[ -r /proc/$p/stat ]] || continue
-        identity=$(pid_identity "$p")
-        unit=$(grep -oE '[^/]+\.service' "/proc/$p/cgroup" | tail -1 || true)
-        if [[ -n $unit ]]; then
-            case "$unit" in ssh*|systemd-*|docker*|containerd*|dbus*|vpskit-*) die "拒绝抢占关键/本工具服务 $unit；请使用相应管理功能。";; esac
-            info "端口 $port 属于 $unit (PID $p)"
-            confirm "停止 $unit，可能影响其现有业务" || die '已取消端口清理。'
-            [[ -r /proc/$p/stat && $(pid_identity "$p") == "$identity" ]] || die '进程状态发生变化，请重试检测。'
-            printf '%s\n' "$unit" >> "$ROOT/backup/transaction/stopped-external"
-            systemctl stop "$unit"
-        else
-            warn "PID $p 不属于可恢复的systemd服务；终止后不能自动重建它。"
-            confirm "向明确的PID $p 发送TERM" || die '已取消。'
-            [[ -r /proc/$p/stat ]] || continue
-            protected_pid "$p" && die '进程归属变化，取消清理。'
-            [[ $(pid_identity "$p") == "$identity" ]] || die 'PID已重用，取消操作。'
-            kill -TERM "$p"
-            local tries
-            for ((tries=0; tries<20; tries++)); do [[ -e /proc/$p ]] || break; sleep 0.25; done
-            if [[ -e /proc/$p ]]; then
-                ask answer "进程仍在运行；输入 KILL-$p 才强制终止" ''
-                [[ $answer == "KILL-$p" ]] || die '未强制终止；请更换端口。'
-                protected_pid "$p" && die '拒绝终止受保护进程。'
-                [[ $(pid_identity "$p") == "$identity" ]] || die 'PID已重用，取消操作。'
-                kill -KILL "$p"
+    if [[ $(get '.components.nginx // false') == true ]]; then
+        systemctl enable vpskit-nginx.service >/dev/null
+        if systemctl is-active --quiet vpskit-nginx.service; then
+            if [[ $restart_ng == true ]]; then
+                warn 'Nginx服务参数/用户/二进制改变，需要重启；现有连接会中断。'
+                systemctl restart vpskit-nginx.service
+            else
+                pid=$(systemctl show -p MainPID --value vpskit-nginx.service)
+                old=$(master_workers "$pid" | awk '{print $1}' | paste -sd ' ' -)
+                systemctl reload vpskit-nginx.service
             fi
+        else systemctl start vpskit-nginx.service; fi
+        verify_nginx_runtime "$old"
+    else
+        systemctl disable --now vpskit-nginx.service >/dev/null 2>&1 || true
+    fi
+    if [[ $scope == all && $(get '.components.xray // false') == true ]]; then
+        count=$(jq '[.nodes[]|select(.enabled)]|length' "$STATE")
+        if ((count>0)); then
+            systemctl enable vpskit-xray.service >/dev/null
+            if [[ $restart_x == true ]] || ! systemctl is-active --quiet vpskit-xray.service; then
+                warn 'Xray配置/服务参数改变，需要启动或重启；现有代理连接可能中断。'
+                systemctl restart vpskit-xray.service
+            fi
+            sleep 0.5
+            systemctl is-active --quiet vpskit-xray.service || die 'Xray启动失败。'
+            while IFS= read -r pid; do [[ -n $(ss -H -lnt "sport = :$pid") ]] || die "Xray端口 $pid 未监听。"; done < <(jq -r '[.nodes[]|select(.enabled)]|unique_by(.entry)[].port' "$STATE")
+        else systemctl disable --now vpskit-xray.service >/dev/null 2>&1 || true; fi
+    fi
+    if [[ $scope == all && $(get '.components.xray // false') != true ]]; then
+        systemctl disable --now vpskit-xray.service >/dev/null 2>&1 || true
+    fi
+    systemctl enable --now vpskit-maintain.timer >/dev/null
+}
+install_component() {
+    local name=$1 version=${2:-$XRAY_DEFAULT_VERSION} force=${3:-no}
+    choice "$name" 'nginx xray acme' || die '组件只能为nginx/xray/acme。'
+    if [[ $force == no ]] && component_ready "$name"; then ok "$name 已安装，读取原配置，不重复安装。"; return; fi
+    begin_tx "component:$name" components
+    case "$name" in nginx) install_nginx_binary;; xray) install_xray_binary "$version";; acme) install_acme_binary;; esac
+    apply_config all "$name"
+    commit_tx
+}
+apply_existing() {
+    confirm '按已保存配置重新生成并验证；初次降权/文件数变更可能重启服务' || return 0
+    begin_tx apply
+    if cf_needed && ! cf_ready; then cf_fetch; cf_install_assets; fi
+    apply_config
+    commit_tx
+}
+history_restore() {
+    local id=${1:-} scope=${2:-full} dir p candidate="$WORK/restored-state.json"
+    if [[ -z $id ]]; then history_list; ask id '输入完整快照ID' ''; fi
+    [[ $id =~ ^[0-9]{8}T[0-9]{6}Z-[a-f0-9]{8}$ ]] || die '快照ID格式错误。'
+    choice "$scope" 'full state advanced' || die '恢复范围只能为full/state/advanced。'
+    dir="$ROOT/backup/history/$id"; snapshot_verify "$dir"
+    if [[ $scope == advanced ]]; then
+        state_basic "$STATE" || die '高级参数恢复需要当前state.json有效；当前状态损坏时使用full。'
+        jq --slurpfile h "$dir/state.json" '.advanced=($h[0].advanced // {})' "$STATE" > "$candidate"
+    else cp "$dir/state.json" "$candidate"; fi
+    validate_advanced "$candidate"
+    for p in xray nginx acme; do
+        if [[ $(jq -r ".components.$p // false" "$candidate") == true ]]; then
+            case "$p" in xray) [[ -x $XRAY ]];; nginx) [[ -x $NGINX ]];; acme) [[ -x $ACME ]];; esac || die "快照需要$p，但当前二进制不存在；历史不包含程序，请先安装相应组件。"
         fi
     done
-    sleep 0.3
-    port_free "$port" || die "端口 $port 仍被占用；本次操作取消。"
-}
-check_port() {
-    local port=$1 own=${2:-false} choice
-    valid_port "$port" || die '端口必须为1～65535。'
-    [[ $port != 22 ]] || die '不允许使用22作为代理端口。'
-    if [[ $own == true ]]; then
-        local pl pid all_owned=true
-        pl=$(port_lines "$port")
-        if [[ -z $pl ]]; then return 0; fi
-        local -a owner_pids
-        mapfile -t owner_pids < <(printf '%s\n' "$pl" | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u)
-        ((${#owner_pids[@]})) || all_owned=false
-        for pid in "${owner_pids[@]}"; do
-            if ! grep -Fq '/vpskit-nginx.service' "/proc/$pid/cgroup"; then all_owned=false; fi
+    warn "恢复范围=$scope。不会恢复/覆盖网站内容、管理代码、程序二进制、防火墙、Swap。full会恢复证书与ACME账户数据。"
+    confirm "恢复快照 $id，必要时重新加载或重启相关服务" || return 0
+    # Retain the chosen snapshot before begin_tx can prune the oldest history.
+    cp -a "$dir" "$WORK/history-selected"; dir="$WORK/history-selected"
+    begin_tx "restore:$id:$scope"
+    if [[ $scope == full ]]; then
+        for p in config certs; do rm -rf -- "$ROOT/$p"; cp -a "$dir/$p" "$ROOT/$p"; done
+        for p in config certstore; do
+            rm -rf -- "$ROOT/acme/$p"
+            [[ ! -d $dir/acme/$p ]] || cp -a "$dir/acme/$p" "$ROOT/acme/$p"
         done
-        [[ $all_owned != true ]] || return 0
     fi
-    port_free "$port" && return 0
-    warn "端口 $port 被占用（TCP/UDP、IPv4/IPv6均检查）。"
-    port_lines "$port" >&2
-    ask_valid choice '1=取消并改端口，2=查看并释放明确占用者' '1' valid_choice '请选择1或2。' '1 2'
-    [[ $choice == 2 ]] || die '端口冲突，未修改服务。'
-    ((TX == 1)) || die '端口释放必须处于可恢复事务中。'
-    release_port "$port"
+    install -m 600 "$candidate" "$STATE"
+    # Program versions reflect currently installed programs, not historical binaries.
+    if state_basic "$ROOT/backup/transaction/snapshot/state.json"; then
+        json_update --slurpfile old "$ROOT/backup/transaction/snapshot/state.json" '.versions=($old[0].versions // .versions)'
+    fi
+    apply_config
+    commit_tx
 }
-next_port() {
+rollback_last() {
+    local dir="$ROOT/backup/last" preserved="$WORK/last-copy"
+    [[ -f $dir/ready ]] || die '没有可用的最近事务快照。'
+    confirm '回滚最近一次事务（可能包括组件二进制），会重新启动之前运行的服务' || return 0
+    cp -a "$dir" "$preserved"
+    begin_tx rollback components
+    restore_transaction "$preserved" || die '回滚失败。'
+    commit_tx
+}
+
+advanced_show() {
+    printf '\nNginx高级配置（默认值与已保存值合并显示）：\n'
+    nginx_settings | jq .
+    printf 'Xray LimitNOFILE=%s\n' "$(xray_nofile)"
+    printf 'CPU逻辑核心=%s；内存=%s MiB\n' "$(getconf _NPROCESSORS_ONLN)" "$(awk '/MemTotal:/{printf "%d",$2/1024}' /proc/meminfo)"
+    printf '连接数包含客户端和上游连接，不等于用户人数；auto按CPU数量启动Worker。\n'
+    printf 'XHTTP启用时HTTP/2保持开启；纯网站可通过http2参数关闭。\n'
+    if component_ready nginx; then
+        printf '计划Worker用户：%s\n' "$(resolve_worker)"
+        local master; master=$(systemctl show -p MainPID --value vpskit-nginx.service 2>/dev/null || true)
+        printf '当前Worker PID / UID：\n'; master_workers "$master"
+    fi
+}
+advanced_assign() {
+    local file=$1 key=$2 value=$3 section=${2%%.*} field=${2#*.} type=num
+    case "$key" in
+        nginx.workers) valid_worker_count "$value" || die 'Worker数量需为auto或1～64。'; [[ $value != auto ]] || type=string;;
+        nginx.worker_user) [[ $value == auto ]] || service_user_valid "$value" || die '必须选择已有的非特权、非登录服务账户。'; type=string;;
+        nginx.http2|nginx.access_log) valid_bool "$value" || die '布尔值只能为true/false。'; type=bool;;
+        nginx.connections|nginx.nofile|nginx.keepalive|nginx.keepalive_requests|nginx.ssl_cache|nginx.ssl_timeout|nginx.client_header_timeout|nginx.client_body_timeout|nginx.send_timeout|nginx.proxy_connect_timeout|nginx.proxy_read_timeout|nginx.proxy_send_timeout|nginx.site_proxy_timeout|nginx.client_max_body_mb|nginx.worker_shutdown_timeout|nginx.upstream_keepalive|xray.nofile)
+            number "$value" 0 1048576 || die '请输入不含前导零的整数。';;
+        *) die "未知或不允许修改的高级字段：$key";;
+    esac
+    if [[ $type == string ]]; then
+        jq --arg s "$section" --arg k "$field" --arg v "$value" '.advanced[$s][$k]=$v' "$file" > "$file.next"
+    else
+        jq --arg s "$section" --arg k "$field" --argjson v "$value" '.advanced[$s][$k]=$v' "$file" > "$file.next"
+    fi
+    mv "$file.next" "$file"
+    if [[ $key == nginx.worker_user ]]; then
+        jq 'del(.advanced.nginx.resolved_user,.advanced.nginx.resolved_uid)' "$file" > "$file.next"; mv "$file.next" "$file"
+    fi
+}
+advanced_set() {
+    (( $#>=2 && $#%2==0 )) || die '用法：advanced set nginx.workers 2 nginx.connections 2048 nginx.nofile 16384'
+    local candidate="$WORK/advanced.json" scope=web key value
+    cp "$STATE" "$candidate"
+    while (($#)); do
+        key=$1; value=$2; shift 2
+        advanced_assign "$candidate" "$key" "$value"
+        [[ $key != xray.nofile ]] || scope=all
+    done
+    validate_advanced "$candidate"
+    if [[ $(nginx_settings "$candidate" | jq -r .workers) == auto ]]; then warn 'auto并不按内存限制Worker数量；低内存VPS建议明确设置1或2。'; fi
+    if component_ready nginx; then resolve_worker "$candidate" >/dev/null; fi
+    confirm '保存这些高级配置并应用；修改文件数/账户时需要重启对应服务' || return 0
+    begin_tx advanced
+    install -m 600 "$candidate" "$STATE"
+    if component_ready nginx || component_ready xray; then apply_config "$scope"
+    else migrate_state; fi
+    commit_tx
+}
+advanced_defaults() {
+    confirm '只恢复Nginx/Xray高级默认参数，保留节点、网站和证书' || return 0
+    begin_tx advanced-defaults
+    json_update --argjson d "$(nginx_defaults)" '.advanced.nginx=$d | .advanced.xray={nofile:8192}'
+    if component_ready nginx || component_ready xray; then apply_config; else migrate_state; fi
+    commit_tx
+}
+advanced_edit() {
+    local key=${1:-} value workers connections nofile
+    if [[ -z $key || $key == capacity ]]; then
+        ask_valid workers 'Worker数量（auto或1～64；小内存推荐1）' "$(ng_value workers)" valid_worker_count
+        ask_valid connections '每个Worker连接上限（128～65535）' "$(ng_value connections)" number 128 65535
+        ask_valid nofile 'Nginx文件数上限（必须至少为连接数+1024）' "$(ng_value nofile)" number 2048 1048576
+        advanced_set nginx.workers "$workers" nginx.connections "$connections" nginx.nofile "$nofile"
+        return
+    fi
+    if [[ $key == xray.nofile ]]; then value=$(xray_nofile); else value=$(ng_value "${key#nginx.}"); fi
+    ask value "设置 $key（true/false用于开关；:q取消）" "$value"
+    advanced_set "$key" "$value"
+}
+site_list() { jq -r '.sites|to_entries[]|[(.key+1),.value.domain,(.value.kind // "custom"),(.value.access // "direct"),(.value.issued|tostring)]|@tsv' "$STATE"; }
+site_select() {
+    local ss_dest=$1 ss_value=${2:-}
+    if [[ -z $ss_value ]]; then
+        [[ $(get '.sites|length') -gt 0 ]] || die '尚无网站，请先添加网站。'
+        site_list >&2
+        ask ss_value '网站域名或序号' "$(get '.preferences.domain // .sites[0].domain // ""')"
+    fi
+    if [[ $ss_value =~ ^[1-9][0-9]*$ ]]; then ss_value=$(jq -r --argjson i "$ss_value" '.sites[$i-1].domain // ""' "$STATE"); fi
+    valid_domain "$ss_value" && jq -e --arg d "$ss_value" '.sites[]|select(.domain==$d)' "$STATE" >/dev/null || die '网站不存在。'
+    printf -v "$ss_dest" '%s' "$ss_value"
+}
+site_template() {
+    local domain=$1 kind=$2 template=$3 file title
+    mkdir -p "$ROOT/www/$domain" "$ROOT/www/acme/.well-known/acme-challenge"
+    [[ $kind == template ]] || return 0
+    file="$ROOT/www/$domain/vpskit-$template.html"
+    [[ ! -e $file ]] || { info '模板文件已存在，保留内容。'; return; }
+    case "$template" in welcome) title='欢迎访问';; notes) title='技术与日常笔记';; blog) title='记录与分享';; *) die '模板非法。';; esac
+    cat > "$file" <<EOF
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>$title · $domain</title><style>body{max-width:850px;margin:10vh auto;padding:24px;font:18px/1.8 system-ui,sans-serif;color:#253245;background:#f8fafc}article{background:#fff;border:1px solid #e2e8f0;border-radius:16px;padding:36px}h1{line-height:1.3}small{color:#64748b}</style></head><body><article><small>$domain</small><h1>$title</h1><p>这是一个轻量静态网站。你可以替换此页面，发布自己的介绍、文档和内容。</p></article></body></html>
+EOF
+}
+site_configure() {
+    local domain=${1:-} existing kind access email challenge wildcard template upstream redirect oldcert pending
+    ensure_component nginx
+    if [[ -z $domain ]]; then ask_valid domain '网站域名（小写，不含协议或路径）' "$(get '.preferences.domain // .sites[0].domain // ""')" valid_domain; fi
+    valid_domain "$domain" || die '域名无效。'
+    json_update --arg d "$domain" '.preferences.domain=$d'
+    existing=$(jq -c --arg d "$domain" '[.sites[]|select(.domain==$d)][0] // {}' "$STATE")
+    ask_valid kind '网站类型：template/custom/proxy/redirect' "$(jq -r '.kind // (if (.upstream // "")!="" then "proxy" else "template" end)' <<< "$existing")" choice 'template custom proxy redirect'
+    ask_valid access '访问方式：direct直连 / cloudflare橙云' "$(jq -r '.access // "direct"' <<< "$existing")" choice 'direct cloudflare'
+    ask_valid email '证书联系邮箱' "$(jq -r --arg fallback "$(get '.preferences.email // ""')" '.email // $fallback' <<< "$existing")" valid_email
+    ask_valid challenge '证书验证：http / dns_cf / dns_dp' "$(jq -r '.challenge // "http"' <<< "$existing")" choice 'http dns_cf dns_dp'
+    wildcard=false
+    if [[ $challenge != http ]]; then ask_valid wildcard '同时签发泛域名证书（true/false）' "$(jq -r '.wildcard // false' <<< "$existing")" valid_bool; fi
+    template=welcome; upstream=''; redirect=''
+    case "$kind" in
+        template) ask_valid template '模板：welcome/notes/blog' "$(jq -r '.template // "welcome"' <<< "$existing")" choice 'welcome notes blog';;
+        custom) info "静态文件放在 $ROOT/www/$domain；不会覆盖已有文件。";;
+        proxy) ask_valid upstream '本机应用HTTP地址' "$(jq -r 'if (.upstream // "")=="" then "http://127.0.0.1:8000" else .upstream end' <<< "$existing")" valid_upstream;;
+        redirect) ask_valid redirect 'HTTPS跳转目标' "$(jq -r 'if (.redirect // "")=="" then "https://www.microsoft.com/" else .redirect end' <<< "$existing")" valid_redirect "$domain";;
+    esac
+    if [[ $access == cloudflare ]] && ! cf_ready; then cf_fetch; fi
+    confirm "保存网站 $domain；保留已有节点、证书及网站文件" || return 0
+    begin_tx "site:$domain"
+    [[ ! -d $WORK/edge ]] || cf_install_assets
+    json_update --arg d "$domain" --arg k "$kind" --arg a "$access" --arg e "$email" --arg c "$challenge" --argjson w "$wildcard" --arg t "$template" --arg u "$upstream" --arg r "$redirect" '
+      ([.sites[]|select(.domain==$d)][0] // {domain:$d,issued:false}) as $old |
+      ($old + {domain:$d,kind:$k,access:$a,email:$e,challenge:$c,wildcard:$w,template:$t,upstream:$u,redirect:$r,
+       cert_settings_pending:($old.issued==true and (($old.challenge // "http")!=$c or ($old.wildcard // false)!=$w))}) as $new |
+      .sites=([.sites[]|select(.domain!=$d)]+[$new]) |
+      .preferences += {domain:$d,email:$e,challenge:$c,wildcard:$w,site_kind:$k,site_access:$a,template:$t,upstream:$u,redirect:$r}'
+    site_template "$domain" "$kind" "$template"
+    apply_config web; commit_tx
+    info '网站配置已保存。尚无证书或证书参数改变时，请在证书菜单签发。'
+}
+site_remove() {
+    local domain; site_select domain "${1:-}"
+    if jq -e --arg d "$domain" '.nodes[]|select(.domain==$d)' "$STATE" >/dev/null; then die '仍有节点引用此网站，请先删除或迁移这些节点。'; fi
+    confirm "移除 $domain 绑定和续期；保留网站内容和证书文件" || return 0
+    begin_tx "site-remove:$domain"
+    if component_ready acme && jq -e --arg d "$domain" '.sites[]|select(.domain==$d and .issued)' "$STATE" >/dev/null; then acme_run --remove -d "$domain" --ecc; fi
+    json_update --arg d "$domain" '.sites |= map(select(.domain!=$d))'
+    apply_config web; commit_tx
+}
+acme_run() { (umask 077; "$ACME" --home "$ROOT/acme" --config-home "$ROOT/acme/config" --cert-home "$ROOT/acme/certstore" --no-color "$@"); }
+dns_credentials() {
+    local provider=$1 token account sid key
+    case "$provider" in
+        dns_cf)
+            secret token 'Cloudflare API Token；留空复用ACME已保存凭据'
+            if [[ -n $token ]]; then
+                [[ $token =~ ^[a-zA-Z0-9_-]{10,256}$ ]] || die 'Cloudflare Token格式异常。'
+                ask account 'Cloudflare Account ID（32位十六进制）' ''
+                [[ $account =~ ^[a-fA-F0-9]{32}$ ]] || die 'Account ID格式错误。'
+                export CF_Token="$token" CF_Account_ID="$account"
+            elif ! grep -Rq '^SAVED_CF_Token=' "$ROOT/acme/config"; then die '未找到已保存的Cloudflare Token。'; fi;;
+        dns_dp)
+            secret sid 'DNSPod API ID；留空复用ACME已保存凭据'
+            if [[ -n $sid ]]; then
+                [[ $sid =~ ^[0-9]+$ ]] || die 'DNSPod ID应为数字。'
+                secret key 'DNSPod API Key'
+                [[ -n $key && $key != *[[:space:]]* ]] || die 'DNSPod密钥为空或包含空白。'
+                export DP_Id="$sid" DP_Key="$key"
+            elif ! grep -Rq '^SAVED_DP_Id=' "$ROOT/acme/config"; then die '未找到已保存的DNSPod凭据。'; fi;;
+        *) die '不支持的DNS验证方式。';;
+    esac
+}
+deploy_certificate() {
+    local domain=$1 base="$ROOT/certs/$1" cert key rev p
+    cert="$base/pending/fullchain.pem"; key="$base/pending/key.pem"
+    [[ -s $cert && -s $key ]] || die '没有待部署证书及私钥。'
+    openssl x509 -in "$cert" -noout -checkend 86400 >/dev/null || die '新证书有效期不足一天。'
+    openssl x509 -in "$cert" -noout -checkhost "$domain" >/dev/null || die '证书域名不匹配。'
+    [[ $(openssl x509 -in "$cert" -pubkey -noout | openssl pkey -pubin -outform DER | sha256sum) == $(openssl pkey -in "$key" -pubout -outform DER | sha256sum) ]] || die '证书与私钥不匹配。'
+    rev="rev-$(date +%s)-$(randhex 4)"; mkdir -m 700 "$base/$rev"
+    install -m 600 "$cert" "$base/$rev/fullchain.pem"; install -m 600 "$key" "$base/$rev/key.pem"
+    ln -s "$rev" "$base/current.new"; mv -Tf "$base/current.new" "$base/current"
+    json_update --arg d "$domain" '(.sites[]|select(.domain==$d)) |= (. + {issued:true,cert_settings_pending:false})'
+    find "$base" -mindepth 1 -maxdepth 1 -type d -name 'rev-*' ! -name "$rev" -exec rm -rf -- {} +
+}
+cert_issue() {
+    local domain site challenge email rc=0
+    ensure_component acme; ensure_component nginx; site_select domain "${1:-}"
+    site=$(jq -c --arg d "$domain" '.sites[]|select(.domain==$d)' "$STATE")
+    challenge=$(jq -r '.challenge // "http"' <<< "$site"); email=$(jq -r '.email // ""' <<< "$site")
+    valid_email "$email" || die '请先在网站设置中填写有效邮箱。'
+    local -a args=(--issue --server letsencrypt --keylength ec-256 -d "$domain" --accountemail "$email")
+    if [[ $(jq -r '.cert_settings_pending // false' <<< "$site") == true ]]; then args+=(--force); fi
+    if [[ $(jq -r '.wildcard // false' <<< "$site") == true ]]; then
+        [[ $challenge != http ]] || die '泛域名证书需要DNS验证。'; args+=(-d "*.$domain")
+    fi
+    if [[ $challenge == http ]]; then
+        systemctl is-active --quiet vpskit-nginx.service || die 'HTTP-01需要本工具Nginx运行。'
+        args+=(--webroot "$ROOT/www/acme")
+        info '请确认公网80及/.well-known/acme-challenge/能到达本机；不自动修改防火墙。'
+    else dns_credentials "$challenge"; args+=(--dns "$challenge"); fi
+    begin_tx "cert-issue:$domain"
+    mkdir -p "$ROOT/www/acme/.well-known/acme-challenge"
+    migrate_state; remember_worker; worker_permissions "$(resolve_worker)"
+    acme_run "${args[@]}" || rc=$?
+    unset CF_Token CF_Account_ID CF_Zone_ID DP_Id DP_Key
+    ((rc==0 || rc==2)) || die '证书签发失败，原证书保留；检查DNS凭据或HTTP验证路径。'
+    if ((rc==2)) && [[ $(jq -r '.cert_settings_pending // false' <<< "$site") == true ]]; then die 'ACME跳过签发，新参数尚未生效。'; fi
+    mkdir -p "$ROOT/certs/$domain/pending"
+    acme_run --install-cert -d "$domain" --ecc --key-file "$ROOT/certs/$domain/pending/key.pem" --fullchain-file "$ROOT/certs/$domain/pending/fullchain.pem" --reloadcmd /bin/true
+    deploy_certificate "$domain"
+    json_update --arg d "$domain" '(.sites[]|select(.domain==$d)).certificate_source="acme"'
+    apply_config; commit_tx
+}
+cert_import() {
+    local domain=$1 cert=$2 key=$3
+    site_select domain "$domain"
+    [[ -f $cert && -f $key && ! -L $cert && ! -L $key ]] || die '证书/私钥必须为现有普通文件。'
+    confirm "为 $domain 导入手动证书，并暂停该域名原有ACME自动续期" || return 0
+    begin_tx "cert-import:$domain"
+    mkdir -p "$ROOT/certs/$domain/pending"
+    install -m 600 "$cert" "$ROOT/certs/$domain/pending/fullchain.pem"; install -m 600 "$key" "$ROOT/certs/$domain/pending/key.pem"
+    if component_ready acme && [[ -d $ROOT/acme/certstore/${domain}_ecc ]]; then
+        acme_run --remove -d "$domain" --ecc
+    fi
+    deploy_certificate "$domain"
+    json_update --arg d "$domain" '(.sites[]|select(.domain==$d)).certificate_source="manual"'
+    apply_config; commit_tx
+}
+cert_status() {
+    local domain f
+    while IFS= read -r domain; do
+        f="$ROOT/certs/$domain/current/fullchain.pem"
+        if [[ -s $f ]]; then printf '%s: ' "$domain"; openssl x509 -in "$f" -noout -enddate
+        else printf '%s: 尚无证书\n' "$domain"; fi
+    done < <(jq -r '.sites[].domain' "$STATE")
+}
+cert_renew() {
+    component_ready acme || return 0
+    local domain changed=false rc=0
+    mkdir -p "$ROOT/www/acme/.well-known/acme-challenge"
+    if component_ready nginx; then worker_permissions "$(resolve_worker)"; fi
+    acme_run --cron || rc=$?
+    if ((rc!=0 && rc!=2)); then warn "ACME续期检查返回$rc；继续检查已生成的新证书。"; fi
+    while IFS= read -r domain; do
+        if [[ -s $ROOT/certs/$domain/pending/fullchain.pem ]] && ! cmp -s "$ROOT/certs/$domain/pending/fullchain.pem" "$ROOT/certs/$domain/current/fullchain.pem"; then
+            if [[ $changed == false ]]; then begin_tx certificate-renewal; changed=true; fi
+            deploy_certificate "$domain"
+        fi
+    done < <(jq -r '.sites[]|select(.issued and (.certificate_source // "acme")!="manual")|.domain' "$STATE")
+    if [[ $changed == true ]]; then apply_config; commit_tx; fi
+    ((rc==0 || rc==2))
+}
+rotate_logs() {
+    local f
+    for f in "$ROOT"/logs/*.log; do
+        [[ -f $f && ! -L $f ]] || continue
+        if (( $(stat -c %s "$f")>2097152 )); then cp -- "$f" "$f.1"; : > "$f"; fi
+    done
+}
+
+# Node records retain the 1.6.0 schema. Public TLS transport uses 443;
+# .port for WS/XHTTP is a distinct loopback listener, never the public port.
+node_list() {
+    printf '序号\t名称\t协议/模式\t入口\t后端/直连端口\t启用\n'
+    jq -r '.nodes|to_entries[]|[(.key+1),.value.id,(.value.protocol+"/"+.value.mode),.value.entry,.value.port,.value.enabled]|@tsv' "$STATE"
+}
+node_select() {
+    local ns_dest=$1 ns_value=${2:-}
+    if [[ -z $ns_value ]]; then node_list >&2; ask ns_value '节点名称或序号' ''; fi
+    if ! jq -e --arg id "$ns_value" '.nodes[]|select(.id==$id)' "$STATE" >/dev/null; then
+        if [[ $ns_value =~ ^[1-9][0-9]{0,7}$ ]]; then ns_value=$(jq -r --argjson i "$ns_value" '.nodes[$i-1].id // ""' "$STATE"); fi
+    fi
+    valid_name "$ns_value" && jq -e --arg id "$ns_value" '.nodes[]|select(.id==$id)' "$STATE" >/dev/null || die '节点不存在。'
+    printf -v "$ns_dest" '%s' "$ns_value"
+}
+unused_port() {
     local p=${1:-20000}
-    while ((p < 65000)); do
-        if port_free "$p" && ! jq -e --argjson p "$p" '.nodes[]|select(.port==$p)' "$STATE" >/dev/null; then printf '%s\n' "$p"; return; fi
+    while ((p<=65535)); do
+        if [[ $p != 22 && $p != 80 && $p != 443 ]] && ! jq -e --argjson p "$p" '.nodes[]|select(.port==$p)' "$STATE" >/dev/null && [[ -z $(ss -H -lntu "sport = :$p") ]]; then printf '%s' "$p"; return; fi
         p=$((p+1))
     done
     die '没有找到可用端口。'
 }
-
-latest_release() {
-    local repo=$1 out=$2
-    fetch "https://api.github.com/repos/$repo/releases/latest" "$out"
-    jq -er '.tag_name | select(test("^[A-Za-z0-9._-]+$"))' "$out"
+node_credential() {
+    case "$1" in
+        vless|vmess) new_uuid;;
+        trojan) randhex 24;;
+        shadowsocks)
+            case "${2:-}" in 2022-blake3-aes-128-gcm) openssl rand -base64 16;; 2022-*) openssl rand -base64 32;; *) randhex 24;; esac;;
+        *) die '协议不支持。';;
+    esac
 }
-install_xray() {
-    local ver=${1:-$XRAY_TESTED_VERSION} asset url sha expected archive="$WORK/xray.zip" meta="$WORK/xray-release.json"
-    case "$(uname -m)" in x86_64) asset=Xray-linux-64.zip;; aarch64|arm64) asset=Xray-linux-arm64-v8a.zip;; *) die '架构不支持。';; esac
-    if [[ $ver == latest ]]; then ver=$(latest_release XTLS/Xray-core "$meta"); else
-        [[ $ver =~ ^v[0-9.]+$ ]] || die 'Xray版本格式应为v数字.数字.数字。'
-        fetch "https://api.github.com/repos/XTLS/Xray-core/releases/tags/$ver" "$meta"
-    fi
-    url=$(jq -er --arg n "$asset" '.assets[]|select(.name==$n)|.browser_download_url' "$meta")
-    fetch "$url" "$archive"
-    expected=$(jq -r --arg n "$asset" '.assets[]|select(.name==$n)|.digest // empty' "$meta")
-    if [[ $expected == sha256:* ]]; then
-        sha=${expected#sha256:}
+node_add() {
+    local guided=${1:-no} id protocol mode host domain='' port path='' method='' credential listen='0.0.0.0'
+    local target='' sni='' private='' public='' short='' keys http_version=h2 item scheme
+    ensure_component xray
+    ask_valid id '节点名称（字母、数字、下划线、短横线）' "node-$(randhex 3)" valid_name
+    if jq -e --arg id "$id" '.nodes[]|select(.id==$id or .entry==$id)' "$STATE" >/dev/null; then die '节点名称/入口已存在。'; fi
+    scheme=$(get '.scheme // "A"')
+    if [[ $guided == yes ]]; then
+        protocol=vless; if [[ $scheme == B ]]; then mode=xhttp; else mode=reality; fi
     else
-        fetch "$url.dgst" "$WORK/xray.dgst"
-        sha=$(grep -Ei 'sha(2[-_])?256' "$WORK/xray.dgst" | grep -oE '[a-fA-F0-9]{64}' | head -1 || true)
-    fi
-    [[ $sha =~ ^[a-fA-F0-9]{64}$ ]] || die '没有找到有效SHA256摘要，拒绝安装。'
-    printf '%s  %s\n' "$sha" "$archive" | sha256sum -c -
-    unzip -p "$archive" xray > "$ROOT/bin/xray.new"
-    chmod 700 "$ROOT/bin/xray.new"
-    "$ROOT/bin/xray.new" version
-    mv -f "$ROOT/bin/xray.new" "$XRAY"
-    json_update --arg v "$ver" '.components.xray=true | .versions.xray=$v'
-    ok "Xray $ver 已安装（同源摘要校验，不等同独立签名验证）。"
-}
-install_nginx() {
-    local pkg file found=0 dir="$WORK/nginx-download" ver
-    mkdir -p "$dir"
-    run apt-get update
-    # Extract distro's signed-repository packages, never execute nginx postinst/user creation.
-    # Older nginx-light builds omit limit_req/limit_conn. Prefer nginx-core.
-    for pkg in nginx nginx-core nginx-light; do
-        if ! apt-cache show "$pkg" >/dev/null 2>&1; then continue; fi
-        info "下载发行版 $pkg 包，不执行维护脚本。"
-        if ! (cd "$dir" && apt-get download "$pkg"); then continue; fi
-        for file in "$dir"/*.deb; do
-            [[ -f $file ]] || continue
-            mkdir -p "$WORK/nginx-extract"
-            dpkg-deb -x "$file" "$WORK/nginx-extract"
-            if [[ -x $WORK/nginx-extract/usr/sbin/nginx ]]; then
-                ver=$(dpkg-deb -f "$file" Version)
-                found=1; break
-            fi
-        done
-        ((found == 0)) || break
-        rm -f "$dir"/*.deb
-    done
-    ((found == 1)) || die '发行版包中未找到Nginx二进制。'
-    local soname; local -a libs=()
-    while read -r soname; do
-        case "$soname" in
-            libpcre.so.3) libs+=(libpcre3);; libpcre2-8.so.0) libs+=(libpcre2-8-0);;
-            libssl.so.1.1|libcrypto.so.1.1) libs+=(libssl1.1);;
-            libssl.so.1.0.0|libcrypto.so.1.0.0) libs+=(libssl1.0.0);;
-            libz.so.1) libs+=(zlib1g);; libcrypt.so.1) libs+=(libcrypt1);;
-            libGeoIP.so.1) libs+=(libgeoip1);;
-            *) die "未识别的Nginx共享库依赖 $soname，请用系统包管理器准备该库。";;
+        ask_valid protocol '协议：vless/vmess/trojan/shadowsocks' vless choice 'vless vmess trojan shadowsocks'
+        case "$protocol" in
+            vless) ask_valid mode '传输：reality/xhttp/ws/tls' reality choice 'reality xhttp ws tls';;
+            vmess) ask_valid mode '传输：ws/tls/ws-plain（最后一个无外层TLS）' ws choice 'ws tls ws-plain';;
+            trojan) ask_valid mode '传输：ws/tls' ws choice 'ws tls';;
+            shadowsocks) mode=ss;;
         esac
-    done < <(ldd "$WORK/nginx-extract/usr/sbin/nginx" | awk '/not found/{print $1}')
-    if ((${#libs[@]})); then install_deps "${libs[@]}"; fi
-    if ldd "$WORK/nginx-extract/usr/sbin/nginx" | grep -q 'not found'; then die 'Nginx共享库仍缺失。'; fi
-    mkdir -p "$ROOT/nginx/usr/sbin"
-    install -m 700 "$WORK/nginx-extract/usr/sbin/nginx" "$ROOT/nginx/usr/sbin/nginx.new"
-    "$ROOT/nginx/usr/sbin/nginx.new" -V
-    mv -f "$ROOT/nginx/usr/sbin/nginx.new" "$NGINX"
-    json_update --arg v "$ver" '.components.nginx=true | .versions.nginx=$v'
-    ok "Nginx $ver 已提取到集中目录；未创建账户或系统nginx服务。"
+    fi
+    if [[ $mode == ws || $mode == xhttp || $mode == tls ]]; then
+        site_select domain
+        [[ $(jq -r --arg d "$domain" '.sites[]|select(.domain==$d)|.issued' "$STATE") == true ]] || die '所选网站尚未签发证书。'
+        host=$domain
+        if [[ $mode == tls ]]; then
+            info '直接TLS使用独立公网端口；Cloudflare普通橙云不能代理任意TCP协议。'
+            ask_valid host '直接连接地址（源站IP或未代理域名）' "$(get '.host // ""')" valid_host
+        fi
+    else ask_valid host '客户端连接的公网IP或域名' "$(get '.host // ""')" valid_host; fi
+    case "$mode" in
+        ws|xhttp)
+            port=$(unused_port 20000); listen=127.0.0.1
+            ask_valid path '代理路径（至少8位随机字符，保留前导/）' "/$(randhex 12)" valid_path
+            if [[ $mode == xhttp && $guided != yes ]]; then
+                ask_valid http_version '客户端HTTP版本：h2；h3仅限已配置Cloudflare的域名' h2 choice 'h2 h3'
+            fi;;
+        *) ask_valid port '公网监听端口（不使用22/80/443）' "$(unused_port 8443)" valid_port
+           [[ $port != 22 && $port != 80 && $port != 443 ]] || die '该端口为保留端口。';;
+    esac
+    case "$mode" in
+        reality)
+            ask_valid sni 'REALITY目标域名/SNI（需TLS1.3，且本机能访问）' 'www.microsoft.com' valid_domain
+            target="$sni:443"
+            keys=$("$XRAY" x25519)
+            private=$(awk -F': *' '/PrivateKey|Private key/{print $2;exit}' <<< "$keys")
+            public=$(awk -F': *' '/PublicKey|Public key|Password/{print $2;exit}' <<< "$keys")
+            [[ $private =~ ^[A-Za-z0-9_-]{43}$ && $public =~ ^[A-Za-z0-9_-]{43}$ ]] || die 'Xray x25519输出格式无法识别，未保存节点。'
+            short=$(randhex 8);;
+        ss) ask_valid method 'Shadowsocks算法' '2022-blake3-aes-128-gcm' choice 'aes-128-gcm aes-256-gcm chacha20-ietf-poly1305 2022-blake3-aes-128-gcm 2022-blake3-aes-256-gcm 2022-blake3-chacha20-poly1305';;
+        ws-plain) warn '此模式没有外层TLS，仅用于明确需要的可信部署；不建议暴露到不可信网络。';;
+    esac
+    credential=$(node_credential "$protocol" "$method")
+    item=$(jq -n --arg id "$id" --arg p "$protocol" --arg m "$mode" --arg h "$host" --arg d "$domain" --argjson port "$port" --arg path "$path" --arg method "$method" --arg c "$credential" --arg l "$listen" --arg t "$target" --arg s "$sni" --arg pk "$private" --arg pub "$public" --arg sid "$short" --arg hv "$http_version" '{id:$id,entry:$id,protocol:$p,mode:$m,host:$h,domain:$d,port:$port,path:$path,method:$method,credential:$c,listen:$l,target:$t,sni:$s,privateKey:$pk,publicKey:$pub,shortId:$sid,http_version:$hv,enabled:true}')
+    confirm "新增 $id ($protocol/$mode)，保留其他节点；Xray将按需重启" || return 0
+    begin_tx "node-add:$id"
+    json_update --argjson n "$item" --arg h "$host" '.nodes += [$n] | if (.host // "")=="" then .host=$h else . end'
+    apply_config; commit_tx
+    node_export "$id"
 }
-install_acme() {
-    local ver meta="$WORK/acme-release.json" url
-    ver=$(latest_release acmesh-official/acme.sh "$meta")
-    url="https://github.com/acmesh-official/acme.sh/archive/refs/tags/$ver.tar.gz"
-    fetch "$url" "$WORK/acme.tar.gz"
-    mkdir -p "$WORK/acme-source" "$ROOT/acme/config" "$ROOT/acme/certstore"
-    tar -tzf "$WORK/acme.tar.gz" | awk '/(^\/|(^|\/)\.\.(\/|$))/{bad=1} END{exit bad}' || die '归档路径异常。'
-    tar --no-same-owner -xzf "$WORK/acme.tar.gz" --strip-components=1 -C "$WORK/acme-source"
-    sh -n "$WORK/acme-source/acme.sh"
-    # Run directly: no installer, profile changes, crontab, or auto-upgrade.
-    install -m 700 "$WORK/acme-source/acme.sh" "$ROOT/acme/acme.sh"
-    rm -rf "$ROOT/acme/dnsapi"
-    cp -a "$WORK/acme-source/dnsapi" "$ROOT/acme/dnsapi"
-    chmod -R go-rwx "$ROOT/acme"
-    json_update --arg v "$ver" '.components.acme=true | .versions.acme=$v'
-    ok "acme.sh $ver 已安装，统一由本工具timer检查续期。"
+node_share() {
+    local source id node protocol credential
+    node_select source "${1:-}"
+    node=$(jq -c --arg id "$source" '.nodes[]|select(.id==$id)' "$STATE"); protocol=$(jq -r .protocol <<< "$node")
+    [[ $protocol != shadowsocks ]] || die '此实现不为Shadowsocks入口创建共享用户，请添加独立节点。'
+    ask_valid id '新用户/节点名称' "user-$(randhex 3)" valid_name
+    if jq -e --arg id "$id" '.nodes[]|select(.id==$id or .entry==$id)' "$STATE" >/dev/null; then die '名称已占用。'; fi
+    credential=$(node_credential "$protocol")
+    node=$(jq --arg id "$id" --arg c "$credential" '.id=$id|.credential=$c|.enabled=true' <<< "$node")
+    confirm "共享 $source 的入口，新增独立凭据 $id；不新增监听端口" || return 0
+    begin_tx "node-share:$id"; json_update --argjson n "$node" '.nodes+=[$n]'; apply_config; commit_tx; node_export "$id"
+}
+node_change() {
+    local action=$1 id=${2:-} value=${3:-} node entry protocol credential
+    node_select id "$id"
+    node=$(jq -c --arg id "$id" '.nodes[]|select(.id==$id)' "$STATE"); entry=$(jq -r .entry <<< "$node")
+    case "$action" in
+        enable|disable|delete|rotate) ;;
+        rename)
+            [[ -n $value ]] || ask_valid value '新节点名称' '' valid_name
+            valid_name "$value" || die '名称无效。'
+            if jq -e --arg id "$value" '.nodes[]|select(.id==$id)' "$STATE" >/dev/null; then die '新名称已存在。'; fi;;
+        port)
+            [[ -n $value ]] || ask_valid value '新监听端口（整个共享入口一起更新）' "$(jq -r .port <<< "$node")" valid_port
+            valid_port "$value" && [[ $value != 22 && $value != 80 && $value != 443 ]] || die '端口无效。';;
+        host)
+            [[ -n $value ]] || ask_valid value '新的客户端连接地址（整个共享入口）' "$(jq -r .host <<< "$node")" valid_host
+            valid_host "$value" || die '连接地址无效。';;
+        *) die '节点操作无效。';;
+    esac
+    confirm "对 $id 执行 $action；必要时重启Xray，当前连接可能中断" || return 0
+    begin_tx "node-$action:$id"
+    case "$action" in
+        enable|disable) local enabled=false; [[ $action != enable ]] || enabled=true
+            json_update --arg id "$id" --argjson e "$enabled" '(.nodes[]|select(.id==$id)).enabled=$e';;
+        delete) json_update --arg id "$id" '.nodes|=map(select(.id!=$id))';;
+        rotate)
+            protocol=$(jq -r .protocol <<< "$node"); credential=$(node_credential "$protocol" "$(jq -r '.method // ""' <<< "$node")")
+            json_update --arg id "$id" --arg c "$credential" '(.nodes[]|select(.id==$id)).credential=$c';;
+        rename) json_update --arg id "$id" --arg v "$value" '(.nodes[]|select(.id==$id)).id=$v';;
+        port) json_update --arg e "$entry" --argjson v "$value" '(.nodes[]|select(.entry==$e)).port=$v';;
+        host) json_update --arg e "$entry" --arg v "$value" '(.nodes[]|select(.entry==$e)).host=$v';;
+    esac
+    apply_config; commit_tx
+}
+uri_encode() { jq -nr --arg s "$1" '$s|@uri'; }
+base64_oneline() { base64 | tr -d '\r\n'; }
+node_export() {
+    local id n protocol mode host port credential domain path label uri security query method payload
+    node_select id "${1:-}"
+    n=$(jq -c --arg id "$id" '.nodes[]|select(.id==$id)' "$STATE")
+    protocol=$(jq -r .protocol <<< "$n"); mode=$(jq -r .mode <<< "$n"); host=$(jq -r .host <<< "$n"); port=$(jq -r .port <<< "$n")
+    credential=$(jq -r .credential <<< "$n"); domain=$(jq -r '.domain // ""' <<< "$n"); path=$(jq -r '.path // ""' <<< "$n"); label=$(uri_encode "$id")
+    if [[ $mode == ws || $mode == xhttp ]]; then port=443; fi
+    warn '下方包含访问凭据；不要发布到公共日志、聊天群或网页。'
+    if [[ $protocol == vmess ]]; then
+        payload=$(jq -nc --arg ps "$id" --arg add "$host" --arg port "$port" --arg id "$credential" --arg d "$domain" --arg path "$path" --arg mode "$mode" '{v:"2",ps:$ps,add:$add,port:$port,id:$id,aid:"0",scy:"auto",net:(if $mode=="tls" then "tcp" else "ws" end),type:"none",host:$d,path:$path,tls:(if $mode=="ws-plain" then "" else "tls" end),sni:$d}')
+        printf 'vmess://%s\n' "$(printf '%s' "$payload" | base64_oneline)"; return
+    fi
+    [[ $host != *:* ]] || host="[$host]"
+    if [[ $protocol == shadowsocks ]]; then
+        method=$(jq -r .method <<< "$n")
+        if [[ $method == 2022-* ]]; then uri="$(uri_encode "$method"):$(uri_encode "$credential")"
+        else uri=$(printf '%s:%s' "$method" "$credential" | base64_oneline | tr '+/' '-_' | tr -d '='); fi
+        printf 'ss://%s@%s:%s#%s\n' "$uri" "$host" "$port" "$label"; return
+    fi
+    case "$mode" in
+        reality) query="security=reality&type=tcp&flow=xtls-rprx-vision&fp=chrome&sni=$(uri_encode "$(jq -r .sni <<< "$n")")&pbk=$(uri_encode "$(jq -r .publicKey <<< "$n")")&sid=$(jq -r .shortId <<< "$n")";;
+        xhttp) query="security=tls&type=xhttp&mode=packet-up&sni=$(uri_encode "$domain")&host=$(uri_encode "$domain")&path=$(uri_encode "$path/")&alpn=$(jq -r '.http_version // "h2"' <<< "$n")";;
+        ws) query="security=tls&type=ws&sni=$(uri_encode "$domain")&host=$(uri_encode "$domain")&path=$(uri_encode "$path")";;
+        tls) query="security=tls&type=tcp&sni=$(uri_encode "$domain")";;
+        *) die '此节点没有可导出的链接。';;
+    esac
+    [[ $protocol != vless ]] || query="encryption=none&$query"
+    printf '%s://%s@%s:%s?%s#%s\n' "$protocol" "$(uri_encode "$credential")" "$host" "$port" "$query" "$label"
+    if [[ $mode == xhttp ]]; then info 'XHTTP分享链接的客户端支持有差异；可用 node client NAME 获取Xray客户端JSON。'; fi
+}
+node_client() {
+    local id; node_select id "${1:-}"
+    [[ $(jq -r --arg id "$id" '.nodes[]|select(.id==$id)|.mode' "$STATE") == xhttp ]] || die '此命令仅生成XHTTP客户端JSON；其他模式使用node export。'
+    warn 'JSON包含UUID；本地SOCKS仅监听127.0.0.1:10808。'
+    jq --arg id "$id" '.nodes[]|select(.id==$id)|. as $n|
+      {log:{loglevel:"warning"},inbounds:[{listen:"127.0.0.1",port:10808,protocol:"socks",settings:{udp:true}}],outbounds:[{protocol:"vless",settings:{vnext:[{address:$n.host,port:443,users:[{id:$n.credential,encryption:"none"}]}]},streamSettings:{network:"xhttp",security:"tls",tlsSettings:{serverName:$n.domain,alpn:[($n.http_version // "h2")],allowInsecure:false},xhttpSettings:{path:($n.path+"/"),host:$n.domain,mode:"packet-up"}}}]}' "$STATE"
 }
 
-validate_state() {
-    local n d p id mode proto credential site kind template upstream redirect
-    jq -e '.schema==1 and (.nodes|type=="array") and (.sites|type=="array") and
-      ([.nodes[].id]|length== (unique|length)) and ([.sites[].domain]|length==(unique|length))' "$STATE" >/dev/null || die '状态结构或唯一性检查失败。'
-    while IFS= read -r d; do valid_domain "$d" || die '状态中的域名非法。'; done < <(jq -r '.sites[].domain' "$STATE")
-    while IFS= read -r site; do
-        edge_validate_site "$site"
-        valid_choice "$(jq -r '.access // "direct"' <<< "$site")" 'direct cloudflare' || die '网站连接方式不合法。'
-        kind=$(jq -r '.kind // (if (.upstream // "")!="" then "proxy" else "custom" end)' <<< "$site")
-        template=$(jq -r '.template // "welcome"' <<< "$site"); upstream=$(jq -r '.upstream // ""' <<< "$site"); redirect=$(jq -r '.redirect // ""' <<< "$site")
-        case "$kind" in template) valid_choice "$template" 'welcome notes blog' || die '网站模板不合法。';;
-            custom) ;; proxy) valid_proxy_upstream "$upstream" || die '网站上游不合法。';;
-            redirect) valid_redirect "$redirect" "$(jq -r .domain <<< "$site")" || die '网站跳转地址不合法。';; *) die '网站类型不合法。';; esac
-        [[ $kind == proxy || -z $upstream ]] || die '网站类型与上游配置不一致。'
-    done < <(jq -c '.sites[]' "$STATE")
-    while IFS= read -r n; do
-        id=$(jq -r .id <<< "$n"); p=$(jq -r .port <<< "$n")
-        mode=$(jq -r .mode <<< "$n"); proto=$(jq -r .protocol <<< "$n")
-        credential=$(jq -r .credential <<< "$n")
-        valid_host "$(jq -r .host <<< "$n")" || die '节点连接地址不合法。'
-        if ! valid_name "$id" || ! valid_port "$p"; then die '节点名称或端口无效。'; fi
-        case "$proto:$mode" in vless:reality|vless:xhttp|vless:ws|vless:tls|vmess:ws|vmess:ws-plain|vmess:tls|trojan:ws|trojan:tls|shadowsocks:ss) ;; *) die "不支持的协议组合: $proto/$mode";; esac
-        if [[ $proto == vless || $proto == vmess ]]; then valid_uuid "$credential" || die 'UUID不合法。'; fi
-        if [[ $mode == ws || $mode == xhttp || $mode == tls ]]; then
-            d=$(jq -r .domain <<< "$n"); valid_domain "$d" || die '节点域名不合法。'
-            jq -e --arg d "$d" '.sites[]|select(.domain==$d and .issued)' "$STATE" >/dev/null || die "节点引用了无有效证书的网站: $d"
-        fi
-        if [[ $mode == ws || $mode == xhttp || $mode == ws-plain ]]; then valid_ws_path "$(jq -r .path <<< "$n")" || die '代理路径非法。'; fi
-        if [[ $mode == xhttp ]]; then
-            valid_choice "$(jq -r '.http_version // "h2"' <<< "$n")" 'h2 h3' || die 'XHTTP HTTP版本无效。'
-            if [[ $(jq -r '.http_version // "h2"' <<< "$n") == h3 ]]; then
-                jq -e --arg d "$d" '.sites[]|select(.domain==$d and .access=="cloudflare")' "$STATE" >/dev/null || die 'H3节点需要Cloudflare网站；请先把节点改为H2。'
-                [[ $(jq -r .host <<< "$n") == "$d" ]] || die 'H3经Cloudflare必须使用本站域名连接，不支持源站IP直连。'
-            fi
-        fi
-    done < <(jq -c '.nodes[]' "$STATE")
-    jq -e '[.nodes|group_by(.entry)[] | (map(del(.id,.credential,.enabled))|unique|length)==1] | all' "$STATE" >/dev/null || die '共享入口参数不一致。'
-    jq -e '[.nodes[]|select(.mode=="ws" or .mode=="xhttp")]|group_by([.domain,.path])|map(map(.entry)|unique|length==1)|all' "$STATE" >/dev/null || die '网站代理路径被不同入口重复使用。'
-    jq -e '[.nodes|group_by(.entry)[]|.[0].port] | length==(unique|length)' "$STATE" >/dev/null || die '不同入口的端口重复。'
+edge_show() {
+    local d s; site_select d "${1:-}"
+    s=$(jq -c --arg d "$d" '.sites[]|select(.domain==$d)' "$STATE")
+    printf '%s\n' "$d"; edge_settings "$s" | jq .
+    info '请求频率/连接/速度/爬虫限制仅作用于网站内容；不套用到WS/XHTTP节点或HTTP-01。'
 }
-render_xray() {
-    local dest=$1
-    jq --arg root "$ROOT" '
-      {log:{access:"none",error:($root+"/logs/xray.log"),loglevel:"warning"},
-       inbounds: ([.nodes[]|select(.enabled)] | group_by(.entry) | map(
-         . as $g | .[0] as $n |
-         {tag:$n.entry,listen:(if ($n.mode=="ws" or $n.mode=="xhttp") then "127.0.0.1" else $n.listen end),port:$n.port,protocol:$n.protocol,
-          settings:(if $n.protocol=="vless" then {decryption:"none",clients:($g|map({id:.credential,email:.id,flow:(if .mode=="reality" then "xtls-rprx-vision" else "" end)}))}
-            elif $n.protocol=="vmess" then {clients:($g|map({id:.credential,email:.id})),disableInsecureEncryption:true}
-            elif $n.protocol=="trojan" then {clients:($g|map({password:.credential,email:.id}))}
-            else {method:$n.method,password:$n.credential,network:"tcp,udp"} end)} +
-          (if $n.mode=="ss" then {} else
-            {streamSettings:({network:(if ($n.mode=="ws" or $n.mode=="ws-plain") then "ws" elif $n.mode=="xhttp" then "xhttp" else "tcp" end),
-             security:(if ($n.mode=="ws" or $n.mode=="xhttp" or $n.mode=="ws-plain") then "none" elif $n.mode=="reality" then "reality" else "tls" end)} +
-             (if $n.mode=="reality" then {realitySettings:{show:false,target:$n.target,xver:0,serverNames:[$n.sni],privateKey:$n.privateKey,shortIds:[$n.shortId]}}
-              elif $n.mode=="tls" then {tlsSettings:{minVersion:"1.2",certificates:[{certificateFile:($root+"/certs/"+$n.domain+"/current/fullchain.pem"),keyFile:($root+"/certs/"+$n.domain+"/current/key.pem")}]}}
-              elif $n.mode=="xhttp" then {xhttpSettings:{path:($n.path+"/"),mode:"packet-up"}}
-              else {wsSettings:{path:$n.path}} end))} end))),
-       outbounds:[{tag:"direct",protocol:"freedom"},{tag:"blocked",protocol:"blackhole"}],
-       routing:{domainStrategy:"IPIfNonMatch",rules:[
-        {type:"field",ip:["0.0.0.0/8","10.0.0.0/8","127.0.0.0/8","169.254.0.0/16","172.16.0.0/12","192.168.0.0/16","224.0.0.0/4","::/128","::1/128","fc00::/7","fe80::/10","ff00::/8"],outboundTag:"blocked"}]}}
-    ' "$STATE" > "$dest"
-}
-# Per-site website controls. WS and ACME use distinct locations and never
-# inherit website request/connection/bandwidth limits or crawler filters.
-edge_settings() {
-    jq -c '{bots:"off",rate:0,burst:30,connections:0,kbps:0,static_ttl:0,gzip:false,origin:false,aop:"off"} + (.protection // {})' <<< "$1"
-}
-edge_zone() { printf '%s' "$1" | sha256sum | cut -c1-12; }
-edge_validate_site() {
-    local settings
-    settings=$(edge_settings "$1")
-    jq -e 'def n($lo;$hi): type=="number" and .==floor and . >= $lo and . <= $hi;
-      (.bots=="off" or .bots=="ai" or .bots=="common" or .bots=="all") and
-      (.rate|n(0;100)) and (.burst|n(1;200)) and (.connections|n(0;200)) and
-      (.kbps|n(0;10240)) and (.static_ttl|n(0;604800)) and
-      (.gzip|type=="boolean") and (.origin|type=="boolean") and
-      (.aop=="off" or .aop=="observe" or .aop=="enforce")' <<< "$settings" >/dev/null || die '网站防护参数非法。'
-    if [[ $(jq -r .origin <<< "$settings") == true || $(jq -r .aop <<< "$settings") != off ]]; then
-        [[ $(jq -r '.access // "direct"' <<< "$1") == cloudflare ]] || die '源站限制/AOP要求网站连接方式为Cloudflare；请先关闭这些防护再改成直连。'
+edge_set() {
+    local domain=$1 key=$2 value=$3 probe
+    site_select domain "$domain"
+    case "$key" in
+        bots) choice "$value" 'off ai common all' || die 'bots: off/ai/common/all。';;
+        aop) choice "$value" 'off observe enforce' || die 'aop: off/observe/enforce。';;
+        gzip|origin) valid_bool "$value" || die '开关应为true/false。';;
+        rate) number "$value" 0 100 || die 'rate:0～100。';;
+        burst) number "$value" 1 200 || die 'burst:1～200。';;
+        connections) number "$value" 0 200 || die 'connections:0～200。';;
+        kbps) number "$value" 0 10240 || die 'kbps:0～10240。';;
+        static_ttl) number "$value" 0 604800 || die 'static_ttl:0～604800。';;
+        *) die '不支持的网站防护参数。';;
+    esac
+    if [[ $key == aop && $value == enforce ]]; then
+        warn '强制AOP前必须在Cloudflare启用Authenticated Origin Pulls，并先用observe模式测试。误配会导致网站/节点525或403。'
     fi
-    if [[ $(jq -r .aop <<< "$settings") != off ]]; then
-        [[ $(jq -r .issued <<< "$1") == true && -s $ROOT/config/edge/aop-ca.pem ]] || die 'AOP需要已签发网站证书及回源CA。'
-    fi
-}
-edge_ai_tokens() {
-    printf '%s\n' GPTBot ChatGPT-User OAI-SearchBot ClaudeBot Claude-User Claude-SearchBot anthropic-ai CCBot Bytespider Amazonbot Applebot-Extended Google-Extended cohere-ai PerplexityBot Perplexity-User Diffbot FacebookBot meta-externalagent meta-externalfetcher
-}
-edge_bot_pattern() {
-    local pattern
-    pattern=$(edge_ai_tokens | paste -sd '|' -)
-    case "$1" in common) pattern+='|AhrefsBot|SemrushBot|MJ12bot|DotBot|BLEXBot|DataForSeoBot|SeekportBot';;
-        all) pattern+='|bot|spider|crawler|scrapy|python-requests|curl|wget|go-http-client|headlesschrome';; esac
-    printf '%s' "$pattern"
-}
-edge_cidrs_valid() {
-    local file=$1 family=$2 line address prefix count=0
-    [[ -f $file && $(stat -c %s "$file") -le 65536 ]] || return 1
-    while IFS= read -r line || [[ -n $line ]]; do
-        [[ $line == */* && $line != *[[:space:]]* ]] || return 1
-        address=${line%/*}; prefix=${line##*/}
-        valid_host "$address" && [[ $prefix =~ ^[0-9]{1,3}$ ]] || return 1
-        if [[ $family == 4 ]]; then
-            [[ $address =~ ^[0-9.]+$ && $address == *.* && $address != *:* ]] && ((10#$prefix>=8 && 10#$prefix<=32)) || return 1
-        else
-            [[ $address == *:* ]] && ((10#$prefix>=16 && 10#$prefix<=128)) || return 1
-        fi
-        count=$((count+1)); ((count<=512)) || return 1
-    done < "$file"
-    ((count>=1))
-}
-edge_cf_ready() { edge_cidrs_valid "$ROOT/config/edge/cf-v4.txt" 4 && edge_cidrs_valid "$ROOT/config/edge/cf-v6.txt" 6; }
-edge_needs_cf() {
-    jq -e '.sites[]|select((.access // "direct")=="cloudflare" and (((.protection.rate // 0)>0) or ((.protection.connections // 0)>0) or .protection.origin==true))' "$STATE" >/dev/null
-}
-edge_http_config() {
-    local site settings domain zone rate connections policy cidr build
-    build=$("$NGINX" -V 2>&1)
-    cat <<'NGINX'
-    map $http_upgrade $vpskit_is_ws { default 0; ~*^websocket$ 1; }
-NGINX
-    for policy in ai common all; do
-        printf '    map $http_user_agent $vpskit_bot_%s { default 0; ~*(%s) 1; }\n' "$policy" "$(edge_bot_pattern "$policy")"
-    done
-    if edge_needs_cf; then
-        edge_cf_ready || die '缺少有效Cloudflare网段，请运行 vpskit edge refresh。'
-        [[ $("$NGINX" -V 2>&1) == *--with-http_realip_module* ]] || die '当前Nginx不含realip模块，不能安全按访客IP限流或限制Cloudflare回源。'
-        printf '    geo $realip_remote_addr $vpskit_cf_peer {\n        default 0;\n'
-        while read -r cidr; do printf '        %s 1;\n' "$cidr"; done < <(awk '1' "$ROOT/config/edge/cf-v4.txt" "$ROOT/config/edge/cf-v6.txt")
-        printf '    }\n'
-    fi
-    while IFS= read -r site; do
-        settings=$(edge_settings "$site"); domain=$(jq -r .domain <<< "$site"); zone=$(edge_zone "$domain")
-        rate=$(jq -r .rate <<< "$settings"); connections=$(jq -r .connections <<< "$settings")
-        if ((rate>0)) && [[ $build == *--without-http_limit_req_module* ]]; then die '当前Nginx缺少limit_req模块；请先运行vpskit update nginx升级为完整构建。'; fi
-        if ((connections>0)) && [[ $build == *--without-http_limit_conn_module* ]]; then die '当前Nginx缺少limit_conn模块；请先运行vpskit update nginx升级为完整构建。'; fi
-        if ((rate>0)); then printf '    limit_req_zone $binary_remote_addr zone=vr_%s:1m rate=%sr/s;\n' "$zone" "$rate"; fi
-        if ((connections>0)); then printf '    limit_conn_zone $binary_remote_addr zone=vc_%s:1m;\n' "$zone"; fi
-    done < <(jq -c '.sites[]' "$STATE")
-}
-edge_server_config() {
-    local site=$1 tls=$2 settings mode domain cidr
-    settings=$(edge_settings "$site"); domain=$(jq -r .domain <<< "$site")
-    printf '        if ($host != %s) { return 404; }\n' "$domain"
-    if [[ $(jq -r '.access // "direct"' <<< "$site") == cloudflare ]] && { [[ $(jq -r .origin <<< "$settings") == true ]] || (( $(jq -r .rate <<< "$settings")>0 || $(jq -r .connections <<< "$settings")>0 )); }; then
-        while read -r cidr; do printf '        set_real_ip_from %s;\n' "$cidr"; done < <(awk '1' "$ROOT/config/edge/cf-v4.txt" "$ROOT/config/edge/cf-v6.txt")
-        printf '        real_ip_header CF-Connecting-IP;\n        real_ip_recursive off;\n'
-    fi
-    mode=$(jq -r .aop <<< "$settings")
-    if [[ $tls == true && $mode != off ]]; then
-        printf '        ssl_client_certificate %s/config/edge/aop-ca.pem;\n        ssl_verify_depth 2;\n' "$ROOT"
-        if [[ $mode == enforce ]]; then printf '        ssl_verify_client on;\n'; else printf '        ssl_verify_client optional;\n'; fi
-        # A random, explicitly invoked diagnostic path is never listed publicly.
-        # It returns only TLS client verification status; no credentials or IPs.
-        local probe; probe=$(get '.edge.probe // ""')
-        [[ $probe =~ ^[a-f0-9]{32}$ ]] || die 'AOP诊断路径缺失，请重新配置AOP。'
-        printf '        location = /.well-known/vpskit-aop-%s {\n' "$probe"
-        edge_origin_guard "$settings"
-        printf '            default_type text/plain;\n            add_header Cache-Control "no-store" always;\n            return 200 "$ssl_client_verify\\n";\n        }\n'
-    fi
-}
-edge_origin_guard() {
-    if [[ $(jq -r .origin <<< "$1") == true ]]; then printf '            if ($vpskit_cf_peer = 0) { return 403; }\n'; fi
-}
-edge_web_guard() {
-    local settings=$1 domain=$2 bots rate burst connections kbps zone
-    bots=$(jq -r .bots <<< "$settings"); rate=$(jq -r .rate <<< "$settings"); burst=$(jq -r .burst <<< "$settings")
-    connections=$(jq -r .connections <<< "$settings"); kbps=$(jq -r .kbps <<< "$settings"); zone=$(edge_zone "$domain")
-    edge_origin_guard "$settings"
-    [[ $bots == off ]] || printf '            if ($vpskit_bot_%s) { return 403; }\n' "$bots"
-    if ((rate>0)); then printf '            limit_req zone=vr_%s burst=%s nodelay;\n            limit_req_status 429;\n            limit_req_log_level info;\n' "$zone" "$burst"; fi
-    if ((connections>0)); then printf '            limit_conn vc_%s %s;\n            limit_conn_status 429;\n            limit_conn_log_level info;\n' "$zone" "$connections"; fi
-    if ((kbps>0)); then printf '            limit_rate %sk;\n' "$kbps"; fi
-}
-edge_static_gzip() {
-    if [[ $1 == true ]]; then
-        cat <<'NGINX'
-            gzip on;
-            gzip_vary on;
-            gzip_comp_level 2;
-            gzip_min_length 1024;
-            gzip_types text/plain text/css application/javascript application/json image/svg+xml;
-NGINX
-    fi
-}
-edge_robots_content() {
-    local mode=$1 token
-    if [[ $mode == all ]]; then printf 'User-agent: *\nDisallow: /\n'; return; fi
-    while read -r token; do printf 'User-agent: %s\nDisallow: /\n\n' "$token"; done < <(edge_ai_tokens)
-    if [[ $mode == common ]]; then for token in AhrefsBot SemrushBot MJ12bot DotBot BLEXBot DataForSeoBot SeekportBot; do printf 'User-agent: %s\nDisallow: /\n\n' "$token"; done; fi
-}
-
-render_nginx() {
-    local dest=$1 site domain issued upstream kind template redirect n path port ipv6='' protocols gzip settings ttl bots robots h2=false h2modern=false nginx_version
-    protocols=$(nginx_tls_protocols)
-    if jq -e '.nodes[]|select(.enabled and .mode=="xhttp")' "$STATE" >/dev/null; then
-        xhttp_require_nginx
-        h2=true
-        nginx_version=$("$NGINX" -v 2>&1 | sed -n 's@.*nginx/\([0-9.]*\).*@\1@p')
-        if dpkg --compare-versions "${nginx_version:-0}" ge 1.25.1; then h2modern=true; fi
-    fi
-    [[ ! -f /proc/sys/net/ipv6/conf/all/disable_ipv6 || $(cat /proc/sys/net/ipv6/conf/all/disable_ipv6) != 0 ]] || ipv6=yes
-    mkdir -p "$ROOT/run/nginx"/{client,proxy,fastcgi,uwsgi,scgi}
-    {
-        cat <<EOF_NGINX
-# VPSKIT_OWNED -- generated; use vpskit site / edge to manage.
-user root;
-worker_processes 1;
-pid $ROOT/run/nginx.pid;
-error_log $ROOT/logs/nginx.log warn;
-events { worker_connections 512; }
-http {
-    types { text/html html htm; text/css css; application/javascript js; application/json json; image/png png; image/jpeg jpg jpeg; image/svg+xml svg; image/x-icon ico; text/plain txt; font/woff2 woff2; }
-    default_type application/octet-stream;
-    server_tokens off;
-    sendfile on;
-    tcp_nodelay on;
-    tcp_nopush on;
-    keepalive_timeout 30;
-    keepalive_requests 1000;
-    client_header_timeout 15s;
-    client_body_timeout 15s;
-    send_timeout 30s;
-    reset_timedout_connection on;
-    client_max_body_size 10m;
-    access_log off;
-    client_body_temp_path $ROOT/run/nginx/client;
-    proxy_temp_path $ROOT/run/nginx/proxy;
-    fastcgi_temp_path $ROOT/run/nginx/fastcgi;
-    uwsgi_temp_path $ROOT/run/nginx/uwsgi;
-    scgi_temp_path $ROOT/run/nginx/scgi;
-    ssl_session_cache shared:VPSKIT:1m;
-    ssl_session_timeout 10m;
-    ssl_protocols $protocols;
-EOF_NGINX
-        edge_http_config
-        printf '    server {\n        listen 80 default_server;\n'
-        [[ -z $ipv6 ]] || printf '        listen [::]:80 default_server;\n'
-        printf '        server_name _;\n        location ^~ /.well-known/acme-challenge/ { root %s/www/acme; default_type text/plain; }\n        location / { return 404; }\n    }\n' "$ROOT"
-        while IFS= read -r site; do
-            domain=$(jq -r .domain <<< "$site"); issued=$(jq -r .issued <<< "$site"); upstream=$(jq -r '.upstream // ""' <<< "$site")
-            kind=$(jq -r '.kind // (if (.upstream // "")!="" then "proxy" else "custom" end)' <<< "$site")
-            template=$(jq -r '.template // "welcome"' <<< "$site"); redirect=$(jq -r '.redirect // ""' <<< "$site")
-            settings=$(edge_settings "$site"); ttl=$(jq -r .static_ttl <<< "$settings"); bots=$(jq -r .bots <<< "$settings")
-            gzip=$(jq -r .gzip <<< "$settings"); [[ $(get '.performance.gzip // false') != true ]] || gzip=true
-            if ! valid_domain "$domain" || ! valid_upstream "$upstream"; then die '网站参数不合法。'; fi
-            edge_validate_site "$site"
-            printf '    server {\n        listen 80;\n'
-            [[ -z $ipv6 ]] || printf '        listen [::]:80;\n'
-            printf '        server_name %s;\n' "$domain"
-            edge_server_config "$site" false
-            printf '        location ^~ /.well-known/acme-challenge/ { root %s/www/acme; default_type text/plain; }\n' "$ROOT"
-            if [[ $issued == true ]]; then
-                printf '        location / {\n'
-                edge_origin_guard "$settings"
-                [[ $bots == off ]] || printf '            if ($vpskit_bot_%s) { return 403; }\n' "$bots"
-                printf '            return 301 https://%s$request_uri;\n        }\n    }\n' "$domain"
-                if [[ $h2 == true && $h2modern == false ]]; then
-                    printf '    server {\n        listen 443 ssl http2;\n'
-                    [[ -z $ipv6 ]] || printf '        listen [::]:443 ssl http2;\n'
-                else
-                    printf '    server {\n        listen 443 ssl;\n'
-                    [[ -z $ipv6 ]] || printf '        listen [::]:443 ssl;\n'
-                    [[ $h2 != true ]] || printf '        http2 on;\n'
-                fi
-                printf '        server_name %s;\n        ssl_certificate %s/certs/%s/current/fullchain.pem;\n        ssl_certificate_key %s/certs/%s/current/key.pem;\n' "$domain" "$ROOT" "$domain" "$ROOT" "$domain"
-                edge_server_config "$site" true
-                printf '        location ^~ /.well-known/acme-challenge/ { root %s/www/acme; default_type text/plain; }\n' "$ROOT"
-            fi
-            printf '        root %s/www/%s;\n' "$ROOT" "$domain"
-            if [[ $kind == template ]]; then printf '        index vpskit-%s.html index.html;\n' "$template"; else printf '        index index.html;\n'; fi
-            printf '        location ~ /\\. { deny all; }\n'
-            if [[ $issued == true ]]; then
-                while IFS= read -r n; do
-                    path=$(jq -r .path <<< "$n"); port=$(jq -r .port <<< "$n")
-                    printf '        location ^~ %s/ {\n' "$path"
-                    edge_origin_guard "$settings"
-                    cat <<EOF_XHTTP
-            proxy_pass http://127.0.0.1:$port;
-            proxy_http_version 1.1;
-            proxy_set_header Host \$host;
-            proxy_set_header Connection "";
-            proxy_set_header Upgrade "";
-            proxy_set_header X-Forwarded-For \$remote_addr;
-            proxy_buffering off;
-            proxy_request_buffering off;
-            proxy_cache off;
-            proxy_max_temp_file_size 0;
-            client_max_body_size 2m;
-            gzip off;
-            add_header Cache-Control "no-store" always;
-            proxy_read_timeout 3600s;
-            proxy_send_timeout 3600s;
-        }
-EOF_XHTTP
-                done < <(jq -c --arg d "$domain" '[.nodes[]|select(.enabled and .mode=="xhttp" and .domain==$d)]|unique_by(.entry)[]' "$STATE")
-                while IFS= read -r n; do
-                    path=$(jq -r .path <<< "$n"); port=$(jq -r .port <<< "$n")
-                    printf '        location = %s {\n' "$path"
-                    edge_origin_guard "$settings"
-                    cat <<EOF_WS
-            if (\$vpskit_is_ws = 0) { return 404; }
-            if (\$request_method != GET) { return 404; }
-            proxy_pass http://127.0.0.1:$port;
-            proxy_http_version 1.1;
-            proxy_set_header Upgrade \$http_upgrade;
-            proxy_set_header Connection "upgrade";
-            proxy_set_header Host \$host;
-            proxy_buffering off;
-            proxy_request_buffering off;
-            proxy_cache off;
-            gzip off;
-            add_header Cache-Control "no-store" always;
-            proxy_read_timeout 3600s;
-            proxy_send_timeout 3600s;
-        }
-EOF_WS
-                done < <(jq -c --arg d "$domain" '[.nodes[]|select(.enabled and .mode=="ws" and .domain==$d)]|unique_by(.entry)[]' "$STATE")
-            fi
-            if [[ $kind == template || $kind == custom ]]; then
-                if [[ $bots != off ]]; then
-                    robots=$(edge_robots_content "$bots" | awk '{printf "%s\\n",$0}')
-                    printf '        location = /robots.txt {\n'
-                    edge_origin_guard "$settings"
-                    printf '            try_files /robots.txt @vpskit_robots;\n        }\n        location @vpskit_robots {\n            default_type text/plain;\n            add_header Cache-Control "no-cache" always;\n            return 200 "%s";\n        }\n' "$robots"
-                fi
-                if ((ttl>0)); then
-                    printf '        location ~* \\.(css|js|png|jpe?g|gif|svg|webp|avif|ico|woff2?|ttf)$ {\n'
-                    edge_web_guard "$settings" "$domain"
-                    printf '            try_files $uri =404;\n            expires %ss;\n' "$ttl"
-                    edge_static_gzip "$gzip"
-                    printf '        }\n'
-                fi
-            fi
-            printf '        location / {\n'
-            edge_web_guard "$settings" "$domain"
-            if [[ $kind == redirect ]]; then
-                valid_redirect "$redirect" "$domain" || die '跳转网址不合法。'
-                printf '            return 302 "%s";\n' "$redirect"
-            elif [[ -n $upstream ]]; then
-                cat <<EOF_PROXY
-            proxy_pass $upstream;
-            proxy_set_header Host \$host;
-            proxy_set_header X-Real-IP \$remote_addr;
-            proxy_set_header X-Forwarded-For \$remote_addr;
-            proxy_set_header X-Forwarded-Proto \$scheme;
-            proxy_hide_header X-Powered-By;
-EOF_PROXY
-            else
-                printf '            try_files $uri $uri/ =404;\n'
-                edge_static_gzip "$gzip"
-            fi
-            printf '        }\n    }\n'
-        done < <(jq -c '.sites[]' "$STATE")
-        printf '}\n'
-    } > "$dest"
-}
-# Website-only changes reload Nginx without restarting Xray on success.
-apply_web_config() {
-    ensure_component nginx
-    validate_state
-    render_nginx "$ROOT/config/nginx.next.conf"
-    nginx_cmd -t -p "$ROOT/" -c "$ROOT/config/nginx.next.conf"
-    mv -f "$ROOT/config/nginx.next.conf" "$ROOT/config/nginx.conf"
-    if systemctl is-active --quiet vpskit-nginx.service; then run systemctl reload vpskit-nginx.service
-    else run systemctl start vpskit-nginx.service; fi
-    systemctl is-active --quiet vpskit-nginx.service || die 'Nginx未正常运行。'
-}
-edge_fetch_assets() {
-    EDGE_STAGE="$WORK/edge-assets"
-    mkdir -p "$EDGE_STAGE"
-    local item url
-    for item in v4 v6 ca; do
-        case "$item" in v4) url=https://www.cloudflare.com/ips-v4;; v6) url=https://www.cloudflare.com/ips-v6;; ca) url=https://developers.cloudflare.com/ssl/static/authenticated_origin_pull_ca.pem;; esac
-        info "下载Cloudflare官方资料：$item"
-        curl --proto '=https' --proto-redir '=https' -fSL --connect-timeout 15 --max-time 45 --max-filesize 65536 --retry 1 -o "$EDGE_STAGE/$item" "$url"
-    done
-    if ! edge_cidrs_valid "$EDGE_STAGE/v4" 4 || ! edge_cidrs_valid "$EDGE_STAGE/v6" 6; then die 'Cloudflare网段下载结果异常，保留旧配置。'; fi
-    openssl x509 -in "$EDGE_STAGE/ca" -noout -checkend 2592000 >/dev/null || die '回源CA无效或不足30天有效期，保留旧配置。'
-    openssl x509 -in "$EDGE_STAGE/ca" -text -noout | grep -q 'CA:TRUE' || die '下载结果不是CA证书。'
-}
-edge_install_assets() {
-    mkdir -p "$ROOT/config/edge"
-    install -m 600 "$EDGE_STAGE/v4" "$ROOT/config/edge/cf-v4.txt"
-    install -m 600 "$EDGE_STAGE/v6" "$ROOT/config/edge/cf-v6.txt"
-    install -m 600 "$EDGE_STAGE/ca" "$ROOT/config/edge/aop-ca.pem"
-    date +%s > "$ROOT/config/edge/updated.epoch"
+    if [[ $key == origin && $value == true ]]; then warn '开启后此站点只接受已知Cloudflare网段，直连该站点会返回403。'; fi
+    if [[ $key == aop && $value != off && ! -s $ROOT/config/edge/aop-ca.pem ]] || { cf_needed && ! cf_ready; }; then cf_fetch; fi
+    confirm "设置 $domain：$key=$value" || return 0
+    begin_tx "edge:$domain:$key"
+    [[ ! -d $WORK/edge ]] || cf_install_assets
+    probe=$(get '.edge.probe // ""'); [[ -n $probe ]] || json_update --arg p "$(randhex 16)" '.edge.probe=$p'
+    case "$key" in
+        bots|aop) json_update --arg d "$domain" --arg k "$key" --arg v "$value" '(.sites[]|select(.domain==$d)).protection[$k]=$v';;
+        *) json_update --arg d "$domain" --arg k "$key" --argjson v "$value" '(.sites[]|select(.domain==$d)).protection[$k]=$v';;
+    esac
+    apply_config web; commit_tx
 }
 edge_refresh() {
-    ensure_component nginx
-    edge_fetch_assets
-    begin_tx; edge_install_assets; apply_web_config; commit_tx
-    ok 'Cloudflare IPv4/IPv6网段及公共回源CA已验证并更新。'
-}
-edge_auto_refresh() {
-    local stamp=0 rc
-    jq -e '.sites[]|select((.access // "direct")=="cloudflare" and ((.protection.origin==true) or ((.protection.rate // 0)>0) or ((.protection.connections // 0)>0) or ((.protection.aop // "off")!="off")))' "$STATE" >/dev/null || return 0
-    if [[ -f $ROOT/config/edge/updated.epoch ]]; then read -r stamp < "$ROOT/config/edge/updated.epoch"; fi
-    [[ $stamp =~ ^[0-9]{1,12}$ ]] || stamp=0
-    (( $(date +%s)-stamp>=604800 )) || return 0
-    # The existing hourly timer drives a weekly refresh. A failed download or
-    # reload rolls back in an isolated action and cannot suppress ACME renewal.
-    set +e
-    trap - ERR
-    (
-        set -Ee
-        trap 'on_error $? $LINENO' ERR
-        trap on_exit EXIT
-        edge_refresh_job
-    )
-    rc=$?
-    set -e
-    trap 'on_error $? $LINENO' ERR
-    [[ $rc == 0 ]] || warn 'Cloudflare资料自动更新失败，保留旧配置；请运行 vpskit edge refresh 检查。'
-}
-edge_refresh_job() {
-    WORK=$(mktemp -d "$ROOT/tmp/edge-refresh.XXXXXXXX")
-    TX=0
-    edge_refresh
-}
-edge_site() { site_select "$1"; }
-edge_get_site() { jq -c --arg d "$1" '.sites[]|select(.domain==$d)' "$STATE"; }
-valid_edge_number() { [[ $1 =~ ^[0-9]{1,6}$ ]] && ((10#$1>=${2:-0} && 10#$1<=${3:-100})); }
-edge_profile() {
-    local domain site cf=false
-    ensure_component nginx; edge_site domain; site=$(edge_get_site "$domain")
-    info '均衡预设：拦截声明身份的AI爬虫；网站5请求/秒、突发30、每IP20并发；静态资源缓存1小时、轻量gzip。'
-    info '仅网站应用上述限制；WS/XHTTP、ACME不套用。已有robots.txt保留。不会自动启用回源限制或AOP。'
-    confirm "应用到 $domain" || return 0
-    if [[ $(jq -r '.access // "direct"' <<< "$site") == cloudflare ]] && ! edge_cf_ready; then edge_fetch_assets; cf=true; fi
-    begin_tx
-    [[ $cf != true ]] || edge_install_assets
-    json_update --arg d "$domain" '(.sites[]|select(.domain==$d)|.protection) = ((.sites[]|select(.domain==$d)|.protection // {}) + {bots:"ai",rate:5,burst:30,connections:20,kbps:0,static_ttl:3600,gzip:true})'
-    apply_web_config; commit_tx
-    ok '网站防护与节流预设已生效。Cloudflare边缘拦截/缓存仍需按控制台指引设置。'
-}
-edge_bots() {
-    local domain site policy
-    ensure_component nginx; edge_site domain; site=$(edge_get_site "$domain")
-    panel_title '网站爬虫策略（WS/XHTTP与ACME不应用）'
-    menu_item 1 '仅AI爬虫 ai' '拒绝匹配已知AI User-Agent；普通搜索爬虫保留'
-    menu_item 2 'AI + 常见采集器 common' '增加Ahrefs、Semrush等采集器；通常不拦Googlebot/Bingbot'
-    menu_item 3 '广泛拒绝声明爬虫 all' '包括搜索爬虫、curl/wget等；影响SEO和网站API/监控，请慎选'
-    menu_item 0 '关闭 off' '恢复网站默认行为；已有robots.txt文件不删除'
-    ask_valid policy '编号或 off / ai / common / all' "$(jq -r '.protection.bots // "off"' <<< "$site")" valid_choice '请选择0/1/2/3或策略名称。' '0 1 2 3 off ai common all'
-    case "$policy" in 0) policy=off;; 1) policy=ai;; 2) policy=common;; 3) policy=all;; esac
-    warn 'User-Agent可伪造；本机规则不能识别所有爬虫。robots.txt是自愿遵守的声明，不是访问控制。'
-    if [[ $policy == all ]]; then confirm '会拒绝普通搜索爬虫及部分自动客户端，继续' || return 0; fi
-    begin_tx
-    json_update --arg d "$domain" --arg p "$policy" '(.sites[]|select(.domain==$d)|.protection.bots)=$p'
-    apply_web_config; commit_tx
-}
-edge_limits() {
-    local domain site settings rate burst connections kbps cf=false
-    ensure_component nginx; edge_site domain; site=$(edge_get_site "$domain"); settings=$(edge_settings "$site")
-    info '按访客IP限制普通网站请求；同一NAT出口会共享额度。WS/XHTTP、证书验证不受这些限额约束。'
-    ask_valid rate '每IP每秒请求数，0关闭，最高100' "$(jq -r .rate <<< "$settings")" valid_edge_number '请输入0～100的整数。' 0 100
-    ask_valid burst '允许突发请求数' "$(jq -r .burst <<< "$settings")" valid_edge_number '请输入1～200的整数。' 1 200
-    ask_valid connections '每IP网站并发请求数，0关闭' "$(jq -r .connections <<< "$settings")" valid_edge_number '请输入0～200的整数。' 0 200
-    ask_valid kbps '每个网站响应的下载上限KiB/s，0不限速' "$(jq -r .kbps <<< "$settings")" valid_edge_number '请输入0～10240的整数。' 0 10240
-    if [[ $(jq -r '.access // "direct"' <<< "$site") == cloudflare ]] && ((10#$rate>0 || 10#$connections>0)) && ! edge_cf_ready; then edge_fetch_assets; cf=true; fi
-    begin_tx
-    [[ $cf != true ]] || edge_install_assets
-    json_update --arg d "$domain" --argjson r "$((10#$rate))" --argjson b "$((10#$burst))" --argjson c "$((10#$connections))" --argjson k "$((10#$kbps))" '(.sites[]|select(.domain==$d)|.protection) = ((.sites[]|select(.domain==$d)|.protection // {}) + {rate:$r,burst:$b,connections:$c,kbps:$k})'
-    apply_web_config; commit_tx
-    info '网站跳转响应很小，Nginx直接return的跳转不受请求限流阶段约束；请在Cloudflare边缘另加规则。'
-}
-edge_cache() {
-    local domain site ttl gzip
-    ensure_component nginx; edge_site domain; site=$(edge_get_site "$domain")
-    info '仅静态网站的CSS/JS/图片/字体使用缓存头；HTML、动态应用和代理流量不强制缓存。更新同名资源后可能需清CDN缓存。'
-    ask_valid ttl '静态资源缓存秒数，0关闭，最高604800（7天）' "$(jq -r '.protection.static_ttl // 0' <<< "$site")" valid_edge_number '请输入0～604800。' 0 604800
-    ask_valid gzip '此网站开启轻量gzip？yes/no' "$(jq -r 'if .protection.gzip==true then "yes" else "no" end' <<< "$site")" valid_choice '请输入yes或no。' 'yes no'
-    begin_tx
-    json_update --arg d "$domain" --argjson t "$((10#$ttl))" --argjson g "$([[ $gzip == yes ]] && printf true || printf false)" '(.sites[]|select(.domain==$d)|.protection) = ((.sites[]|select(.domain==$d)|.protection // {}) + {static_ttl:$t,gzip:$g})'
-    apply_web_config; commit_tx
-    if [[ $(get '.performance.gzip // false') == true ]]; then info '全局静态gzip仍开启；需要全部关闭时，请同时执行 vpskit optimize gzip-off。'; fi
-}
-edge_origin() {
-    local domain site choice cf=false
-    ensure_component nginx; edge_site domain; site=$(edge_get_site "$domain")
-    ask_valid choice '仅允许Cloudflare网段访问此网站和WS/XHTTP？yes/no' "$(jq -r 'if .protection.origin==true then "yes" else "no" end' <<< "$site")" valid_choice '请输入yes或no。' 'yes no'
-    if [[ $choice == yes ]]; then
-        [[ $(jq -r '.access // "direct"' <<< "$site") == cloudflare ]] || die '请先在网站设置中选择Cloudflare访问方式并完成控制台橙云配置。'
-        warn '启用后源站IP直连网站/WS/XHTTP会被拒绝；该限制在Nginx层，不替代云防火墙，也不影响SSH。HTTP证书验证路径保持可用。'
-        warn 'Cloudflare网段和公共AOP都不能证明请求属于你的账户；其他直连代理端口仍可能暴露源站。'
-        confirm '已确认网站与WS/XHTTP能通过Cloudflare正常访问，现在启用限制' || return 0
-        if ! edge_cf_ready; then edge_fetch_assets; cf=true; fi
-    fi
-    begin_tx
-    [[ $cf != true ]] || edge_install_assets
-    json_update --arg d "$domain" --argjson e "$([[ $choice == yes ]] && printf true || printf false)" '(.sites[]|select(.domain==$d)|.protection.origin)=$e'
-    apply_web_config; commit_tx
-}
-edge_aop_probe() {
-    local domain=${1:-} token result
-    if [[ -z $domain ]]; then edge_site domain; fi
-    token=$(get '.edge.probe // ""'); [[ $token =~ ^[a-f0-9]{32}$ ]] || die '请先设置AOP观察模式。'
-    info "通过公网域名验证 $domain 的实际回源客户端证书；不显示源站IP。"
-    result=$(curl --noproxy '*' -fsS --connect-timeout 10 --max-time 20 -H 'Cache-Control: no-cache' "https://$domain/.well-known/vpskit-aop-$token?check=$(randhex 8)") || die '回源验证请求失败，请检查橙云、SSL模式、WAF及AOP设置。'
-    [[ $result == SUCCESS ]] || die "未确认有效AOP客户端证书（期望SUCCESS）；请在Cloudflare启用Global AOP后重试。"
-    ok '本次公网回源已提供可验证的客户端证书。'
-}
-edge_aop() {
-    local domain site mode
-    ensure_component nginx; edge_site domain; site=$(edge_get_site "$domain")
-    info '公共AOP验证请求来自Cloudflare网络，不专属于你的账户；账户级保护需另行配置自有回源证书。'
-    ask_valid mode 'AOP：off关闭 / observe观察（建议先选） / enforce强制' "$(jq -r '.protection.aop // "off"' <<< "$site")" valid_choice '请选择off、observe或enforce。' 'off observe enforce'
-    if [[ $mode != off ]]; then
-        [[ $(jq -r '.access // "direct"' <<< "$site") == cloudflare && $(jq -r .issued <<< "$site") == true ]] || die 'AOP需要Cloudflare访问方式和已签发的HTTPS网站。'
-        if [[ $mode == enforce && $(jq -r '.protection.aop // "off"' <<< "$site") != enforce ]]; then
-            [[ $(jq -r '.protection.aop // "off"' <<< "$site") == observe ]] || die '请先启用observe，再在Cloudflare开启Global AOP，验证后才能切换enforce。'
-            edge_aop_probe "$domain"
-            confirm '本次回源验证通过；缺少有效客户端证书的HTTPS请求将被拒绝，启用强制模式' || return 0
-        fi
-        edge_fetch_assets
-    fi
-    begin_tx
-    if [[ $mode != off ]]; then
-        edge_install_assets
-        if [[ ! $(get '.edge.probe // ""') =~ ^[a-f0-9]{32}$ ]]; then json_update --arg p "$(randhex 16)" '.edge.probe=$p'; fi
-    fi
-    json_update --arg d "$domain" --arg a "$mode" '(.sites[]|select(.domain==$d)|.protection.aop)=$a'
-    apply_web_config
-    if [[ $mode == enforce ]]; then edge_aop_probe "$domain"; fi
-    commit_tx
-    if [[ $mode == observe ]]; then info '观察模式已启用：现在去Cloudflare开启Global AOP，再用菜单“验证回源”检查；未提供证书的请求暂时允许。'; fi
-}
-edge_reset() {
-    local domain
-    ensure_component nginx; edge_site domain
-    confirm "关闭 $domain 的新增爬虫/网站限额/静态缓存/回源限制/AOP（节点及网站文件保留）" || return 0
-    begin_tx; json_update --arg d "$domain" '(.sites[]|select(.domain==$d)) |= del(.protection)'
-    apply_web_config; commit_tx
-    info '此网站增强设置已关闭；全局gzip和你在Cloudflare控制台设置的规则需分别调整。'
-}
-edge_status() {
-    panel_title '方案B · 网站防护与流量'
-    jq -r '.sites[] | (.protection // {}) as $p | "\(.domain) [\(.access // "direct")]\n  爬虫=\($p.bots // "off")；网站请求=\($p.rate // 0)r/s；突发=\($p.burst // 30)；并发=\($p.connections // 0)；每响应=\($p.kbps // 0)KiB/s\n  静态缓存=\($p.static_ttl // 0)s；站点gzip=\($p.gzip // false)；仅CF回源=\($p.origin // false)；AOP=\($p.aop // "off")"' "$STATE"
-    printf '  全局静态gzip=%s；网站限额0表示关闭；WS/XHTTP/ACME不套用网站限额。\n' "$(get '.performance.gzip // false')"
-    if [[ -f $ROOT/config/edge/updated.epoch ]]; then
-        local stamp; read -r stamp < "$ROOT/config/edge/updated.epoch"
-        if [[ $stamp =~ ^[0-9]{1,12}$ ]]; then printf '  CF资料更新于：%s；已有小时维护任务每7天尝试刷新，失败保留旧版。\n' "$(date -d "@$stamp" '+%F %T')"; fi
-    fi
-    printf '  Nginx状态：%s；未知Host或普通HTTP访问WS路径返回404；不保证流量无法被识别。\n' "$(service_caption nginx)"
-}
-edge_traffic() {
-    panel_title '网卡实际流量 · 采样约1秒（不下载测速文件）'
-    local first="$WORK/net-before" second="$WORK/net-after"
-    cat /proc/net/dev > "$first"; sleep 1; cat /proc/net/dev > "$second"
-    awk 'NR==FNR{gsub(":"," "); if(NF==17){rx[$1]=$2;tx[$1]=$10} next}
-      {gsub(":"," "); if(NF==17 && $1!="lo" && ($1 in rx)){printf "  %s: 入站 %.1f KiB/s / 出站 %.1f KiB/s；累计接收 %.2f GiB / 发送 %.2f GiB\n",$1,($2-rx[$1])/1024,($10-tx[$1])/1024,$2/1073741824,$10/1073741824}}' "$first" "$second"
-    printf '计数来自网卡，可能包含虚拟接口重复流量；不是月度账单，不代表线路最大带宽。\n'
-}
-edge_guide() {
-    local domain paths probe xp
-    edge_site domain
-    paths=$(jq -r --arg d "$domain" '[.nodes[]|select(.domain==$d and .mode=="ws" and .enabled)|.path]|unique|map("\""+.+"\"")|join(" ")' "$STATE")
-    probe=$(get '.edge.probe // ""')
-    if [[ $probe =~ ^[a-f0-9]{32}$ ]]; then paths+=" \"/.well-known/vpskit-aop-$probe\""; fi
-    printf '\nCloudflare控制台配置指引 · %s\n' "$domain"
-    cat <<'GUIDE'
-1. 域名橙云 + Full (strict) + WebSockets。使用自己的正常网站内容。
-2. 优先在Cloudflare边缘拦截爬虫，节省回源带宽；可用AI机器人策略取决于当前控制台选项。
-3. 以下“网站范围”表达式可用于自定义拦截/限流规则的作用范围，再叠加你需要的条件。
-   不要把此范围表达式单独设为Block，否则会封禁正常网站访问。
-GUIDE
-    printf '  (http.host eq "%s" and not starts_with(http.request.uri.path, "/.well-known/acme-challenge/")' "$domain"
-    [[ -z $paths ]] || printf ' and not http.request.uri.path in {%s}' "$paths"
-    while IFS= read -r xp; do
-        printf ' and not starts_with(http.request.uri.path, "%s/")' "$xp"
-    done < <(jq -r --arg d "$domain" '[.nodes[]|select(.enabled and .mode=="xhttp" and .domain==$d)|.path]|unique[]' "$STATE")
-    printf ')\n'
-    cat <<'GUIDE'
-4. 普通访问应看到网站；为WS精确路径及XHTTP路径前缀（包含末尾/）设置缓存Bypass，并避免JS挑战/CAPTCHA。
-   若套餐支持，跳过仅会误伤代理的限流/机器人规则；不要给任意Upgrade头全站放行。
-   免费Bot Fight Mode不能通过普通Skip规则豁免，不建议在共用代理域名上盲目启用。
-5. 静态CSS/JS/图片/字体尊重源站缓存头；不要对登录页、API或整个域名使用Cache Everything。
-6. 先检查网站与客户端，再启用本机“仅CF回源”；AOP先observe，在控制台开启Global AOP，验证后enforce。
-7. 网段限制和公共AOP只识别Cloudflare网络，不绑定你的账户。DNS历史、其他直连服务仍可能泄露源站。
-控制台规则不会由本脚本自动发布；DNS签发Token不被挪作WAF管理凭据。修改/停用WS或XHTTP节点后请同步更新边缘路径规则。
-GUIDE
-}
-edge_menu() {
-    local choice
-    while [[ -f $STATE ]]; do
-        edge_status
-        menu_item 1 '应用均衡预设' '网站AI爬虫拦截、5r/s限流、并发20、静态缓存和gzip；不自动锁回源'
-        menu_item 2 '爬虫策略' '关闭 / AI / AI+采集器 / 广泛爬虫；强策略会影响SEO'
-        menu_item 3 '网站请求、并发与下载限额' '按访客IP调整；WS和ACME不使用网站限额'
-        menu_item 4 '静态缓存与压缩' '减少重复回源；不强制缓存HTML、动态页面或代理流量'
-        menu_item 5 '限制Cloudflare回源' '仅所选网站/WS/XHTTP；Nginx层限制，源站IP直连将失败'
-        menu_item 6 'AOP回源认证' '关闭 / 观察 / 强制；先配置Cloudflare，再验证后强制'
-        menu_item 7 '验证AOP实际回源' '通过公网HTTPS确认本次回源证书验证为SUCCESS'
-        menu_item 8 '刷新Cloudflare网段与CA' '只下载官方资料；校验后重载，失败保留旧配置'
-        menu_item 9 'Cloudflare边缘配置指引' '输出网站规则范围、WS缓存旁路与防误伤说明'
-        menu_item 10 '网卡流量' '查看实际收发和约1秒速率；不消耗大量流量测速'
-        menu_item 11 '关闭所选网站的增强设置' '保留网站、节点；Cloudflare控制台规则需单独关闭'
-        menu_item 0 '返回' '回到主菜单'
-        ask choice '选择编号' 0
-        case "$choice" in 1) menu_run edge_profile;; 2) menu_run edge_bots;; 3) menu_run edge_limits;; 4) menu_run edge_cache;; 5) menu_run edge_origin;; 6) menu_run edge_aop;; 7) menu_run edge_aop_probe;; 8) menu_run edge_refresh;; 9) menu_run edge_guide;; 10) menu_run edge_traffic;; 11) menu_run edge_reset;; 0) return;; *) warn '无效选择。';; esac
-    done
-}
-edge_action() {
-    case "$1" in status|profile|bots|limits|cache|origin|aop|refresh|guide|traffic|reset) "edge_$1";; probe) edge_aop_probe;; *) die '用法：vpskit edge status|profile|bots|limits|cache|origin|aop|probe|refresh|guide|traffic|reset';; esac
-}
-
-apply_config() {
-    validate_state
-    local xc="$ROOT/config/xray.next.json" nc="$ROOT/config/nginx.next.conf" count
-    if [[ $(get .components.xray) == true ]]; then
-        render_xray "$xc"
-        info '验证Xray配置；Warning弃用提示不等于失败，以测试退出码为准。'
-        "$XRAY" run -test -config "$xc"
-        ok 'Xray配置验证通过；旧节点的弃用提示可通过节点菜单迁移处理。'
-    fi
-    if [[ $(get .components.nginx) == true ]]; then
-        render_nginx "$nc"
-        nginx_cmd -t -p "$ROOT/" -c "$nc"
-    fi
-    [[ ! -f $xc ]] || mv -f "$xc" "$ROOT/config/xray.json"
-    [[ ! -f $nc ]] || mv -f "$nc" "$ROOT/config/nginx.conf"
-    write_units
-    if [[ $(get .components.nginx) == true ]]; then
-        systemctl enable vpskit-nginx.service
-        if systemctl is-active --quiet vpskit-nginx.service; then systemctl reload vpskit-nginx.service; else systemctl start vpskit-nginx.service; fi
-        systemctl is-active --quiet vpskit-nginx.service || die 'Nginx未正常运行。'
-    fi
-    count=$(jq '[.nodes[]|select(.enabled)]|length' "$STATE")
-    if [[ $(get .components.xray) == true && $count -gt 0 ]]; then
-        warn '应用配置将重启Xray；现有代理连接可能短暂中断。'
-        systemctl enable vpskit-xray.service
-        systemctl restart vpskit-xray.service
-        sleep 0.5
-        systemctl is-active --quiet vpskit-xray.service || die 'Xray启动失败。'
-        local p
-        while read -r p; do
-            ss -Hlnt "sport = :$p" | grep -q . || die "Xray端口$p未监听。"
-        done < <(jq -r '[.nodes[]|select(.enabled)]|unique_by(.entry)[].port' "$STATE")
-    else systemctl disable --now vpskit-xray.service 2>/dev/null || true; fi
-}
-ensure_component() {
-    local c=$1
-    component_ready "$c" || die "组件未安装或程序缺失，请运行: vpskit install $c"
-}
-
-# ACME: stage certs, validate matching key, switch current symlink, then reload.
-acme_run() {
-    "$ACME" --home "$ROOT/acme" --config-home "$ROOT/acme/config" --cert-home "$ROOT/acme/certstore" --no-color "$@"
-}
-site_select() {
-    local dest=$1 _domain _default n=0 d
-    [[ $(get '.sites|length') -gt 0 ]] || die '尚无网站，请先在部署向导添加网站。'
-    _default=$(default_domain)
-    jq -e --arg d "$_default" '.sites[]|select(.domain==$d)' "$STATE" >/dev/null || _default=$(get '.sites[0].domain')
-    while read -r d; do n=$((n+1)); printf '  %s) %s\n' "$n" "$d" >&2; done < <(jq -r '.sites[].domain' "$STATE")
-    while :; do
-        ask _domain '选择网站（域名或编号；回车使用默认）' "$_default"
-        if [[ $_domain =~ ^[0-9]{1,4}$ ]] && ((10#$_domain>0)); then _domain=$(jq -r --argjson n "$((10#$_domain-1))" '.sites[$n].domain // ""' "$STATE"); fi
-        _domain=${_domain,,}
-        if valid_domain "$_domain" && jq -e --arg d "$_domain" '.sites[]|select(.domain==$d)' "$STATE" >/dev/null; then break; fi
-        warn '未找到该网站，请重新输入列表中的域名或编号。'
-    done
-    remember_domain "$_domain"
-    printf -v "$dest" '%s' "$_domain"
-}
-# Read-only preflight: never print tokens, headers, or full API response bodies.
-cf_zone_preflight() {
-    local cf_domain=$1 cf_token=$2 cf_account=$3 cf_candidate cf_header cf_reply cf_codes
-    cf_header=$(mktemp "$WORK/cf-header.XXXXXXXX")
-    cf_reply=$(mktemp "$WORK/cf-reply.XXXXXXXX")
-    chmod 600 "$cf_header" "$cf_reply"
-    printf 'header = "Authorization: Bearer %s"\n' "$cf_token" > "$cf_header"
-    cf_candidate=$cf_domain
-    while [[ $cf_candidate == *.* ]]; do
-        if ! curl --silent --show-error --proto '=https' --connect-timeout 10 --max-time 30 \
-            --max-filesize 1048576 --config "$cf_header" --output "$cf_reply" \
-            "https://api.cloudflare.com/client/v4/zones?name=$cf_candidate&account.id=$cf_account"; then
-            rm -f "$cf_header" "$cf_reply"
-            warn '无法连接Cloudflare API：检查VPS出站HTTPS、DNS和网络。'; return 1
-        fi
-        if ! jq -e '.success==true and (.result|type=="array")' "$cf_reply" >/dev/null 2>&1; then
-            cf_codes=$(jq -r '[.errors[]?.code|tostring]|join(",")' "$cf_reply" 2>/dev/null || true)
-            [[ $cf_codes =~ ^[0-9,]{1,100}$ ]] || cf_codes=unknown
-            rm -f "$cf_header" "$cf_reply"
-            warn "Cloudflare区域查询被拒绝（错误码 $cf_codes）。检查Token有效期、Zone Read权限、授权域名和出口IP限制。"; return 1
-        fi
-        if jq -e --arg d "$cf_candidate" '.result[]|select(.name==$d and (.id|test("^[a-fA-F0-9]{32}$")))' "$cf_reply" >/dev/null; then
-            CF_Zone_ID=$(jq -r --arg d "$cf_candidate" '.result[]|select(.name==$d)|.id' "$cf_reply" | head -1)
-            export CF_Zone_ID
-            rm -f "$cf_header" "$cf_reply"
-            ok "Cloudflare可读取区域：$cf_candidate。预检不写DNS；DNS Edit权限将在ACME实际添加记录时验证。"
-            return 0
-        fi
-        cf_candidate=${cf_candidate#*.}
-    done
-    rm -f "$cf_header" "$cf_reply"
-    warn '当前Token与Account ID查不到该域名区域。资源应授权根域名（例如moglider.com），不是普通子域名；Account ID与Zone ID不能互换。'
-    return 1
-}
-
-dns_credentials() {
-    local provider=$1 domain=${2:-} token='' account='' sid='' skey=''
-    # Credential values are exported only for the ACME process; acme stores them in its private account config.
-    case "$provider" in
-        dns_cf)
-            info '创建Token：Zone / DNS / Edit + Zone / Zone / Read；资源限定为证书域名所属区域。'
-            info '入口：https://dash.cloudflare.com/profile/api-tokens；Account ID取自该网站概览，不是Zone ID。'
-            while :; do
-                required_secret token 'Cloudflare限定区域DNS编辑Token'
-                if [[ ! $token =~ ^[A-Za-z0-9_-]{20,512}$ ]]; then warn 'Token格式异常；只粘贴令牌本身，不要粘贴引号或curl命令。'; continue; fi
-                required_secret account 'Cloudflare Account ID（32位十六进制，非Zone ID）'
-                if [[ ! $account =~ ^[a-fA-F0-9]{32}$ ]]; then warn 'Account ID应为32位十六进制，请重新输入。'; continue; fi
-                if [[ -z $domain ]] || cf_zone_preflight "$domain" "$token" "$account"; then break; fi
-                warn '请修正Cloudflare设置后重新输入；输入:q取消。本次尚未向CA提交签发请求。'
-            done
-            export CF_Token="$token" CF_Account_ID="$account";;
-        dns_dp)
-            required_secret sid 'DNSPod API ID'; required_secret skey 'DNSPod API Key'
-            export DP_Id="$sid" DP_Key="$skey";;
-        *) die '只支持Cloudflare dns_cf及DNSPod dns_dp的自动DNS验证。';;
-    esac
-}
-required_secret() {
-    local rs_dest=$1 rs_label=$2 rs_value
-    while :; do
-        secret rs_value "$rs_label" '必填，输入不回显'
-        if [[ -n $rs_value && $rs_value != *[[:space:]]* ]]; then printf -v "$rs_dest" '%s' "$rs_value"; return 0; fi
-        warn '凭据不能为空或包含空白，请重新输入。'
-    done
-}
-cert_issue() {
-    local domain=${1:-} site challenge email provider
-    ensure_component acme
-    [[ -n $domain ]] || site_select domain
-    site=$(jq -c --arg d "$domain" '.sites[]|select(.domain==$d)' "$STATE")
-    [[ -n $site ]] || die '先添加网站。'
-    challenge=$(jq -r .challenge <<< "$site"); email=$(jq -r .email <<< "$site")
-    local -a args=(--issue --server letsencrypt --keylength ec-256 -d "$domain" --accountemail "$email")
-    if [[ $(jq -r '.cert_settings_pending // false' <<< "$site") == true ]]; then
-        info '证书参数已变更，本次重新签发以使验证方式/泛域名设置生效。'
-        args+=(--force)
-    fi
-    if [[ $(jq -r '.wildcard // false' <<< "$site") == true ]]; then
-        [[ $challenge != http ]] || die '泛域名证书必须使用DNS验证。'
-        args+=(-d "*.$domain")
-    fi
-    if [[ $challenge == http ]]; then
-        args+=(--webroot "$ROOT/www/acme")
-        info "HTTP-01要求 $domain 的公开HTTP验证路径能够到达本机80；可以经CDN转发，不比对A/AAAA是否为VPS地址。"
-    else
-        provider=$challenge
-        dns_credentials "$provider" "$domain"
-        args+=(--dns "$provider")
-    fi
-    # Do not tee ACME's output to management logs (provider errors might contain sensitive context).
-    local issue_rc=0
-    acme_run "${args[@]}" || issue_rc=$?
-    if ((issue_rc != 0 && issue_rc != 2)); then
-        unset CF_Token CF_Account_ID CF_Zone_ID DP_Id DP_Key
-        if [[ $challenge == http ]]; then
-            die 'HTTP-01签发失败，现有证书保留；检查公网80及/.well-known/acme-challenge/回源路径。'
-        else
-            die 'DNS-01签发失败，现有证书保留；检查DNS编辑权限、权威DNS及TXT传播，不需要开放80端口或关闭橙云。'
-        fi
-    fi
-    if ((issue_rc == 2)) && [[ $(jq -r '.cert_settings_pending // false' <<< "$site") == true ]]; then
-        unset CF_Token CF_Account_ID CF_Zone_ID DP_Id DP_Key
-        die 'ACME跳过签发，新验证参数尚未生效；原证书保留，请稍后重试。'
-    fi
-    unset CF_Token CF_Account_ID CF_Zone_ID DP_Id DP_Key
-    mkdir -p "$ROOT/certs/$domain/pending"
-    acme_run --install-cert -d "$domain" --ecc --key-file "$ROOT/certs/$domain/pending/key.pem" \
-        --fullchain-file "$ROOT/certs/$domain/pending/fullchain.pem" --reloadcmd /bin/true
-    begin_tx
-    deploy_cert "$domain"
-    json_update --arg d "$domain" '(.sites[]|select(.domain==$d)|.cert_settings_pending)=false'
-    apply_config
-    commit_tx
-    ok "$domain 证书已部署，日常续期自动运行。"
-}
-deploy_cert() {
-    local d=$1 base="$ROOT/certs/$1" cert key v prev
-    cert="$base/pending/fullchain.pem"; key="$base/pending/key.pem"
-    [[ -s $cert && -s $key ]] || die "$d 缺少待部署证书。"
-    openssl x509 -in "$cert" -noout -checkend 86400 >/dev/null || die '新证书有效期异常。'
-    openssl x509 -in "$cert" -noout -checkhost "$d" >/dev/null || die '证书域名不匹配。'
-    [[ $(openssl x509 -in "$cert" -pubkey -noout | openssl pkey -pubin -outform DER | sha256sum | cut -d' ' -f1) == \
-       $(openssl pkey -in "$key" -pubout -outform DER | sha256sum | cut -d' ' -f1) ]] || die '证书和私钥不匹配。'
-    v="rev-$(date +%s)-$(randhex 4)"
-    mkdir -p "$base/$v"
-    install -m 600 "$cert" "$base/$v/fullchain.pem"
-    install -m 600 "$key" "$base/$v/key.pem"
-    prev=$(readlink "$base/current" || true)
-    ln -s "$v" "$base/current.new"
-    mv -Tf "$base/current.new" "$base/current"
-    json_update --arg d "$d" '(.sites[]|select(.domain==$d)|.issued)=true'
-    [[ -z $prev ]] || info "$d 已切换证书；上次证书保存在回滚快照。"
-    find "$base" -mindepth 1 -maxdepth 1 -type d -name 'rev-*' ! -name "$v" -exec rm -rf -- {} +
-}
-cert_renew() {
-    [[ $(get .components.acme) == true ]] || return 0
-    [[ $(jq '[.sites[]|select(.issued)]|length' "$STATE") -gt 0 ]] || return 0
-    local rc=0 d changed=0
-    if acme_run --cron; then :; else rc=$?; warn "ACME检查返回 $rc，继续核对现有证书。"; fi
-    while read -r d; do
-        if [[ -s $ROOT/certs/$d/pending/fullchain.pem ]] && ! cmp -s "$ROOT/certs/$d/pending/fullchain.pem" "$ROOT/certs/$d/current/fullchain.pem"; then
-            if ((changed == 0)); then begin_tx; fi
-            changed=1; deploy_cert "$d"
-        fi
-    done < <(jq -r '.sites[].domain' "$STATE")
-    if ((changed)); then apply_config; commit_tx; fi
-    cert_status
-    return "$rc"
-}
-cert_status() {
-    local d file bad=0
-    while read -r d; do
-        if jq -e --arg d "$d" '.sites[]|select(.domain==$d and .cert_settings_pending==true)' "$STATE" >/dev/null; then warn "$d 新证书参数待签发，现有证书仍按原方式续期。"; fi
-        file="$ROOT/certs/$d/current/fullchain.pem"
-        if [[ -s $file ]]; then
-            printf '%s: ' "$d"; openssl x509 -in "$file" -noout -enddate
-            if ! openssl x509 -in "$file" -noout -checkend 1209600 >/dev/null; then warn "$d 证书不足14天，请检查续期日志。"; bad=1; fi
-        else warn "$d 尚未部署证书。"; fi
-    done < <(jq -r '.sites[].domain' "$STATE")
-    ((bad == 0))
-}
-site_access_prompt() {
-    local d=$1 current answer old
-    current=$(jq -r --arg d "$d" '[.sites[]|select(.domain==$d)][0].access // empty' "$STATE")
-    [[ -n $current ]] || current=$(get '.preferences.site_access // (if .scheme=="B" then "cloudflare" else "direct" end)')
-    old=$current
-    panel_title '网站 / WS/XHTTP连接方式'
-    menu_item 1 'Cloudflare代理（橙云）' '适用于网站和WS/XHTTP+TLS；公开DNS可以返回Cloudflare IP'
-    menu_item 2 '直连 / 其他反向代理' '不强制DNS解析结果等于VPS；由你保证连接及回源正确'
-    ask_valid answer '连接方式：编号或 cloudflare / direct' "$current" valid_choice '请选择1、2、cloudflare或direct。' '1 2 cloudflare direct'
-    case "$answer" in 1|cloudflare) SITE_ACCESS=cloudflare;; 2|direct) SITE_ACCESS=direct;; esac
-    json_update --arg a "$SITE_ACCESS" '.preferences.site_access=$a | .preferences.access_chosen=true'
-    if [[ $SITE_ACCESS == cloudflare ]]; then
-        if [[ $old != cloudflare ]]; then
-            json_update '.preferences.challenge="dns_cf"'
-        fi
-        info '建议Cloudflare DNS-01：通过TXT验证域名所有权，不要求公开A/AAAA等于当前VPS。'
-        info 'Cloudflare控制台：记录开启橙云；正确设置源站/回源；SSL选择Full (strict)，WebSockets开启。'
-        info 'DNS-01签发不要求开放80，但网站回源443仍须可达。脚本不会自动修改Cloudflare控制台设置。'
-        warn '橙云不保证源站IP绝对隐藏；直连节点、其他DNS记录和历史记录仍可能暴露源站。'
-    else info '仅校验域名格式；不进行“DNS必须解析到本机IPv4/IPv6”的强制检查。'; fi
-}
-certificate_prompt() {
-    local d=$1 existing current answer
-    existing=$(jq -c --arg d "$d" '[.sites[]|select(.domain==$d)][0] // {}' "$STATE")
-    panel_title "证书默认值 · $d"
-    info "签发机构：Let's Encrypt；证书：ECC P-256；自动续期：每小时检查，按到期策略续期。"
-    if [[ $(get .scheme) == A ]]; then info '方案A的REALITY代理不使用此证书；此证书用于你的网站。'
-    else info '方案B的网站与WS/XHTTP代理共用此域名的HTTPS证书。'; fi
-    current=$(jq -r '.email // empty' <<< "$existing"); [[ -n $current ]] || current=$(get '.preferences.email // ""')
-    ask_valid CERT_EMAIL 'ACME联系邮箱' "$current" valid_email '邮箱格式示例：admin@example.com。'
-    json_update --arg v "$CERT_EMAIL" '.preferences.email=$v'
-    current=$(jq -r '.challenge // empty' <<< "$existing"); [[ -n $current ]] || current=$(get '.preferences.challenge // "http"')
-    # Switching an existing site to orange-cloud offers DNS-01 once. Subsequent
-    # visits retain the user's explicit HTTP/DNS choice.
-    if [[ $(get '.preferences.site_access // "direct"') == cloudflare && $(jq -r '.access // "direct"' <<< "$existing") != cloudflare && $(jq -r 'has("domain")' <<< "$existing") == true ]]; then current=dns_cf; fi
-    menu_item 1 'HTTP-01' '公开域名的HTTP验证请求须能到达本机80；可经代理，不比对A/AAAA地址' 
-    menu_item 2 'Cloudflare DNS-01' '适用于使用Cloudflare DNS、泛域名或80端口不可达的情况'
-    menu_item 3 'DNSPod DNS-01' '适用于DNSPod DNS；需要API凭据，可申请泛域名'
-    ask_valid answer '验证方式：编号或 http / dns_cf / dns_dp' "$current" valid_choice '请选择1/2/3或列出的验证方式。' '1 2 3 http dns_cf dns_dp'
-    case "$answer" in 1|http) CERT_CHALLENGE=http;; 2|dns_cf) CERT_CHALLENGE=dns_cf;; 3|dns_dp) CERT_CHALLENGE=dns_dp;; esac
-    json_update --arg v "$CERT_CHALLENGE" '.preferences.challenge=$v'
-    CERT_WILDCARD=false
-    if [[ $CERT_CHALLENGE != http ]]; then
-        current=$(jq -r 'if has("wildcard") then .wildcard else empty end' <<< "$existing")
-        [[ -n $current ]] || current=$(get '.preferences.wildcard // false')
-        if [[ $current == true ]]; then current=yes; else current=no; fi
-        ask_valid answer '同时签发*.当前域名的泛域名证书？yes/no' "$current" valid_choice '请输入yes或no。' 'yes no'
-        [[ $answer != yes ]] || CERT_WILDCARD=true
-    fi
-    json_update --argjson w "$CERT_WILDCARD" '.preferences.wildcard=$w'
-}
-site_content_prompt() {
-    local d=$1 existing current choice target
-    existing=$(jq -c --arg d "$d" '[.sites[]|select(.domain==$d)][0] // {}' "$STATE")
-    current=$(jq -r 'if .kind then .kind elif (.upstream // "")!="" then "proxy" elif .domain then "custom" else "" end' <<< "$existing")
-    [[ -n $current ]] || current=$(get '.preferences.site_kind // "template"')
-    panel_title "网站内容 · https://$d"
-    menu_item 1 '本地轻量网站模板' '欢迎页 / 技术笔记 / 个人博客；无需数据库，适合512MB VPS'
-    menu_item 2 '自己的静态网站' "使用 $ROOT/www/$d 中的index.html；保留已有内容"
-    menu_item 3 '自己的动态网站' '反向代理到本机应用，例如http://127.0.0.1:8000'
-    menu_item 4 '跳转到常用或自定义网站' '浏览器访问时跳转；WS路径仍由本机代理处理，不复制目标网站'
-    ask_valid choice '网站类型：编号或 template / custom / proxy / redirect' "$current" valid_choice '请选择1～4或列出的类型。' '1 2 3 4 template custom proxy redirect'
-    case "$choice" in 1|template) SITE_KIND=template;; 2|custom) SITE_KIND=custom;; 3|proxy) SITE_KIND=proxy;; 4|redirect) SITE_KIND=redirect;; esac
-    SITE_TEMPLATE=welcome; SITE_UPSTREAM=''; SITE_REDIRECT=''
-    json_update --arg k "$SITE_KIND" '.preferences.site_kind=$k'
-    case "$SITE_KIND" in
-        template)
-            current=$(jq -r '.template // empty' <<< "$existing"); [[ -n $current ]] || current=$(get '.preferences.template // "welcome"')
-            menu_item 1 '简洁欢迎页' '显示当前域名与基本介绍'
-            menu_item 2 '技术笔记页' '用于整理文档与学习记录'
-            menu_item 3 '个人博客页' '用于个人介绍和内容入口'
-            ask_valid choice '模板编号或 welcome / notes / blog' "$current" valid_choice '请选择1/2/3或模板名称。' '1 2 3 welcome notes blog'
-            case "$choice" in 1|welcome) SITE_TEMPLATE=welcome;; 2|notes) SITE_TEMPLATE=notes;; 3|blog) SITE_TEMPLATE=blog;; esac
-            json_update --arg v "$SITE_TEMPLATE" '.preferences.template=$v';;
-        proxy)
-            current=$(jq -r '.upstream // empty' <<< "$existing"); [[ -n $current ]] || current=$(get '.preferences.upstream // ""')
-            [[ -n $current ]] || current=http://127.0.0.1:8000
-            ask_valid SITE_UPSTREAM '本机应用地址' "$current" valid_proxy_upstream '请输入http://127.0.0.1:端口，且不能回指80/443。'
-            json_update --arg v "$SITE_UPSTREAM" '.preferences.upstream=$v';;
-        redirect)
-            current=$(jq -r '.redirect // empty' <<< "$existing"); [[ -n $current ]] || current=$(get '.preferences.redirect // "https://www.microsoft.com/"')
-            menu_item 1 'Microsoft' '跳转到https://www.microsoft.com/'
-            menu_item 2 'Wikipedia' '跳转到https://www.wikipedia.org/'
-            menu_item 3 'Bing' '跳转到https://www.bing.com/'
-            menu_item 4 '自定义网址' '使用你指定的HTTPS网站地址'
-            while :; do
-                ask choice '选择编号，或直接输入HTTPS网址（回车使用上次网址）' "$current"
-                case "$choice" in 1) target=https://www.microsoft.com/;; 2) target=https://www.wikipedia.org/;; 3) target=https://www.bing.com/;;
-                    4) ask_valid target '目标HTTPS网址' "$current" valid_redirect '仅允许普通HTTPS域名及URL路径，且不能跳回当前域名。' "$d";; *) target=$choice;; esac
-                if valid_redirect "$target" "$d"; then SITE_REDIRECT=$target; break; fi
-                warn '目标网址无效或会跳回本站，请重新选择。'
-            done
-            json_update --arg v "$SITE_REDIRECT" '.preferences.redirect=$v'
-            info '普通访问会发生HTTP跳转；这不提供REALITY握手伪装，也不保证隐藏代理特征。';;
-    esac
-}
-site_template_file() {
-    local d=$1 kind=$2 template=$3 file title lead
-    mkdir -p "$ROOT/www/$d" "$ROOT/www/acme/.well-known/acme-challenge"
-    case "$kind" in
-        template)
-            case "$template" in welcome) title='欢迎来到这里'; lead='一个分享想法、记录生活与探索新知的地方。';;
-                notes) title='技术与日常笔记'; lead='把值得记录的知识整理下来，让每一次探索都有迹可循。';;
-                blog) title='记录与分享'; lead='关于生活、学习，以及那些值得留下的片刻。';; *) die '模板名称不合法。';; esac
-            file="$ROOT/www/$d/vpskit-$template.html";;
-        custom) file="$ROOT/www/$d/index.html"; title='欢迎访问'; lead='本站内容正在整理，欢迎稍后再来。';;
-        *) return 0;;
-    esac
-    # Never overwrite an existing page, including a template the user customized.
-    [[ ! -e $file && ! -L $file ]] || return 0
-    cat > "$file" <<EOF_PAGE
-<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>$d · $title</title>
-<style>html{color-scheme:light}body{margin:0;background:#f5f7fa;color:#1b2a41;font:16px/1.8 system-ui,sans-serif}main{max-width:760px;margin:9vh auto;padding:32px}header{border-bottom:1px solid #dbe2ea;padding-bottom:20px}small{color:#536b86;letter-spacing:.08em}h1{font-size:clamp(32px,6vw,48px);line-height:1.3}section{background:white;border:1px solid #e2e7ee;border-radius:16px;padding:24px;margin-top:28px}footer{margin-top:40px;color:#65768b;font-size:14px}a{color:#285f9a}</style></head>
-<body><main><header><small>$d</small><h1>$title</h1><p>$lead</p></header><section><h2>关于本站</h2><p>这里将持续更新文章、笔记与个人作品。感谢你的访问。</p></section><footer>$d · 保持好奇，继续探索。</footer></main></body></html>
-EOF_PAGE
-}
-site_apply_preferences() {
-    local domain=$1 exists=false own=false access
-    valid_domain "$domain" || die '网站域名不合法。'
-    access=$(get '.preferences.site_access // "direct"')
-    SITE_KIND=$(get '.preferences.site_kind // "template"'); SITE_TEMPLATE=$(get '.preferences.template // "welcome"')
-    SITE_UPSTREAM=''; SITE_REDIRECT=''
-    [[ $SITE_KIND != proxy ]] || SITE_UPSTREAM=$(get '.preferences.upstream // ""')
-    [[ $SITE_KIND != redirect ]] || SITE_REDIRECT=$(get '.preferences.redirect // ""')
-    CERT_EMAIL=$(get '.preferences.email // ""'); CERT_CHALLENGE=$(get '.preferences.challenge // "http"'); CERT_WILDCARD=$(get '.preferences.wildcard // false')
-    valid_email "$CERT_EMAIL" || die '请先设置证书联系邮箱。'
-    if jq -e --arg d "$domain" '.sites[]|select(.domain==$d)' "$STATE" >/dev/null; then exists=true; fi
-    begin_tx
-    if [[ $exists == false ]]; then
-        if systemctl is-active --quiet vpskit-nginx.service; then own=true; fi
-        check_port 80 "$own"; check_port 443 "$own"
-        json_update --arg d "$domain" '.sites += [{domain:$d,issued:false}]'
-    fi
-    site_template_file "$domain" "$SITE_KIND" "$SITE_TEMPLATE"
-    json_update --arg d "$domain" --arg e "$CERT_EMAIL" --arg c "$CERT_CHALLENGE" --arg u "$SITE_UPSTREAM" --arg r "$SITE_REDIRECT" --arg k "$SITE_KIND" --arg t "$SITE_TEMPLATE" --arg a "$access" --argjson w "$CERT_WILDCARD" '
-        (.sites[]|select(.domain==$d)) |= (. + {cert_settings_pending:((.cert_settings_pending // false) or (.issued==true and (.email!=$e or .challenge!=$c or (.wildcard // false)!=$w))),email:$e,challenge:$c,upstream:$u,redirect:$r,kind:$k,template:$t,access:$a,wildcard:$w}) |
-        if .wizard.domain==$d then .wizard.site_pending=false else . end'
-    apply_config; commit_tx
-}
-site_add() {
-    local domain choice
-    ensure_component nginx; ensure_component acme
-    ask_valid domain '网站域名（小写ASCII/Punycode，不含https://）' "$(default_domain)" valid_domain '域名示例：www.example.com；不能填IP或网址路径。'
-    remember_domain "$domain"
-    if jq -e --arg d "$domain" '.sites[]|select(.domain==$d)' "$STATE" >/dev/null; then
-        info "$domain 已存在，可继续配置或签发证书，不会重复添加。"
-        ask_valid choice '1=使用现有网站并检查证书，2=修改网站配置' 1 valid_choice '请选择1或2。' '1 2'
-        if [[ $choice == 1 ]]; then
-            if certificate_ready "$domain"; then ok '现有网站和证书可用。'; else cert_issue "$domain"; fi
-            return 0
-        fi
-    fi
-    site_access_prompt "$domain"; certificate_prompt "$domain"; site_content_prompt "$domain"
-    site_apply_preferences "$domain"
-    info "网站域名已记住：$domain；内容目录：$ROOT/www/$domain。"
-    if ! certificate_ready "$domain"; then cert_issue "$domain"; fi
-}
-site_edit() {
-    local domain
-    site_select domain
-    info "当前域名：$domain；已有静态文件保留，可在 $ROOT/www/$domain 修改。"
-    # Preserve the site's certificate options while changing only content.
-    local cert_data; cert_data=$(jq -c --arg d "$domain" '.sites[]|select(.domain==$d)|{email,challenge,wildcard:(.wildcard // false)}' "$STATE")
-    json_update --argjson c "$cert_data" '.preferences += $c'
-    site_access_prompt "$domain"
-    # Editing website routing does not silently change active certificate settings.
-    json_update --argjson c "$cert_data" '.preferences += $c'
-    site_content_prompt "$domain"
-    site_apply_preferences "$domain"
-}
-site_certificate_edit() {
-    local domain
-    site_select domain
-    json_update --arg d "$domain" '.preferences.site_access=([.sites[]|select(.domain==$d)][0].access // "direct")'
-    certificate_prompt "$domain"
-    begin_tx
-    json_update --arg d "$domain" --arg e "$CERT_EMAIL" --arg c "$CERT_CHALLENGE" --argjson w "$CERT_WILDCARD" '(.sites[]|select(.domain==$d)) |= (. + {cert_settings_pending:((.cert_settings_pending // false) or (.issued==true and (.email!=$e or .challenge!=$c or (.wildcard // false)!=$w))),email:$e,challenge:$c,wildcard:$w})'
-    commit_tx
-    info '签发偏好已保存。成功重新签发后切换续期验证方式；暂不签发时，现有证书仍按原方式续期。'
-    if confirm '现在按新设置签发证书'; then cert_issue "$domain"; fi
-}
-reality_target_prompt() {
-    local rt_dest=$1 rt_choice rt_value rt_default
-    rt_default=$(get '.preferences.reality_target // "www.microsoft.com"')
-    panel_title 'REALITY握手目标（与自有网站域名分别保存）'
-    menu_item 1 'Microsoft候选' 'www.microsoft.com；将从本VPS测试TLS连接'
-    menu_item 2 'Apple候选' 'www.apple.com；可用性以现场检测为准'
-    menu_item 3 'Cloudflare候选' 'www.cloudflare.com；可用性以现场检测为准'
-    menu_item 4 '自己的HTTPS网站 / 自定义目标' '目标应支持TLS1.3；不会向该域名申请证书'
-    while :; do
-        ask rt_choice '编号或目标域名（回车使用上次目标）' "$rt_default"
-        case "$rt_choice" in 1) rt_value=www.microsoft.com;; 2) rt_value=www.apple.com;; 3) rt_value=www.cloudflare.com;;
-            4) ask_valid rt_value '目标域名/SNI' "$rt_default" valid_domain '请填写域名，不含https://、端口或路径。';; *) rt_value=${rt_choice,,};; esac
-        if valid_domain "$rt_value"; then
-            json_update --arg d "$rt_value" '.preferences.reality_target=$d'
-            printf -v "$rt_dest" '%s' "$rt_value"; return 0
-        fi
-        warn '域名格式错误，请重新选择或输入域名。'
-    done
-}
-
-site_remove() {
-    local domain answer
-    site_select domain
-    jq -e --arg d "$domain" '.nodes[]|select(.domain==$d)' "$STATE" >/dev/null && die '还有节点引用此域名，请先删除这些节点。'
-    confirm "移除 $domain 的站点绑定及续期（网站文件和证书另行选择删除）" || return 0
-    begin_tx
-    if [[ $(get .components.acme) == true ]]; then acme_run --remove -d "$domain" --ecc || die '移除续期记录失败。'; fi
-    json_update --arg d "$domain" '.sites |= map(select(.domain!=$d))'
-    apply_config; commit_tx
-    if confirm "同时永久删除 $domain 的网站内容和证书"; then
-        rm -rf -- "$ROOT/www/$domain" "$ROOT/certs/$domain"
-    else ok '网站内容和证书保留在集中目录。'; fi
-}
-
-node_list() {
-    local index name proto mode host port internal enabled domain state color
-    if [[ $(get '.nodes|length') == 0 ]]; then printf '  暂无节点；选择“添加节点”开始。\n'; return 0; fi
-    while IFS=$'\t' read -r index name proto mode host port internal enabled domain; do
-        color=$DIM; state='停用'; [[ $enabled != true ]] || { color=$GREEN; state='配置启用'; }
-        [[ $host != *:* ]] || host="[$host]"
-        printf '  %s[%s]%s %s%s%s  %s[%s]%s\n' "$BLUE" "$index" "$RESET" "$BOLD" "$name" "$RESET" "$color" "$state" "$RESET"
-        printf '       %s / %s | 连接 %s%s:%s%s | 本机端口 %s | TLS/SNI %s\n' "$proto" "$mode" "$CYAN" "$host" "$port" "$RESET" "$internal" "$domain"
-    done < <(jq -r '.nodes|to_entries[]|.key as $i|.value|[($i+1|tostring),.id,.protocol,(if .mode=="xhttp" then ("XHTTP/"+(.http_version // "h2")+"+TLS") elif .mode=="ws" then "WS+TLS" elif .mode=="ws-plain" then "WS(无TLS)" elif .mode=="tls" then "TCP+TLS" elif .mode=="reality" then "REALITY" else "TCP/UDP" end),.host,(if (.mode=="ws" or .mode=="xhttp") then "443" else (.port|tostring) end),(.port|tostring),(.enabled|tostring),(if .mode=="reality" then .sni elif (.domain // "")!="" then .domain else "-" end)]|@tsv' "$STATE")
-    printf '  %s序号按当前列表排列；删除节点后会重新编号。启用状态不等于公网连通。%s\n' "$DIM" "$RESET"
-}
-valid_node_index() {
-    [[ $1 =~ ^[0-9]{1,6}$ ]] || return 1
-    ((10#$1>=1 && 10#$1<=$(get '.nodes|length')))
-}
-node_select() {
-    local ns_dest=$1 ns_name=${2:-} ns_index
-    [[ $(get '.nodes|length') -gt 0 ]] || die '尚无节点，请先添加节点。'
-    if [[ -z $ns_name ]]; then
-        node_list >&2
-        ask_valid ns_index '选择节点序号（输入:q取消）' '' valid_node_index '请输入当前列表内的有效序号。'
-        ns_name=$(jq -r --argjson i "$((10#$ns_index-1))" '.nodes[$i].id' "$STATE")
-    elif ! valid_existing_node "$ns_name"; then
-        # CLI keeps old names working. Numeric existing names have precedence.
-        valid_node_index "$ns_name" || die '指定节点名称或序号不存在。'
-        ns_name=$(jq -r --argjson i "$((10#$ns_name-1))" '.nodes[$i].id' "$STATE")
-    fi
-    info "已选择节点：$ns_name"
-    printf -v "$ns_dest" '%s' "$ns_name"
-}
-node_share_select() {
-    local sh_dest=$1 sh_index sh_name
-    node_list >&2
-    while :; do
-        ask sh_index '复用入口：输入节点序号；0=新建独立入口' 0
-        if [[ $sh_index == 0 ]]; then printf -v "$sh_dest" '%s' ''; return 0; fi
-        if valid_node_index "$sh_index"; then
-            sh_name=$(jq -r --argjson i "$((10#$sh_index-1))" '.nodes[$i].id' "$STATE")
-            if valid_share_node "$sh_name"; then printf -v "$sh_dest" '%s' "$sh_name"; return 0; fi
-        fi
-        warn '序号无效或该节点为Shadowsocks（需独立入口），请重新选择。'
-    done
-}
-node_endpoint_prompt() {
-    local ep_dest=$1 ep_mode=$2 ep_domain=$3 ep_default=$4 ep_value access
-    if [[ $ep_mode == ws || $ep_mode == xhttp || $ep_mode == tls ]]; then
-        info "连接地址与证书域名分开设置：TLS SNI/HTTP Host仍使用 $ep_domain。"
-        ask_valid ep_value '客户端连接地址：域名、IPv4或IPv6（IPv6不加方括号）' "$ep_default" valid_host '请输入有效域名或IP，不含https://、端口或路径。'
-        access=$(jq -r --arg d "$ep_domain" '[.sites[]|select(.domain==$d)][0].access // "direct"' "$STATE")
-        if [[ $access == cloudflare ]]; then
-            if ! valid_domain "$ep_value"; then warn '自定义IP会写入客户端链接；若填写源站IP，将绕过Cloudflare并暴露该IP。'; fi
-            [[ $ep_mode != tls ]] || warn '独立TCP+TLS不能通过Cloudflare普通橙云代理，请使用源站IP/直连域名，或改为XHTTP+TLS。'
-        fi
-    else
-        ask_valid ep_value '客户端连接地址：VPS IPv4、IPv6或直连域名' "$ep_default" valid_host '请输入有效IP或域名，不含端口、路径或IPv6方括号。'
-        info '当前传输需要直连；Cloudflare普通橙云不能代理此独立TCP/UDP入口。'
-    fi
-    printf -v "$ep_dest" '%s' "$ep_value"
-}
-choose_credential() {
-    local cc_dest=$1 cc_protocol=$2 cc_method=${3:-} cc_except=${4:-} cc_value='' cc_length cc_wanted
-    while :; do
-        case "$cc_protocol" in
-            vless|vmess)
-                ask_valid cc_value 'UUID（回车使用随机默认值）' "$(new_uuid)" valid_uuid 'UUID应为8-4-4-4-12格式的十六进制字符。'
-                cc_value=${cc_value,,};;
-            shadowsocks)
-                secret cc_value "Shadowsocks密码；$cc_method"
-                if [[ -z $cc_value ]]; then
-                    case "$cc_method" in 2022-blake3-aes-128-gcm) cc_value=$(openssl rand -base64 16);; 2022-*) cc_value=$(openssl rand -base64 32);; *) cc_value=$(randhex 24);; esac
-                fi
-                if [[ $cc_method == 2022-* ]]; then
-                    cc_wanted=32; [[ $cc_method != 2022-blake3-aes-128-gcm ]] || cc_wanted=16
-                    if ! cc_length=$(printf '%s' "$cc_value" | base64 -d 2>/dev/null | wc -c); then
-                        warn 'SS2022需要有效的Base64密钥，请重新输入，或回车自动生成。'; continue
-                    fi
-                    if [[ $cc_length != "$cc_wanted" ]]; then
-                        warn "此方法需要Base64编码的${cc_wanted}字节密钥，请重新输入，或回车自动生成。"; continue
-                    fi
-                fi;;
-            trojan) secret cc_value 'Trojan密码'; [[ -n $cc_value ]] || cc_value=$(randhex 24);;
-            *) die '不支持的协议。';;
-        esac
-        if [[ ${#cc_value} -lt 8 || ${#cc_value} -gt 256 || $cc_value == *$'\n'* || $cc_value == *$'\r'* ]]; then
-            warn '凭据必须为8～256个字符且不能换行，请重新输入。'; continue
-        fi
-        if jq -e --arg c "$cc_value" --arg n "$cc_except" '.nodes[]|select(.id!=$n and .credential==$c)' "$STATE" >/dev/null; then
-            warn '凭据已被其他节点使用，请重新输入。'; continue
-        fi
-        printf -v "$cc_dest" '%s' "$cc_value"; return 0
-    done
-}
-ipv6_available() { [[ -r /proc/sys/net/ipv6/conf/all/disable_ipv6 && $(cat /proc/sys/net/ipv6/conf/all/disable_ipv6) == 0 ]]; }
-node_listen_prompt() {
-    local nl_dest=$1 nl_host=$2 nl_default=${3:-0.0.0.0} nl_value
-    while :; do
-        ask_valid nl_value '监听地址：0.0.0.0（IPv4）或 ::（IPv4/IPv6，需系统支持）' "$nl_default" valid_choice '请输入0.0.0.0或::。' '0.0.0.0 ::'
-        if [[ $nl_value == :: ]] && ! ipv6_available; then warn '系统IPv6已禁用；请先启用IPv6，或输入:q取消并改用IPv4地址。'; continue; fi
-        if [[ $nl_host == *:* && $nl_value != :: ]]; then warn 'IPv6直连地址需要::监听；请重新选择或:q取消。'; continue; fi
-        printf -v "$nl_dest" '%s' "$nl_value"; return 0
-    done
-}
-# XHTTP packet-up supports H2 at Nginx and H3 at Cloudflare's edge.
-# No QUIC listener is installed on the VPS; H3 is explicitly opt-in.
-xhttp_require_nginx() {
-    local build
-    build=$("$NGINX" -V 2>&1) || die '无法读取Nginx编译信息。'
-    [[ $build == *--with-http_v2_module* ]] || die 'XHTTP H2需要Nginx http_v2模块；请先在更新菜单更新Nginx，旧节点保持不变。'
-}
-xhttp_choose_version() {
-    local xv_dest=$1 xv_domain=$2 xv_host=$3 xv_value xv_default=${4:-h2} xv_access
-    xhttp_require_nginx
-    xv_access=$(jq -r --arg d "$xv_domain" '.sites[]|select(.domain==$d)|.access // "direct"' "$STATE")
-    while :; do
-        info 'H2：默认，直连/Cloudflare均可；H3：仅客户端→Cloudflare，源站仍TCP443。'
-        ask_valid xv_value 'XHTTP HTTP版本：h2 / h3' "$xv_default" valid_choice '请输入h2或h3。' 'h2 h3'
-        if [[ $xv_value == h3 ]]; then
-            if [[ $xv_access != cloudflare || $xv_host != "$xv_domain" ]]; then
-                warn 'H3要求网站连接方式为Cloudflare，节点连接地址必须等于网站域名；请先配置橙云，或选择h2。'
-                xv_default=h2; continue
-            fi
-            warn '请在Cloudflare开启HTTP/3，确认橙云和边缘证书有效；客户端须支持XHTTP及出站UDP443。'
-            warn '脚本不会自动修改Cloudflare开关，也不能仅凭设置证明H3公网可达；失败时可切回H2。'
-            confirm '确认以上条件，生成仅使用H3的客户端参数' || { xv_default=h2; continue; }
-        fi
-        printf -v "$xv_dest" '%s' "$xv_value"; return 0
-    done
-}
-node_migrate_xhttp() {
-    ensure_component xray; ensure_component nginx
-    local source=${1:-} n domain host name port path credential hv entry
-    node_select source "$source"
-    n=$(jq -c --arg n "$source" '.nodes[]|select(.id==$n)' "$STATE")
-    domain=$(jq -r '.domain // ""' <<< "$n")
-    if ! certificate_good "$domain"; then
-        info '原节点没有可复用的网站证书，请选择一个已签发证书的网站。'
-        site_select domain
-        certificate_good "$domain" || die '请先为此网站签发证书，再迁移节点。'
-    fi
-    host=$(jq -r '.host' <<< "$n")
-    node_endpoint_prompt host xhttp "$domain" "$host"
-    ask_valid name '新XHTTP节点名称（原节点保留）' "xhttp-$(randhex 3)" valid_new_node_name '名称须合法且不能重名。'
-    ask_node_port port '新节点本机端口（客户端连接443）' "$(next_port 20000)"
-    ask_valid path '新XHTTP路径' "/$(randhex 12)" valid_new_ws_path '路径须/开头且后接8～80个字母/数字/横线/下划线，不得重名。' "$domain"
-    xhttp_choose_version hv "$domain" "$host"
-    choose_credential credential vless ''
-    info "将创建 $name：VLESS + XHTTP/$hv + TLS；原节点 $source 和同入口其他用户均保留。"
-    confirm '客户端支持XHTTP，开始创建兼容升级节点' || return 0
-    entry="in-$(randhex 6)"
-    begin_tx; check_port "$port"
-    json_update --arg n "$name" --arg e "$entry" --arg d "$domain" --arg h "$host" --arg p "$path" --arg c "$credential" --arg v "$hv" --argjson port "$port" \
-      '.nodes += [{id:$n,entry:$e,protocol:"vless",mode:"xhttp",http_version:$v,port:$port,domain:$d,path:$p,method:"",credential:$c,host:$h,listen:"127.0.0.1",target:"",sni:"",privateKey:"",publicKey:"",shortId:"",enabled:true}]'
-    apply_config; commit_tx
-    ok '新节点已创建；请导入客户端测试，确认后再按序号停用旧节点。Cloudflare缓存/WAF规则需同步更新路径前缀。'
-    node_export "$name"
-}
-node_xhttp_version() {
-    local name=${1:-} n hv entry
-    node_select name "$name"
-    n=$(jq -c --arg n "$name" '.nodes[]|select(.id==$n)' "$STATE")
-    [[ $(jq -r .mode <<< "$n") == xhttp ]] || die '此节点不是XHTTP；请先使用兼容升级选项。'
-    xhttp_choose_version hv "$(jq -r .domain <<< "$n")" "$(jq -r .host <<< "$n")" "$(jq -r '.http_version // "h2"' <<< "$n")"
-    entry=$(jq -r .entry <<< "$n")
-    begin_tx
-    json_update --arg e "$entry" --arg v "$hv" '(.nodes[]|select(.entry==$e)|.http_version)=$v'
-    apply_config; commit_tx
-    ok '同入口客户端导出参数已更新；已导入客户端需重新导入，不会自动切换。'
-    node_export "$name"
-}
-node_xhttp_json() {
-    local name=${1:-}
-    node_select name "$name"
-    jq -e --arg n "$name" '.nodes[]|select(.id==$n and .mode=="xhttp")' "$STATE" >/dev/null || die '此节点不是XHTTP。'
-    warn '以下JSON含UUID；本地SOCKS监听127.0.0.1:10808，请勿公开。仅客户端使用，不要覆盖服务端配置。'
-    jq --arg n "$name" '.nodes[]|select(.id==$n)|. as $n|
-      {log:{loglevel:"warning"},inbounds:[{listen:"127.0.0.1",port:10808,protocol:"socks",settings:{auth:"noauth",udp:true}}],
-       outbounds:[{tag:"proxy",protocol:"vless",settings:{vnext:[{address:$n.host,port:443,users:[{id:$n.credential,encryption:"none"}]}]},
-       streamSettings:{network:"xhttp",security:"tls",tlsSettings:{serverName:$n.domain,alpn:[($n.http_version // "h2")],allowInsecure:false},
-         xhttpSettings:{host:$n.domain,path:($n.path+"/"),mode:"packet-up"}}}]}' "$STATE"
-}
-
-node_add() {
-    ensure_component xray
-    local guided=${1:-no} name proto mode share='' entry port domain='' path='' method='' credential='' host listen target='' sni='' pk='' pub='' sid='' keys template http_version=''
-    ask_valid name '节点名称（英文/数字/下划线/横线）' "node-$(randhex 3)" valid_new_node_name '名称须为1～48个英文、数字、下划线或横线，且不能重名。'
-    if [[ $guided != guided ]]; then
-        node_share_select share
-    fi
-    if [[ -n $share ]]; then
-        node_select share "$share"
-        template=$(jq -c --arg n "$share" '.nodes[]|select(.id==$n)' "$STATE")
-        proto=$(jq -r .protocol <<< "$template"); method=$(jq -r .method <<< "$template")
-        [[ $proto != shadowsocks ]] || die 'Shadowsocks在本版本中每入口一个凭据；请新增独立端口。'
-        choose_credential credential "$proto" "$method"
-        begin_tx
-        json_update --argjson t "$template" --arg n "$name" --arg c "$credential" '.nodes += [$t|.id=$n|.credential=$c|.enabled=true]'
-    else
-        if [[ $guided == guided && $(get .scheme) == A ]]; then
-            proto=vless; mode=reality
-            info '沿用方案A：VLESS + REALITY + Vision。'
-        else
-            panel_title '选择代理协议'
-            menu_item 1 'VLESS（默认）' '推荐XHTTP+TLS；也支持REALITY和兼容传输'
-            menu_item 2 'VMess（旧版兼容）' 'Xray弃用提示；建议新客户端使用VLESS'
-            menu_item 3 'Trojan（旧版兼容）' 'Xray弃用提示；建议新客户端使用VLESS'
-            local choices='1 2 3 vless vmess trojan' default_proto
-            default_proto=vless
-            if [[ $guided != guided ]]; then
-                menu_item 4 'Shadowsocks' '独立TCP/UDP端口；AEAD或2022方法'
-                choices+=' 4 ss shadowsocks'
-            elif [[ $default_proto == shadowsocks ]]; then default_proto=vless; fi
-            ask_valid proto '协议编号或名称' "$default_proto" valid_choice '请选择列出的协议编号或名称。' "$choices"
-            case "$proto" in 1) proto=vless;; 2) proto=vmess;; 3) proto=trojan;; 4|ss) proto=shadowsocks;; esac
-            json_update --arg p "$proto" '.preferences.protocol=$p'
-            if [[ $guided == guided ]]; then
-                if [[ $proto == vless ]]; then mode=xhttp; info '沿用方案B：VLESS + XHTTP + TLS，默认H2，共用443。'
-                else mode=ws; warn '已明确选择旧协议兼容节点，将使用WS+TLS并可能显示弃用警告。'; fi
-            elif [[ $proto == shadowsocks ]]; then mode=ss
-            else
-                local default=1 mode_choices='1 2 ws wss ws-tls tls'
-                if [[ $proto == vless ]]; then default=5; mode_choices+=' 5 xhttp'; fi
-                [[ $(get .scheme) != A || $proto != vless ]] || default=3
-                panel_title '选择传输方式（WS是传输层，不是独立代理协议）'
-                [[ $proto != vless ]] || menu_item 5 'XHTTP + TLS（推荐）' 'H2直连/CDN；H3经Cloudflare；需要域名、Nginx和证书'
-                menu_item 1 'WS + TLS（旧版兼容）' '仍可使用；Xray可能打印弃用警告'
-                menu_item 2 'TCP + TLS' '独立公网端口；需要域名和证书'
-                if [[ $proto == vless ]]; then menu_item 3 'TCP + REALITY' '独立端口，不需要自己的代理证书'; mode_choices+=' 3 reality'; fi
-                if [[ $proto == vmess ]]; then menu_item 4 'WS（无外层TLS）' 'VMess AEAD；独立端口，无HTTPS外观'; mode_choices+=' 4 ws-plain'; fi
-                ask_valid mode '传输编号或名称' "$default" valid_choice '此协议不支持该传输，请从当前列表重新选择。' "$mode_choices"
-                case "$mode" in 1|wss|ws-tls) mode=ws;; 2) mode=tls;; 3) mode=reality;; 4) mode=ws-plain;; 5) mode=xhttp;; esac
-            fi
-        fi
-        if [[ $mode == ws-plain ]]; then
-            warn '独立WS没有外层TLS和HTTPS伪装；VMess必须使用AEAD客户端，导出链接启用auto加密。VLESS/Trojan不提供明文WS。'
-            confirm '选择VMess独立WS；通常建议改用选项1 WS+TLS' || return 0
-        fi
-        if [[ $mode == ws || $mode == xhttp || $mode == tls ]]; then
-            ensure_component nginx
-            if [[ $guided == guided ]]; then
-                domain=$(get '.wizard.domain // ""')
-                certificate_good "$domain" || die '当前方案域名的证书未就绪，请先继续部署向导完成证书签发。'
-                info "沿用网站与证书域名：$domain"
-            else
-                [[ $(get '[.sites[]|select(.issued)]|length') -gt 0 ]] || die '尚无已签发证书的网站，请先添加网站并签发证书。'
-                while :; do
-                    site_select domain
-                    if certificate_good "$domain"; then break; fi
-                    warn '此网站证书未就绪，请重新选择其他网站，或输入 :q 返回证书管理。'
-                done
-            fi
-            node_endpoint_prompt host "$mode" "$domain" "$domain"
-        elif [[ $guided == guided ]]; then
-            host=$(get .host); info "沿用连接地址：$host"
-        else
-            node_endpoint_prompt host "$mode" "$domain" "$(get .host)"
-            json_update --arg h "$host" '.host=$h'
-            if valid_domain "$host"; then remember_domain "$host"; fi
-        fi
-        if [[ $mode == ws || $mode == xhttp ]]; then
-            ask_node_port port 'Xray本机端口，客户端仍连接网站443' "$(next_port 20000)"
-            ask_valid path '代理路径（至少8个字母/数字/横线/下划线）' "/$(randhex 12)" valid_new_ws_path '路径须以/开头，后接8～80个允许字符，且当前网站尚未使用。' "$domain"
-            listen=127.0.0.1
-        else
-            local start=8443
-            [[ $proto != shadowsocks ]] || start=8388
-            ask_node_port port '公网代理端口（避开网站80/443和SSH）' "$(next_port "$start")"
-            listen=0.0.0.0
-            if ipv6_available; then listen='::'; fi
-            node_listen_prompt listen "$host" "$listen"
-        fi
-        if [[ $mode == ws-plain ]]; then
-            ask_valid path '独立WebSocket路径（至少8个字母/数字/横线/下划线）' "/$(randhex 12)" valid_ws_path '路径须以/开头，后接8～80个字母、数字、横线或下划线。'
-        fi
-        if [[ $mode == reality ]]; then
-            local -a tls_flags=()
-            local tls_help; tls_help=$(openssl s_client -help 2>&1 || true)
-            if [[ $tls_help == *'-tls1_3'* ]]; then tls_flags=(-tls1_3)
-            else warn '此OpenSSL不支持TLS1.3预检，仅检查证书和连通性；目标TLS1.3能力需另行确认。'; fi
-            while :; do
-                reality_target_prompt sni; target="$sni:443"
-                info '检查目标TLS连接及证书；失败后可重选目标。'
-                if timeout 15 openssl s_client -connect "$target" -servername "$sni" "${tls_flags[@]}" -alpn h2 -verify_return_error -verify_hostname "$sni" </dev/null > "$WORK/target-check.log" 2>&1; then break; fi
-                warn '目标TLS检查失败；请更换目标，或输入 :q 取消。已填节点参数保留到本次输入结束。'
-            done
-            keys=$("$XRAY" x25519)
-            pk=$(printf '%s\n' "$keys" | awk -F': *' '/PrivateKey|Private key/{print $2;exit}')
-            pub=$(printf '%s\n' "$keys" | awk -F': *' '/PublicKey|Public key|Password/{print $2;exit}')
-            [[ $pk =~ ^[A-Za-z0-9_-]{43}$ && $pub =~ ^[A-Za-z0-9_-]{43}$ ]] || die '无法解析当前Xray密钥输出。'
-            sid=$(randhex 8)
-        fi
-        if [[ $proto == shadowsocks ]]; then
-            ask_valid method 'Shadowsocks加密方法' 2022-blake3-aes-128-gcm valid_choice '支持aes-128-gcm、aes-256-gcm、chacha20-ietf-poly1305、2022-blake3-aes-128-gcm、2022-blake3-aes-256-gcm。' 'aes-128-gcm aes-256-gcm chacha20-ietf-poly1305 2022-blake3-aes-128-gcm 2022-blake3-aes-256-gcm'
-            warn 'Shadowsocks已加密，但没有REALITY/HTTPS外观；端口须放行TCP和UDP。'
-        fi
-        if [[ $mode == xhttp ]]; then xhttp_choose_version http_version "$domain" "$host"; fi
-        choose_credential credential "$proto" "$method"
-        entry="in-$(randhex 6)"
-        begin_tx
-        check_port "$port"
-        json_update --arg id "$name" --arg entry "$entry" --arg protocol "$proto" --arg mode "$mode" \
-          --argjson port "$port" --arg domain "$domain" --arg path "$path" --arg method "$method" --arg credential "$credential" \
-          --arg host "$host" --arg listen "$listen" --arg target "$target" --arg sni "$sni" --arg pk "$pk" --arg pub "$pub" --arg sid "$sid" \
-          '.nodes += [{id:$id,entry:$entry,protocol:$protocol,mode:$mode,port:$port,domain:$domain,path:$path,method:$method,credential:$credential,host:$host,listen:$listen,target:$target,sni:$sni,privateKey:$pk,publicKey:$pub,shortId:$sid,enabled:true}]'
-    fi
-    if [[ ${mode:-} == xhttp && -n ${http_version:-} ]]; then
-        json_update --arg n "$name" --arg h "$http_version" '(.nodes[]|select(.id==$n)|.http_version)=$h'
-    fi
-    apply_config; commit_tx
-    ok "节点 $name 已添加。请用 vpskit firewall sync 放行系统防火墙端口；云安全组需另行设置。"
-    node_export "$name"
-}
-node_export() {
-    local name=${1:-} n host displayhost port mode proto encoded label path sni key sid credential method
-    node_select name "$name"
-    n=$(jq -c --arg n "$name" '.nodes[]|select(.id==$n)' "$STATE")
-    host=$(jq -r .host <<< "$n"); port=$(jq -r .port <<< "$n"); mode=$(jq -r .mode <<< "$n"); proto=$(jq -r .protocol <<< "$n")
-    credential=$(jq -r .credential <<< "$n"); label=$(jq -rn --arg v "$name" '$v|@uri')
-    displayhost=$host; [[ $host != *:* ]] || displayhost="[$host]"
-    [[ $mode != ws && $mode != xhttp ]] || port=443
-    path=$(jq -r .path <<< "$n"); sni=$(jq -r '.domain' <<< "$n")
-    warn '以下链接含访问凭据，请勿公开或粘贴到公共日志。'
-    case "$proto" in
-        vmess)
-            encoded=$(jq -cn --arg ps "$name" --arg add "$host" --arg port "$port" --arg id "$credential" --arg mode "$mode" --arg path "$path" --arg sni "$sni" \
-              '{v:"2",ps:$ps,add:$add,port:$port,id:$id,aid:"0",scy:"auto",net:(if ($mode=="ws" or $mode=="ws-plain") then "ws" else "tcp" end),type:"none",host:$sni,path:$path,tls:(if $mode=="ws-plain" then "" else "tls" end),sni:$sni}' | base64 -w0)
-            printf 'vmess://%s\n' "$encoded";;
-        vless|trojan)
-            local query
-            if [[ $mode == reality ]]; then
-                sni=$(jq -r .sni <<< "$n"); key=$(jq -r .publicKey <<< "$n"); sid=$(jq -r .shortId <<< "$n")
-                query="security=reality&type=tcp&flow=xtls-rprx-vision&sni=$sni&fp=chrome&pbk=$key&sid=$sid"
-            elif [[ $mode == xhttp ]]; then
-                local hv
-                hv=$(jq -r '.http_version // "h2"' <<< "$n")
-                path=$(jq -rn --arg v "$path/" '$v|@uri')
-                query="security=tls&type=xhttp&sni=$sni&host=$sni&path=$path&mode=packet-up&alpn=$hv"
-            elif [[ $mode == ws ]]; then
-                path=$(jq -rn --arg v "$path" '$v|@uri')
-                query="security=tls&type=ws&sni=$sni&host=$sni&path=$path"
-            else query="security=tls&type=tcp&sni=$sni"; fi
-            [[ $proto != vless ]] || query="encryption=none&$query"
-            credential=$(jq -rn --arg v "$credential" '$v|@uri')
-            printf '%s://%s@%s:%s?%s#%s\n' "$proto" "$credential" "$displayhost" "$port" "$query" "$label";;
-        shadowsocks)
-            method=$(jq -r .method <<< "$n")
-            encoded=$(printf '%s:%s' "$method" "$credential" | base64 -w0 | tr '+/' '-_' | tr -d '=')
-            printf 'ss://%s@%s:%s#%s\n' "$encoded" "$displayhost" "$port" "$label";;
-    esac
-}
-node_action() {
-    local action=$1 name=${2:-} entry credential proto method port old newname mode domain host listen
-    node_select name "$name"
-    entry=$(jq -r --arg n "$name" '.nodes[]|select(.id==$n)|.entry' "$STATE")
-    case "$action" in
-        address)
-            mode=$(jq -r --arg n "$name" '.nodes[]|select(.id==$n)|.mode' "$STATE")
-            domain=$(jq -r --arg n "$name" '.nodes[]|select(.id==$n)|.domain' "$STATE")
-            old=$(jq -r --arg n "$name" '.nodes[]|select(.id==$n)|.host' "$STATE")
-            node_endpoint_prompt host "$mode" "$domain" "$old"
-            [[ $host != "$old" ]] || { ok '连接地址未变更。'; return 0; }
-            listen=$(jq -r --arg n "$name" '.nodes[]|select(.id==$n)|.listen' "$STATE")
-            if [[ $mode != ws && $mode != xhttp && $host == *:* && $listen != :: ]]; then
-                info '改为IPv6直连，需要同步调整共享入口的监听地址。'
-                node_listen_prompt listen "$host" ::
-            fi
-            info '同入口所有用户一起更新连接地址；证书域名/SNI、UUID和端口保留。'
-            begin_tx
-            json_update --arg e "$entry" --arg h "$host" --arg l "$listen" '(.nodes[]|select(.entry==$e)) |= (. + {host:$h,listen:$l})';;
-        rename)
-            ask_valid newname '新的节点名称' "$name" valid_new_node_name '名称格式不合法或与其他节点重名，请输入1～48个英文、数字、下划线或横线。' "$name"
-            [[ $newname != "$name" ]] || return 0
-            begin_tx
-            json_update --arg old "$name" --arg new "$newname" '(.nodes[]|select(.id==$old)|.id)=$new'
-            name=$newname;;
-        delete)
-            confirm "删除节点 $name 的凭据（其他共享用户保留）" || return 0
-            begin_tx; json_update --arg n "$name" '.nodes |= map(select(.id!=$n))';;
-        enable|disable)
-            begin_tx
-            if [[ $action == enable ]]; then
-                port=$(jq -r --arg n "$name" '.nodes[]|select(.id==$n)|.port' "$STATE")
-                if ! jq -e --arg e "$entry" '.nodes[]|select(.entry==$e and .enabled)' "$STATE" >/dev/null; then check_port "$port"; fi
-            fi
-            json_update --arg n "$name" --argjson enabled "$([[ $action == enable ]] && echo true || echo false)" '(.nodes[]|select(.id==$n)|.enabled)=$enabled';;
-        edit)
-            proto=$(jq -r --arg n "$name" '.nodes[]|select(.id==$n)|.protocol' "$STATE")
-            method=$(jq -r --arg n "$name" '.nodes[]|select(.id==$n)|.method' "$STATE")
-            choose_credential credential "$proto" "$method" "$name"
-            begin_tx; json_update --arg n "$name" --arg c "$credential" '(.nodes[]|select(.id==$n)|.credential)=$c';;
-        port)
-            old=$(jq -r --arg n "$name" '.nodes[]|select(.id==$n)|.port' "$STATE")
-            ask_node_port port '新的入口端口（同入口所有用户一起修改；WS/XHTTP仅修改内部端口）' "$old" "$entry"
-            [[ $port != "$old" ]] || { ok '端口未变更。'; return 0; }
-            begin_tx; check_port "$port"
-            json_update --arg e "$entry" --argjson p "$port" '(.nodes[]|select(.entry==$e)|.port)=$p';;
-        *) die '未知节点操作。';;
-    esac
-    apply_config; commit_tx
-    ok "节点操作完成: $action $name"
-    if [[ $action == edit || $action == port || $action == address ]]; then node_export "$name"; fi
-}
-
-explain() {
-    cat <<'EOF'
-A：VLESS+REALITY+Vision直连（默认8443），网站单独使用80/443。
-   代理不需要自有域名；网站仍需要域名和证书。
-B：默认VLESS + XHTTP + TLS H2，经Nginx共用网站443；H3可选经Cloudflare。
-   需要有效证书和可达的域名/指定IP；支持Cloudflare橙云，不要求公开DNS等于VPS IP。
-额外：上述三个协议可选独立TCP+TLS；Shadowsocks使用独立TCP+UDP端口。
-VMess还可选独立WS（无外层TLS），仍使用VMess AEAD加密，但不伪装成HTTPS。
-XHTTP采用packet-up兼容回源；H3只用于客户端到Cloudflare，不要求VPS开放UDP443。
-WS/VMess/Trojan保留为旧客户端兼容选项；迁移先新增测试，旧节点不会自动删除。
-只启动一个Xray进程。A/B是新建节点的默认模式，允许明确选择其他支持的组合。
-TLS/REALITY降低内容暴露，但不保证匿名、无法识别或永久可用。
-本工具提供UFW/firewalld端口菜单；只按明确选择修改。云安全组需单独管理，不创建账户、不修改SSH配置。
-服务按当前提升权限后的root账户运行，网站默认仅静态文件。
-EOF
-}
-install_component() {
-    local c=$1
-    case "$c" in xray|nginx|acme);; *) die '组件名必须为xray/nginx/acme。';; esac
-    if component_ready "$c"; then ok "$c 已安装，更新请用 update。"; return 0; fi
-    begin_tx
-    if [[ $c == nginx ]]; then
-        local own=false
-        if systemctl is-active --quiet vpskit-nginx.service; then own=true; fi
-        check_port 80 "$own"; check_port 443 "$own"
-    fi
-    "install_$c"
-    apply_config
+    cf_fetch
+    begin_tx edge-refresh; cf_install_assets
+    if component_ready nginx; then apply_config web; fi
     commit_tx
 }
-inspect_existing() {
-    local service location
-    for service in xray.service v2ray.service nginx.service x-ui.service; do
-        location=$(systemctl show -p FragmentPath --value "$service" 2>/dev/null || true)
-        if [[ -n $location ]]; then
-            warn "发现非本工具服务: $service ($location)，保留；若端口冲突将单独处理。"
-        fi
-    done
-    info "本工具残留检查完成；仅自动清理 $ROOT/tmp 中的暂存文件并恢复未完成事务。"
+edge_edit() {
+    local d key value s; site_select d
+    edge_show "$d"
+    ask_valid key '参数：bots/rate/burst/connections/kbps/static_ttl/gzip/origin/aop' rate choice 'bots rate burst connections kbps static_ttl gzip origin aop'
+    s=$(jq -c --arg d "$d" '.sites[]|select(.domain==$d)' "$STATE")
+    ask value "设置$key" "$(edge_settings "$s" | jq -r --arg k "$key" '.[$k]')"
+    edge_set "$d" "$key" "$value"
 }
-configure_wizard() {
-    local scheme website host domain current
-    explain
-    ask_valid scheme '部署方案 A / B（回车保留上次选择）' "$(get '.scheme // "A"')" valid_scheme '方案只能为A或B。'
-    scheme=${scheme^^}
-    json_update --arg s "$scheme" '.scheme=$s | .wizard.selected=true | .wizard.defaults_ready=false'
-    if [[ $(get '.preferences.access_chosen // false') != true && $(get '.sites|length') == 0 ]]; then
-        json_update --arg s "$scheme" '.preferences.site_access=(if $s=="B" then "cloudflare" else "direct" end) | .preferences.challenge=(if $s=="B" then "dns_cf" else "http" end)'
+performance_gzip() {
+    local value=${1:-}
+    [[ -n $value ]] || ask_valid value '全局网站压缩（仅未单独覆盖的网站；代理节点始终不压缩）' "$(get '.performance.gzip // false')" valid_bool
+    valid_bool "$value" || die '开关必须为true/false。'
+    confirm "网站gzip=$value" || return 0
+    begin_tx performance; json_update --argjson v "$value" '.performance.gzip=$v'; apply_config web; commit_tx
+}
+
+wizard_step() { json_update --arg step "$1" '.wizard.last_step=$step|.wizard.last_result="进行中；中断后可继续"'; }
+install_wizard() {
+    local scheme host domain answer
+    if [[ $(get '.wizard.selected // false') != true ]]; then
+        if [[ $(get '.nodes|length') -gt 0 || $(get '.sites|length') -gt 0 ]]; then
+            info '已读取现有部署，不重新询问原节点和网站参数。'
+            json_update '.wizard.selected=true'
+        else
+            ask_valid scheme '部署方案：A=VLESS REALITY直连；B=网站TLS+VLESS XHTTP' "$(get '.scheme // "A"')" choice 'A B'
+            ask_valid host '服务器公网IP或连接域名（不自动猜测）' "$(get '.host // ""')" valid_host
+            json_update --arg s "$scheme" --arg h "$host" '.scheme=$s|.host=$h|.wizard.selected=true'
+        fi
     fi
+    scheme=$(get '.scheme // "A"')
+    wizard_step xray
+    install_component xray
     if [[ $scheme == B ]]; then
-        website=yes
-        info '方案B：默认VLESS XHTTP H2与网站共用443；自动选择Nginx、acme.sh和域名证书。'
-    else
-        current=$(get '.wizard.website != false'); if [[ $current == true ]]; then current=yes; else current=no; fi
-        ask_valid website '方案A同时部署HTTPS网站？yes/no（代理本身无需证书）' "$current" valid_choice '请输入yes或no。' 'yes no'
-        ask_valid host 'VPS公网IP或直连域名（REALITY客户端连接地址）' "$(get '.host // ""')" valid_host '请输入IP或小写域名，不含https://、端口、路径或IPv6方括号。'
-        json_update --arg h "$host" '.host=$h'
-        if [[ -z $(default_domain) ]] && valid_domain "$host"; then remember_domain "$host"; fi
+        wizard_step nginx; install_component nginx
+        wizard_step acme; install_component acme
+        wizard_step website
+        domain=$(get '.preferences.domain // .sites[0].domain // ""')
+        if [[ -z $domain ]] || ! jq -e --arg d "$domain" '.sites[]|select(.domain==$d)' "$STATE" >/dev/null; then
+            site_configure
+            domain=$(get '.preferences.domain // .sites[0].domain // ""')
+        else info "复用已保存网站：$domain；需要改动时进入网站菜单。"; fi
+        wizard_step certificate
+        if [[ $(jq -r --arg d "$domain" '.sites[]|select(.domain==$d)|.issued' "$STATE") != true || $(jq -r --arg d "$domain" '.sites[]|select(.domain==$d)|.cert_settings_pending // false' "$STATE") == true ]]; then cert_issue "$domain"; fi
     fi
-    json_update --argjson w "$([[ $website == yes ]] && printf true || printf false)" '.wizard.website=$w'
-    if [[ $website == yes ]]; then
-        current=$(get '.wizard.domain // ""'); [[ -n $current ]] || current=$(default_domain)
-        ask_valid domain '自有网站域名（后续节点、网站和证书默认使用此域名）' "$current" valid_domain '请填写你能管理DNS的域名，不含https://或路径。'
-        remember_domain "$domain"
-        json_update --arg d "$domain" '.wizard.domain=$d'
-        site_access_prompt "$domain"
-        certificate_prompt "$domain"
-        site_content_prompt "$domain"
-        json_update '.wizard.site_pending=true'
-    else json_update '.wizard.site_pending=false'; fi
-    json_update '.wizard.defaults_ready=true'
-    remember_step '方案与默认值' '已保存'
-    wizard_preview
+    wizard_step node
+    if [[ $(get '.nodes|length') == 0 ]]; then node_add yes; else info '保留现有节点及凭据，不重新生成。'; fi
+    json_update '.wizard.last_step="complete"|.wizard.last_result="已完成"'
+    ok '部署向导完成；再次运行将读取现有配置。'
 }
-wizard_preview() {
-    local domain website
-    domain=$(get '.wizard.domain // ""'); website=$(get '.wizard.website != false')
-    panel_title "已记住方案 $(get .scheme)"
-    if [[ $(get .scheme) == A ]]; then
-        printf '  代理：VLESS + REALITY + Vision；连接地址：%s；默认起始端口8443\n' "$(get '.host // "待输入"')"
-    else printf '  代理：默认VLESS + XHTTP + TLS H2；客户端连接 %s:443；内部端口从20000选择\n' "${domain:-待输入}"; fi
-    if [[ $(get .scheme) == B || $website == true ]]; then
-        printf '  网站：%s；内容类型：%s\n' "${domain:-待输入}" "$(get '.preferences.site_kind // "template"')"
-        printf '  访问：%s；不强制公开DNS解析到本机IP\n' "$(get '.preferences.site_access // "direct"')"
-        printf '  证书：Let\047s Encrypt / ECC P-256；验证：%s；泛域名：%s\n' "$(get '.preferences.challenge // "http"')" "$(get '.preferences.wildcard // false')"
-        printf '  后续：检查组件 → 配置当前域名网站 → 签发/检查证书 → 添加本方案节点 → 检查本机运行\n'
-    else printf '  后续：检查Xray → 添加REALITY节点 → 检查本机运行（无需网站证书）\n'; fi
-    printf '  默认值已保存在本机；输入 :q 可中断当前操作，下次继续。\n'
-}
-install_all() {
-    local choice domain free_kb existing_node
-    init_preferences
-    if [[ $(get '.wizard.selected // false') != true ]]; then configure_wizard
-    else
-        wizard_preview
-        ask_valid choice '1=按上次方案继续未完成步骤，2=修改方案和默认值，0=返回' 1 valid_choice '请选择0、1或2。' '0 1 2'
-        case "$choice" in 0) return 0;; 2) configure_wizard;; esac
-    fi
-    # Incomplete answers (e.g. :q during email input) resume with saved defaults.
-    domain=$(get '.wizard.domain // ""')
-    if [[ $(get '.wizard.defaults_ready != false') != true ]] || { [[ $(get .scheme) == A ]] && ! valid_host "$(get '.host // ""')"; }; then
-        info '上次默认值尚未填写完整，保留已填内容并继续配置。'
-        configure_wizard; domain=$(get '.wizard.domain // ""')
-    fi
-    if plan_needs_site; then
-        if ! valid_domain "$domain" || ! valid_email "$(get '.preferences.email // ""')"; then
-            info '域名或证书联系信息尚未填写完整，继续配置默认值。'
-            configure_wizard; domain=$(get '.wizard.domain // ""')
-        fi
-    elif ! valid_host "$(get '.host // ""')"; then configure_wizard; fi
-    WIZARD_ACTIVE=1
-    inspect_existing
-    free_kb=$(df -Pk "$ROOT" | awk 'NR==2{print $4}')
-    ((free_kb >= 512000)) || die '可用磁盘不足500MB，请释放空间后继续；已输入的默认值保留。'
-    remember_step '安装Xray'
-    if component_ready xray; then ok 'Xray已安装，跳过下载。'; else install_component xray; fi
-    if plan_needs_site; then
-        remember_step '安装网站与证书工具'
-        if component_ready nginx; then ok 'Nginx已安装，跳过下载。'; else install_component nginx; fi
-        if component_ready acme; then ok 'acme.sh已安装，跳过下载。'; else install_component acme; fi
-        remember_step "配置网站 $domain"
-        if ! jq -e --arg d "$domain" '.sites[]|select(.domain==$d)' "$STATE" >/dev/null || [[ $(get '.wizard.site_pending // false') == true ]]; then
-            site_apply_preferences "$domain"
-        else ok "$domain 已配置，跳过重复建站。"; fi
-        remember_step "检查/签发证书 $domain"
-        if certificate_ready "$domain"; then ok '当前域名证书有效，跳过重复签发。'; else cert_issue "$domain"; fi
-    fi
-    remember_step '配置本方案节点'
-    if [[ -n $(plan_nodes enabled) ]]; then
-        ok '已存在本方案的启用节点，跳过重复创建。'
-    elif [[ -n $(plan_nodes all) ]]; then
-        existing_node=$(plan_nodes all | head -1)
-        ask_valid choice "已有停用节点 $existing_node：1=启用，2=新建，0=稍后" 1 valid_choice '请选择0、1或2。' '0 1 2'
-        case "$choice" in 1) node_action enable "$existing_node";; 2) node_add guided;; 0) remember_step '配置本方案节点' '待继续'; WIZARD_ACTIVE=0; return 0;; esac
-    else
-        ask_valid choice '现在添加本方案节点？yes/no' yes valid_choice '请输入yes或no。' 'yes no'
-        if [[ $choice == yes ]]; then node_add guided
-        else remember_step '配置本方案节点' '待继续'; WIZARD_ACTIVE=0; return 0; fi
-    fi
-    remember_step '检查本机运行'
-    refresh_deployment
-    if [[ $D_RUNTIME_OK != true ]]; then
-        info '检查到服务、监听端口或续期timer尚未就绪，重新验证并应用配置。'
-        begin_tx; apply_config; commit_tx
-    fi
-    refresh_deployment
-    if [[ $D_COMPLETE == true ]]; then remember_step '部署向导' '本机检查通过'
-    else remember_step '部署向导' '待继续'; warn "$D_NEXT"; fi
-    WIZARD_ACTIVE=0
-    deployment_details
-    info '公网访问还需检查DNS、云安全组和客户端连通性；本机就绪不代表公网已验收。'
-}
-service_caption() {
-    local v; v=$(systemctl is-active "vpskit-$1.service" 2>/dev/null || true)
-    case "$v" in active) printf '运行中';; failed) printf '启动失败';; activating) printf '启动中';; *) printf '已停止';; esac
-}
-component_caption() {
-    if component_ready "$1"; then
-        if [[ $1 == acme ]]; then printf '已安装'; else printf '已安装 / %s' "$(service_caption "$1")"; fi
-    elif [[ $(get ".components.$1 // false") == true ]]; then printf '异常：程序文件缺失'
-    else printf '未安装'; fi
-}
-progress_step() {
-    local label=$1 complete=$2 next=$3
-    D_TOTAL=$((D_TOTAL+1))
-    if [[ $complete == true ]]; then D_DONE=$((D_DONE+1)); D_ROWS+=("完成|$label")
-    else
-        D_ROWS+=("待办|$label")
-        [[ -n $D_NEXT ]] || D_NEXT=$next
-    fi
-}
-refresh_deployment() {
-    local flag components=true d certfile p selected timer_active timer_enabled runtime=true
-    D_TOTAL=0; D_DONE=0; D_NEXT=''; D_ROWS=(); D_COMPLETE=false
-    D_SCHEME=$(get '.scheme // "A"'); D_DOMAIN=$(get '.wizard.domain // ""')
-    D_NODE_TOTAL=$(get '.nodes|length'); D_NODE_ENABLED=$(get '[.nodes[]|select(.enabled)]|length')
-    D_SITE_TOTAL=$(get '.sites|length'); D_PLAN_ENABLED=$(plan_nodes enabled | awk 'NF{n++} END{print n+0}')
-    D_XRAY=$(component_caption xray); D_NGINX=$(component_caption nginx); D_ACME=$(component_caption acme)
-    D_CERT_OK=0; D_CERT_DUE=0; D_CURRENT_CERT=false
-    while read -r d; do
-        if certificate_good "$d"; then
-            D_CERT_OK=$((D_CERT_OK+1))
-            if [[ $d == "$D_DOMAIN" ]] && certificate_ready "$d"; then D_CURRENT_CERT=true; fi
-            certfile="$ROOT/certs/$d/current/fullchain.pem"
-            if ! openssl x509 -in "$certfile" -noout -checkend 1209600 >/dev/null 2>&1; then D_CERT_DUE=$((D_CERT_DUE+1)); fi
-        fi
-    done < <(jq -r '.sites[].domain' "$STATE")
-    timer_active=false; timer_enabled=false
-    if systemctl is-active --quiet vpskit-maintain.timer; then timer_active=true; fi
-    if systemctl is-enabled --quiet vpskit-maintain.timer 2>/dev/null; then timer_enabled=true; fi
-    D_TIMER='未就绪'; [[ $timer_active != true || $timer_enabled != true ]] || D_TIMER='已开启'
-    selected=$(get '.wizard.selected // false')
-    [[ $(get '.wizard.defaults_ready != false') == true ]] || selected=false
-    progress_step '选择并保存部署方案与默认值' "$selected" '打开部署与安装 → 继续部署向导，选择A或B方案。'
-    flag=false
-    if [[ $D_SCHEME == A ]]; then
-        if valid_host "$(get '.host // ""')"; then flag=true; fi
-    elif valid_domain "$D_DOMAIN"; then flag=true; fi
-    progress_step '填写本方案连接地址 / 域名' "$flag" '继续部署向导，补全VPS连接地址或自有域名。'
-    component_ready xray || components=false
-    if plan_needs_site; then component_ready nginx || components=false; component_ready acme || components=false; fi
-    progress_step '安装本方案所需组件' "$components" '继续部署向导，安装缺少的组件或修复缺失程序。'
-    if plan_needs_site; then
-        flag=false
-        if jq -e --arg d "$D_DOMAIN" '.sites[]|select(.domain==$d)' "$STATE" >/dev/null && [[ $(get '.wizard.site_pending // false') != true ]]; then flag=true; fi
-        progress_step "配置网站 ${D_DOMAIN:-（待填写）}" "$flag" '继续部署向导，配置已保存的域名和网站类型。'
-        flag=false; [[ $D_CURRENT_CERT != true || $D_TIMER != '已开启' ]] || flag=true
-        progress_step '域名证书有效 + 自动续期已开启' "$flag" '检查网站与证书，或继续部署向导重试签发/恢复续期timer。'
-        systemctl is-active --quiet vpskit-nginx.service || runtime=false
-        [[ $D_TIMER == '已开启' ]] || runtime=false
-        for p in 80 443; do [[ -n $(ss -H -lnt "sport = :$p" 2>/dev/null) ]] || runtime=false; done
-    fi
-    flag=false; ((D_PLAN_ENABLED == 0)) || flag=true
-    progress_step "本方案启用节点（$D_PLAN_ENABLED 个）" "$flag" '继续部署向导添加本方案节点，或在节点管理中启用已有节点。'
-    D_CONFIG_OK=false; ((D_DONE != D_TOTAL)) || D_CONFIG_OK=true
-    systemctl is-active --quiet vpskit-xray.service || runtime=false
-    ((D_PLAN_ENABLED > 0)) || runtime=false
-    [[ -s $ROOT/config/xray.json ]] || runtime=false
-    if plan_needs_site; then [[ -s $ROOT/config/nginx.conf ]] || runtime=false; fi
-    while read -r p; do [[ -n $(ss -H -lnt "sport = :$p" 2>/dev/null) ]] || runtime=false; done < <(jq -r '[.nodes[]|select(.enabled)]|unique_by(.entry)[].port' "$STATE")
-    D_RUNTIME_OK=$runtime
-    progress_step '本机服务与所需TCP端口就绪' "$runtime" '打开状态、日志与维护检查服务，或继续部署向导修复运行配置。'
-    if ((D_DONE == D_TOTAL)); then D_COMPLETE=true; D_DEPLOYMENT='已完成 / 本机运行正常'; D_NEXT='本机检查通过；可导出节点，并从客户端验证公网连接。'
-    elif [[ $D_CONFIG_OK == true ]]; then D_DEPLOYMENT='配置完成 / 运行异常'
-    elif [[ $(get '.wizard.selected // false') != true ]]; then D_DEPLOYMENT='待选择方案'
-    elif [[ $selected != true ]]; then D_DEPLOYMENT='待完善方案默认值'
-    else D_DEPLOYMENT="进行中 $D_DONE/$D_TOTAL"; fi
-}
-deployment_details() {
-    refresh_deployment
-    panel_title "部署进度 · $D_DEPLOYMENT"
-    local row kind label color
-    for row in "${D_ROWS[@]}"; do
-        kind=${row%%|*}; label=${row#*|}; color=$YELLOW; [[ $kind != 完成 ]] || color=$GREEN
-        printf '  %s[%s]%s %s\n' "$color" "$kind" "$RESET" "$label"
+status_show() {
+    printf 'VPSKit %s\n根目录：%s\n' "$VERSION" "$ROOT"
+    if ! state_basic "$STATE"; then warn 'state.json缺失或损坏，未初始化覆盖；请查看历史/repair。'; return 0; fi
+    jq -r '"保存配置版本：\(.manager // "unknown")\n方案：\(.scheme // "A")\n节点数：\(.nodes|length)；网站数：\(.sites|length)\n向导进度：\(.wizard.last_step // "未记录")"' "$STATE"
+    local c unit active pid
+    for c in xray nginx acme; do printf '%-8s 配置标记=%-5s 版本=%s\n' "$c" "$(get ".components.$c // false")" "$(get ".versions.$c // \"unknown\"")"; done
+    for unit in vpskit-xray.service vpskit-nginx.service vpskit-maintain.timer; do
+        active=$(systemctl is-active "$unit" 2>/dev/null || true); printf '%-28s %s\n' "$unit" "${active:-unknown}"
     done
-    printf '  %s下一步：%s%s\n' "$BLUE" "$D_NEXT" "$RESET"
-    printf '  节点：总计%s / 配置启用%s / 当前方案启用%s；网站：%s；有效证书：%s；14天内到期：%s\n' "$D_NODE_TOTAL" "$D_NODE_ENABLED" "$D_PLAN_ENABLED" "$D_SITE_TOTAL" "$D_CERT_OK" "$D_CERT_DUE"
-}
-
-update_component() {
-    local c=$1
-    if [[ $c == manager ]]; then update_manager; return; fi
-    case "$c" in xray|nginx|acme);; *) die '更新目标：xray/nginx/acme/manager/all。';; esac
-    ensure_component "$c"
-    begin_tx
-    if [[ $c == xray ]]; then
-        local requested
-        ask_valid requested 'Xray版本：latest或v版本（默认经本脚本配置测试的版本）' "$XRAY_TESTED_VERSION" valid_version '格式示例：v26.3.27 或 latest。'
-        install_xray "$requested"
-    else "install_$c"; fi
-    apply_config
-    if [[ $c == nginx ]]; then
-        systemctl restart vpskit-nginx.service
-        sleep 0.3
-        systemctl is-active --quiet vpskit-nginx.service || die 'Nginx新程序启动失败。'
+    pid=$(systemctl show -p MainPID --value vpskit-nginx.service 2>/dev/null || true)
+    if [[ $pid =~ ^[1-9][0-9]*$ && -d /proc/$pid ]]; then
+        printf 'Nginx进程（Master为root是预期的；Worker必须非root）：\n'
+        ps -o pid,ppid,user,stat,rss,args -p "$pid" --ppid "$pid" || true
     fi
-    commit_tx
-}
-update_all() {
-    local c
-    for c in xray nginx acme; do
-        if [[ $(get ".components.$c") == true ]]; then update_component "$c"; fi
-    done
-    update_manager
-    ok '全部已安装组件依次更新完成；未执行整机系统升级。'
-}
-update_manager() {
-    local stage="$WORK/manager.new" v
-    info "管理脚本更新来源: $SELF_URL"
-    confirm '从你的GitHub仓库下载并替换管理脚本' || return 0
-    fetch "$SELF_URL" "$stage"
-    grep -Fq 'VPSKIT_SINGLE_FILE' "$stage" || die '文件标识不匹配。'
-    bash -n "$stage"
-    v=$(sed -n "s/^VERSION='\([0-9.]*\)'$/\1/p" "$stage" | head -1)
-    [[ -n $v ]] || die '没有有效版本号。'
-    cp "$ROOT/vpskit.sh" "$ROOT/backup/manager.previous"
-    install -m 700 "$stage" "$ROOT/vpskit.sh.new"
-    mv -f "$ROOT/vpskit.sh.new" "$ROOT/vpskit.sh"
-    json_update --arg v "$v" '.manager=$v'
-    ok "管理脚本已更新至$v；当前会话仍执行旧代码，下次唤醒使用新版本。"
-}
-rollback_last() {
-    [[ -f $ROOT/backup/last/ready ]] || die '没有可回滚快照。'
-    confirm '恢复最近一次操作前的节点、配置及程序；之后增加的节点将被撤销' || return 0
-    restore_tx "$ROOT/backup/last" || die '回滚不完整，保留快照供排查。'
-    rm -rf "$ROOT/backup/last"
-    ok '回滚完成。'
-}
-remove_unit() {
-    local u=$1
-    if [[ -f $SYSTEMD/$u ]] && grep -Fq '# VPSKIT_OWNED' "$SYSTEMD/$u"; then
-        systemctl disable --now "$u" 2>/dev/null || true
-        rm -f -- "$SYSTEMD/$u"
-        systemctl reset-failed "$u" 2>/dev/null || true
-    fi
-}
-uninstall_component() {
-    local c=$1
-    case "$c" in xray|nginx|acme);; *) die '卸载目标：xray/nginx/acme/all。';; esac
-    if [[ $c == nginx ]]; then
-        jq -e '.nodes[]|select(.mode=="ws" or .mode=="xhttp" or .mode=="tls")' "$STATE" >/dev/null && die '仍有域名/TLS节点，请先移除它们。'
-        [[ $(jq '.sites|length' "$STATE") == 0 ]] || die '仍有网站绑定，请先执行 site remove。'
-    fi
-    if [[ $c == acme ]]; then
-        [[ $(jq '.sites|length' "$STATE") == 0 ]] || die '仍有网站依赖自动证书，请先移除网站。'
-    fi
-    confirm "卸载$c及其私有资料；不会卸载系统原有同名程序" || return 0
-    begin_tx
-    case "$c" in
-        xray) json_update '.nodes=[] | .components.xray=false | del(.versions.xray)'; systemctl disable --now vpskit-xray.service 2>/dev/null || true; rm -f "$XRAY" "$ROOT/config/xray.json";;
-        nginx) json_update '.components.nginx=false | del(.versions.nginx)'; systemctl disable --now vpskit-nginx.service 2>/dev/null || true; rm -rf "$ROOT/nginx"; mkdir -p "$ROOT/nginx"; rm -f "$ROOT/config/nginx.conf";;
-        acme) json_update '.components.acme=false | del(.versions.acme)'; rm -rf "$ROOT/acme" "$ROOT/certs"; mkdir -p "$ROOT/acme" "$ROOT/certs";;
-    esac
-    apply_config
-    commit_tx
-    # Component removal should not retain its binaries/secrets in a generic rollback copy.
-    rm -rf "$ROOT/backup/last" "$ROOT/backup/manager.previous"
-    case "$c" in xray) remove_unit vpskit-xray.service;; nginx) remove_unit vpskit-nginx.service;; esac
-    systemctl daemon-reload
-    ok "$c 已卸载；管理工具及其他组件保留。"
-}
-purge_owned_packages() {
-    local -a pkgs=(); local p simulated removed
-    [[ -s $ROOT/data/packages.added ]] || return 0
-    while read -r p; do
-        [[ $p =~ ^[a-z0-9][a-z0-9+.:_-]+$ ]] || die '依赖包清单异常。'
-        if dpkg-query -W -f='${db:Status-Status}' "$p" 2>/dev/null | grep -qx installed; then pkgs+=("$p"); fi
-    done < "$ROOT/data/packages.added"
-    ((${#pkgs[@]})) || return 0
-    printf '本工具新增过的依赖包：\n%s\n' "${pkgs[*]}"
-    confirm '尝试移除这些共享依赖（若涉及其他包则拒绝）' || return 0
-    simulated=$(apt-get -s purge "${pkgs[@]}") || die '卸载模拟失败，保留依赖。'
-    while read -r removed; do
-        [[ -z $removed ]] && continue
-        printf '%s\n' "${pkgs[@]}" | grep -Fxq "$removed" || die "移除将影响其他软件包 $removed；已保留依赖。"
-    done < <(printf '%s\n' "$simulated" | awk '$1=="Remv"||$1=="Purg"{print $2}')
-    run apt-get -y purge "${pkgs[@]}"
-}
-uninstall_all() {
-    printf '将删除：\n  %s\n  %s\n  VPSKit服务、续期timer、全部节点/私钥/网站/日志/备份、本工具防火墙规则及Swap\n' "$ROOT" "$ENTRY"
-    printf '已配置网站：\n'; jq -r '.sites[].domain' "$STATE"
-    warn '完整卸载不可恢复。请先把需要保留的网站文件复制到其他位置。不会删除其他工具的目录或系统共享日志。'
-    confirm '完整卸载VPSKit' || return 0
-    swap_remove no
-    firewall_cleanup no
-    tuning_restore no
-    UNINSTALLING=1
-    local u
-    for u in vpskit-maintain.timer vpskit-maintain.service vpskit-xray.service vpskit-nginx.service; do remove_unit "$u"; done
-    systemctl daemon-reload
-    # Optional dependency purge uses only a whitelist recorded at the actual dependency installation.
-    purge_owned_packages
-    [[ ! -L $ROOT && $(cat "$ROOT/.vpskit-owned") == VPSKIT_V1 && $(stat -c %u "$ROOT") == 0 ]] || die '目录归属检查失败，停止删除。'
-    if [[ -L $ENTRY && $(readlink "$ENTRY") == "$ROOT/vpskit.sh" ]]; then rm -f "$ENTRY"; fi
-    cd /
-    LOGFILE=''; WORK=''
-    rm -rf --one-file-system -- "$ROOT"
-    [[ ! -e $ROOT ]] || die '仍有挂载点或不可删除内容，请人工检查 /opt/vpskit。'
-    ok '完整卸载完成。本工具文件、入口、服务和任务已移除。'
-}
-status() {
-    deployment_details
-    printf '\nVPSKit %s | 默认方案 %s | 目录 %s\n' "$VERSION" "$(get .scheme)" "$ROOT"
-    free -m; df -h "$ROOT"
-    jq -r '.versions|to_entries[]|"\(.key): \(.value)"' "$STATE"
-    local u
-    for u in xray nginx; do printf '%s: ' "$u"; systemctl is-active "vpskit-$u.service" || true; done
-    printf '续期任务: '; systemctl is-active vpskit-maintain.timer || true
-    printf '节点数: '; jq '.nodes|length' "$STATE"
-    cert_status || true
+    [[ ! -d $ROOT/backup/transaction ]] || warn '有未完成事务，请先运行repair。'
 }
 doctor() {
-    status
+    status_show; state_basic "$STATE" || return 1
     validate_state
-    [[ $(get .components.xray) != true ]] || "$XRAY" run -test -config "$ROOT/config/xray.json"
-    [[ $(get .components.nginx) != true ]] || nginx_cmd -t -p "$ROOT/" -c "$ROOT/config/nginx.conf"
+    local u pid
+    u=$(resolve_worker); info "预期Worker账户：$u / UID $(id -u "$u")"
+    if component_ready nginx; then
+        nginx_cmd -t -p "$ROOT/" -c "$ROOT/config/nginx.conf"
+        if systemctl is-active --quiet vpskit-nginx.service; then
+            verify_nginx_runtime ''
+        fi
+        if runuser -u "$u" -- test -r "$STATE"; then die 'Worker能读state.json。'; fi
+        if runuser -u "$u" -- test -x "$ROOT/certs"; then die 'Worker能遍历证书目录。'; fi
+    fi
+    if component_ready xray; then "$XRAY" run -test -config "$ROOT/config/xray.json"; fi
     printf '\n监听端口：\n'; ss -lntup
-    printf '\n续期timer：\n'; systemctl list-timers vpskit-maintain.timer --no-pager
-    local d
-    while read -r d; do
-        info "DNS解析 $d"; getent ahosts "$d" || warn '解析失败。'
-        if [[ -s $ROOT/certs/$d/current/fullchain.pem ]]; then
-            info "通过公网域名检查HTTPS $d（若使用CDN，检查的是CDN证书）"
-            curl -fsSI --connect-timeout 10 --max-time 20 "https://$d/" || warn '公网HTTPS检查失败。'
-            timeout 15 openssl s_client -connect "$d:443" -servername "$d" </dev/null 2>/dev/null | openssl x509 -noout -dates -issuer || warn '未读取到线上证书。'
-        fi
-    done < <(jq -r '.sites[].domain' "$STATE")
-    warn '云安全组、实际客户端连通性、性能和REALITY目标适用性还需从客户端验收。'
+    printf '\n内存/Swap：\n'; free -h
+    printf '\n当前拥塞控制：\n'; sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc 2>/dev/null || true
+    ok '上述本机检查完成；不等于外网连通性、CDN回源或实际吞吐测试通过。'
 }
-logs() {
-    local c=${1:-manager} file
-    case "$c" in xray) file="$ROOT/logs/xray.log";; nginx) file="$ROOT/logs/nginx.log";; manager) file="$ROOT/logs/manage.log";; cert) journalctl -u vpskit-maintain.service -n 100 --no-pager; return;; *) die '日志目标：xray/nginx/manager/cert。';; esac
-    [[ -f $file ]] || { warn '尚无日志。'; return 0; }
-    tail -n 100 "$file"
-}
-service_action() {
-    local action=$1 c=$2
-    case "$action" in start|stop|restart);; *) die '服务操作必须是start/stop/restart。';; esac
-    case "$c" in xray|nginx);; *) die '服务目标必须是xray/nginx。';; esac
-    ensure_component "$c"
-    systemctl "$action" "vpskit-$c.service"
-    systemctl is-active "vpskit-$c.service" || [[ $action == stop ]]
-}
-maintenance() {
-    rotate_logs
-    edge_auto_refresh
-    if [[ $(get .components.acme) == true ]]; then cert_renew; fi
-}
-# Reversible system-wide tuning. Kept outside generic configuration snapshots so
-# ordinary node/certificate rollback cannot silently change kernel tuning files.
-tuning_paths_ok() {
-    [[ -d ${SYSCTL_LINK%/*} && ! -L ${SYSCTL_LINK%/*} ]] || die 'sysctl.d目录异常。'
-    if [[ -e $SYSCTL_LINK || -L $SYSCTL_LINK ]]; then
-        [[ -L $SYSCTL_LINK && $(readlink "$SYSCTL_LINK") == "$ROOT/data/sysctl.conf" ]] || die "$SYSCTL_LINK 已被其他工具使用，保留并停止。"
-    fi
-}
-tuning_write_persistent() {
-    tuning_paths_ok
-    if [[ -f $ROOT/data/tuning.json ]] && jq -e '.keys|length>0' "$ROOT/data/tuning.json" >/dev/null; then
-        { printf '# VPSKIT_OWNED -- manage with vpskit optimize\n'; jq -r '.keys|to_entries[]|"\(.key) = \(.value.applied)"' "$ROOT/data/tuning.json"; } > "$ROOT/data/sysctl.conf.new"
-        chmod 600 "$ROOT/data/sysctl.conf.new"
-        mv -f "$ROOT/data/sysctl.conf.new" "$ROOT/data/sysctl.conf"
-        ln -sfn "$ROOT/data/sysctl.conf" "$SYSCTL_LINK"
-    else
-        if [[ -L $SYSCTL_LINK ]]; then rm -f "$SYSCTL_LINK"; fi
-        rm -f "$ROOT/data/sysctl.conf" "$ROOT/data/tuning.json"
-    fi
-}
-tuning_begin() {
-    local intent=$1 tx="$ROOT/backup/tuning-transaction" f
-    tuning_paths_ok
-    [[ ! -e $tx ]] || die '有待恢复的网络调优事务，请执行 repair。'
-    mkdir -p "$tx"
-    for f in tuning.json sysctl.conf; do [[ ! -f $ROOT/data/$f ]] || cp -a "$ROOT/data/$f" "$tx/$f"; done
-    [[ ! -L $SYSCTL_LINK ]] || touch "$tx/had-link"
-    cp "$intent" "$tx/changes.json"
-    touch "$tx/ready"
-}
-tuning_recover() {
-    local tx="$ROOT/backup/tuning-transaction" row key before after current f
-    [[ -d $tx ]] || return 0
-    if [[ ! -f $tx/ready ]]; then rm -rf "$tx"; return 0; fi
-    tuning_paths_ok
-    warn '恢复上次未完成的网络调优。'
-    while read -r row; do
-        key=$(jq -r .key <<< "$row"); before=$(jq -r .value.before <<< "$row"); after=$(jq -r .value.after <<< "$row")
-        case "$key" in net.ipv4.tcp_congestion_control|net.core.default_qdisc|net.ipv4.tcp_mtu_probing);; *) warn '调优快照中有未知参数。'; return 1;; esac
-        current=$(sysctl -n "$key") || return 1
-        if [[ $current == "$before" ]]; then continue; fi
-        if [[ $current != "$after" ]]; then warn "$key 已被外部改为 $current；保留快照，需核对后再恢复。"; return 1; fi
-        sysctl -q -w "$key=$before" || return 1
-    done < <(jq -c 'to_entries[]' "$tx/changes.json")
-    for f in tuning.json sysctl.conf; do
-        if [[ -f $tx/$f ]]; then cp -a "$tx/$f" "$ROOT/data/$f" || return 1; else rm -f "$ROOT/data/$f"; fi
-    done
-    if [[ -f $tx/had-link ]]; then ln -sfn "$ROOT/data/sysctl.conf" "$SYSCTL_LINK"; else rm -f "$SYSCTL_LINK"; fi
-    rm -rf "$tx"
-    ok '网络调优已恢复到该次操作之前。'
-}
-tuning_apply() {
-    local kind=$1 key value current previous tracked intent="$WORK/tuning-intent.json" record="$WORK/tuning-record.json" i
-    local -a keys=() values=()
-    case "$kind" in
-        bbr)
-            confirm '启用BBR与默认fq队列；这会影响整台VPS的新TCP连接' || return 0
-            if ! sysctl -n net.ipv4.tcp_available_congestion_control | tr ' ' '\n' | grep -Fxq bbr; then
-                if command -v modprobe >/dev/null; then modprobe tcp_bbr || true; fi
-            fi
-            sysctl -n net.ipv4.tcp_available_congestion_control | tr ' ' '\n' | grep -Fxq bbr || die '当前内核不提供BBR；保留原值，不安装内核、不重启。'
-            if command -v modprobe >/dev/null; then modprobe sch_fq 2>/dev/null || true; fi
-            keys=(net.core.default_qdisc net.ipv4.tcp_congestion_control); values=(fq bbr);;
-        mtu)
-            confirm '启用按需TCP MTU黑洞探测（值1）；适用于部分卡顿链路，影响整台VPS' || return 0
-            keys=(net.ipv4.tcp_mtu_probing); values=(1);;
-        *) die '未知调优方式。';;
-    esac
-    tuning_paths_ok
-    printf '{}\n' > "$intent"
-    if [[ -f $ROOT/data/tuning.json ]]; then cp "$ROOT/data/tuning.json" "$record"; else printf '{"keys":{}}\n' > "$record"; fi
-    for i in "${!keys[@]}"; do
-        key=${keys[$i]}; value=${values[$i]}
-        current=$(sysctl -n "$key") || die "内核未提供 $key，未应用调优。"
-        tracked=$(jq -r --arg k "$key" '.keys[$k].applied // empty' "$record")
-        [[ -z $tracked || $current == "$tracked" ]] || die "$key 已被其他工具修改；先运行 optimize restore，再重新选择。"
-        previous=$(jq -r --arg k "$key" --arg v "$current" '.keys[$k].before // $v' "$record")
-        jq --arg k "$key" --arg v "$previous" --arg a "$value" '.keys[$k]={before:$v,applied:$a}' "$record" > "$record.new"; mv "$record.new" "$record"
-        jq --arg k "$key" --arg b "$current" --arg a "$value" '.[$k]={before:$b,after:$a}' "$intent" > "$intent.new"; mv "$intent.new" "$intent"
-    done
-    tuning_begin "$intent"
-    for i in "${!keys[@]}"; do
-        key=${keys[$i]}; value=${values[$i]}
-        info "设置 $key=$value"
-        sysctl -q -w "$key=$value"
-        [[ $(sysctl -n "$key") == "$value" ]] || die "$key 未生效。"
-    done
-    mv "$record" "$ROOT/data/tuning.json"
-    tuning_write_persistent
-    rm -rf "$ROOT/backup/tuning-transaction"
-    ok '调优已应用并持久化，可用 optimize restore 恢复。'
-    warn '现有监听器/连接可能仍使用原算法；维护时重启本工具服务后再对比。fq默认值不会替换现有网卡队列。'
-    tuning_status
-}
-tuning_restore() {
-    local interactive=${1:-yes} row key before applied current intent="$WORK/tuning-intent.json"
-    if [[ ! -f $ROOT/data/tuning.json ]]; then
-        [[ ! -L $SYSCTL_LINK || $(readlink "$SYSCTL_LINK") != "$ROOT/data/sysctl.conf" ]] || die '调优记录缺失但仍有持久化链接，请先人工核对，防止丢失原值。'
-        ok '没有本工具管理的内核调优。'; return 0
-    fi
-    [[ $interactive != yes ]] || { confirm '恢复本工具修改前的内核参数，并移除调优持久化配置' || return 0; }
-    printf '{}\n' > "$intent"
-    while read -r row; do
-        key=$(jq -r .key <<< "$row"); before=$(jq -r .value.before <<< "$row"); applied=$(jq -r .value.applied <<< "$row")
-        case "$key" in net.ipv4.tcp_congestion_control|net.core.default_qdisc|net.ipv4.tcp_mtu_probing);; *) die '调优记录参数异常。';; esac
-        current=$(sysctl -n "$key") || die "无法读取 $key；保留恢复资料。"
-        if [[ $current != "$applied" ]]; then warn "$key 已被外部改为 $current，保留外部值。"; continue; fi
-        jq --arg k "$key" --arg b "$current" --arg a "$before" '.[$k]={before:$b,after:$a}' "$intent" > "$intent.new"; mv "$intent.new" "$intent"
-    done < <(jq -c '.keys|to_entries[]' "$ROOT/data/tuning.json")
-    tuning_begin "$intent"
-    while read -r row; do
-        key=$(jq -r .key <<< "$row"); before=$(jq -r .value.after <<< "$row")
-        sysctl -q -w "$key=$before"
-        [[ $(sysctl -n "$key") == "$before" ]] || die "恢复 $key 未生效，保留资料。"
-    done < <(jq -c 'to_entries[]' "$intent")
-    printf '{"keys":{}}\n' > "$ROOT/data/tuning.json"
-    tuning_write_persistent
-    rm -rf "$ROOT/backup/tuning-transaction"
-    ok '内核调优已恢复；现有连接/网卡队列的状态由内核继续管理。'
-}
-tuning_status() {
-    local key
-    printf '\n%s网络调优状态%s\n' "$BLUE" "$RESET"
-    for key in net.ipv4.tcp_available_congestion_control net.ipv4.tcp_congestion_control net.core.default_qdisc net.ipv4.tcp_mtu_probing; do
-        printf '  %s = %s\n' "$key" "$(sysctl -n "$key" 2>/dev/null || printf '内核未提供')"
-    done
-    printf '  静态网站gzip: %s\n' "$(get '.performance.gzip // false')"
-    if [[ -f $ROOT/data/tuning.json ]]; then jq -r '.keys|to_entries[]|"  已记录：\(.key)，原值=\(.value.before)，设定值=\(.value.applied)"' "$ROOT/data/tuning.json"; fi
-    if command -v tc >/dev/null; then printf '\n当前网卡队列（只读）：\n'; tc qdisc show || true; fi
-    printf '\nBBR取决于内核与链路；WS本身不加速。gzip只减少静态文本传输量。\n不扩大TCP缓冲、不更换内核、不自动修改网卡队列或防火墙。\n'
-}
-gzip_action() {
-    local enabled=$1
-    ensure_component nginx
-    begin_tx
-    json_update --argjson e "$enabled" '.performance.gzip=$e'
-    apply_config; commit_tx
-    ok "静态网站轻量gzip=$enabled；级别2，只压缩大于1KB的文本，不压缩代理节点或动态网站响应。"
-}
-optimize_action() {
-    case "${1:-status}" in
-        status) tuning_status;; bbr|mtu) tuning_apply "$1";; restore) tuning_restore;;
-        gzip-on) gzip_action true;; gzip-off) gzip_action false;;
-        *) die '用法: vpskit optimize status|bbr|mtu|restore|gzip-on|gzip-off';;
-    esac
-}
-
-# Firewall changes are explicit and use a separate durable ownership journal.
-# They are not rolled back by a proxy configuration transaction.
-firewall_init() {
-    local f="$ROOT/data/firewall.json"
-    [[ ! -L $f ]] || die '防火墙记录不能是符号链接。'
-    if [[ ! -f $f ]]; then printf '[]\n' > "$f"; fi
-    jq -e 'type=="array"' "$f" >/dev/null || die '防火墙记录损坏，停止更改规则。'
-}
-firewall_detect() {
-    FW_BACKEND=none
-    local ua=false fa=false ufw_state
-    if command -v ufw >/dev/null; then
-        if ! ufw_state=$(ufw status 2>/dev/null); then FW_BACKEND=error; return 0; fi
-        if grep -q '^Status: active' <<< "$ufw_state"; then ua=true; fi
-    fi
-    if command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then fa=true; fi
-    if [[ $ua == true && $fa == true ]]; then FW_BACKEND=conflict
-    elif [[ $ua == true ]]; then FW_BACKEND=ufw
-    elif [[ $fa == true ]]; then FW_BACKEND=firewalld; fi
-}
-firewall_status() {
-    firewall_detect
-    panel_title "防火墙状态 · $FW_BACKEND"
-    if command -v ufw >/dev/null; then ufw status numbered || true; else printf 'UFW：未安装\n'; fi
-    if command -v firewall-cmd >/dev/null; then
-        if firewall-cmd --state; then firewall-cmd --get-active-zones; firewall-cmd --list-all; fi
-    else printf 'firewalld：未安装\n'; fi
-    if [[ -f $ROOT/data/firewall.json ]]; then
-        printf '\n本工具规则记录（也包含待完成操作）：\n'
-        jq -r '.[]|[.backend,.zone,(.port|tostring),.proto,.action,.scope]|@tsv' "$ROOT/data/firewall.json"
-    fi
-    printf '\n仅管理已启用的UFW/firewalld；不自动启用、禁用或重置整机防火墙。\n原生nftables/iptables、Docker链及云安全组可能另有限制，请从外网验证新连接。\n'
-}
-firewall_prepare() {
-    firewall_detect
-    case "$FW_BACKEND" in
-        error) die '无法读取UFW状态，请先排查其权限或内核错误；为避免冲突，未修改任何规则。';;
-        none) die '未发现已启用的UFW/firewalld；请先通过系统配置启用一个防火墙。脚本不自动改变整机默认策略。';;
-        conflict) die 'UFW和firewalld同时启用，请先明确使用其中一个，避免两套规则互相影响。';;
-    esac
-    firewall_init
-    FW_ZONE=''
-    if [[ $FW_BACKEND == firewalld ]]; then
-        local zones
-        info 'firewalld按zone管理；请选择公网网卡/来源实际所属的zone。'
-        firewall-cmd --get-active-zones
-        zones=$(firewall-cmd --get-zones)
-        ask_valid FW_ZONE '需要修改的zone' "$(firewall-cmd --get-default-zone)" valid_choice '请选择现有zone（上方显示接口绑定，firewall-cmd --get-zones可列出全部）。' "$zones"
-    fi
-}
-firewall_record() {
-    local verb=$1 backend=$2 zone=$3 port=$4 proto=$5 action=$6 scope=$7 f="$ROOT/data/firewall.json"
-    jq --arg v "$verb" --arg b "$backend" --arg z "$zone" --argjson p "$port" --arg t "$proto" --arg a "$action" --arg s "$scope" '
-      map(select((.backend==$b and .zone==$z and .port==$p and .proto==$t and .action==$a and .scope==$s)|not)) |
-      if $v=="add" then .+[{backend:$b,zone:$z,port:$p,proto:$t,action:$a,scope:$s}] else . end' "$f" > "$f.new"
-    chmod 600 "$f.new"; mv -f "$f.new" "$f"
-}
-firewall_ufw_rule() {
-    # show added supplies canonical commands, independent of translated table columns.
-    local action=$1 port=$2 proto=$3 line rules
-    rules=$(ufw show added) || die '无法读取UFW规则。'
-    while IFS= read -r line; do
-        line=${line#ufw }
-        if [[ $line == "$action $port/$proto" || $line == "$action $port/$proto comment "* ]]; then printf '%s' "$line"; return 0; fi
-    done <<< "$rules"
-}
-firewall_rich_rule() { printf 'rule priority="-17321" port port="%s" protocol="%s" %s' "$1" "$2" "$3"; }
-firewall_remove_record() {
-    local backend=$1 zone=$2 port=$3 proto=$4 action=$5 scope=$6 rule line tag rc
-    if ! valid_port "$port" || ! valid_choice "$proto" 'tcp udp'; then die '防火墙记录中的端口/协议无效。'; fi
-    case "$backend" in
-        ufw)
-            valid_choice "$action" 'allow deny' || die 'UFW记录动作无效。'
-            command -v ufw >/dev/null || die 'UFW程序缺失，无法清理已记录规则。'
-            line=$(firewall_ufw_rule "$action" "$port" "$proto")
-            tag="vpskit-managed-$port-$proto-$action"
-            if [[ $line == *" comment '$tag'" || $line == *" comment $tag" ]]; then
-                run ufw --force delete "$action" "$port/$proto"
-            elif [[ -n $line ]]; then warn "保留已由外部修改的UFW规则：$port/$proto。"; fi;;
-        firewalld)
-            if ! valid_choice "$action" 'accept drop' || ! valid_choice "$scope" 'runtime permanent' || [[ ! $zone =~ ^[a-zA-Z0-9_-]+$ ]]; then die 'firewalld记录格式无效。'; fi
-            if ! command -v firewall-cmd >/dev/null || ! firewall-cmd --state >/dev/null 2>&1; then die '请先启动firewalld以清理规则；记录仍保留。'; fi
-            local -a args=(--zone="$zone"); [[ $scope != permanent ]] || args+=(--permanent)
-            rule=$(firewall_rich_rule "$port" "$proto" "$action")
-            if firewall-cmd "${args[@]}" --query-rich-rule="$rule" >/dev/null; then
-                run firewall-cmd "${args[@]}" --remove-rich-rule="$rule"
-            else rc=$?; ((rc==1)) || die '查询firewalld规则失败，保留记录。'; fi;;
-        *) die '未知防火墙记录类型。';;
-    esac
-    firewall_record del "$backend" "$zone" "$port" "$proto" "$action" "$scope"
-}
-firewall_ssh_ports() {
-    local _client_ip _client_port _server_ip p sshbin
-    printf '22\n'
-    if [[ -n ${SSH_CONNECTION:-} ]]; then
-        read -r _client_ip _client_port _server_ip p <<< "$SSH_CONNECTION"
-        if valid_port "${p:-}"; then printf '%s\n' "$((10#$p))"; fi
-    fi
-    sshbin=$(command -v sshd || true)
-    if [[ -n $sshbin ]]; then "$sshbin" -T 2>/dev/null | awk '$1=="port"{print $2}' || true; fi
-    # Include listening and established SSH sockets (also covers socket activation
-    # once an SSH connection exists), including dropbear when used instead of sshd.
-    { ss -H -lntp 2>/dev/null; ss -H -ntp 2>/dev/null; } |
-        awk '/sshd|dropbear/{n=split($4,a,":"); if(a[n]~/^[0-9]+$/)print a[n]}' || true
-}
-valid_firewall_port() {
-    valid_port "$1" || return 1
-    local p=$((10#$1))
-    if [[ ${FW_PROTOCOL:-tcp} != udp ]] && grep -Fxq "$p" <<< "${FW_SSH_PORTS:-22}"; then return 1; fi
-    return 0
-}
-firewall_change() {
-    local operation=$1 port=$2 proto=$3 backend=$FW_BACKEND zone=$FW_ZONE action opposite scope rule line tag rc
-    if ! valid_port "$port" || ! valid_choice "$proto" 'tcp udp' || ! valid_choice "$operation" 'open close'; then die '防火墙操作、端口或协议无效。'; fi
-    # Recheck SSH immediately before applying any TCP close, including cleanup callers.
-    if [[ $proto == tcp ]] && grep -Fxq "$port" <<< "$(firewall_ssh_ports)"; then
-        if [[ $operation == close ]]; then die '拒绝关闭SSH端口。'; fi
-        warn "端口$port属于SSH，跳过本工具规则管理，请保留系统SSH放行规则。"; return 0
-    fi
-    if [[ $backend == ufw ]]; then
-        action=allow; opposite=deny; [[ $operation != close ]] || { action=deny; opposite=allow; }
-    else action=accept; opposite=drop; [[ $operation != close ]] || { action=drop; opposite=accept; }; fi
-    # Remove only this tool's opposite rule; external rules stay untouched.
-    while IFS=$'\t' read -r scope; do
-        [[ -n $scope ]] || continue
-        firewall_remove_record "$backend" "$zone" "$port" "$proto" "$opposite" "$scope"
-    done < <(jq -r --arg b "$backend" --arg z "$zone" --argjson p "$port" --arg t "$proto" --arg a "$opposite" '.[]|select(.backend==$b and .zone==$z and .port==$p and .proto==$t and .action==$a)|.scope' "$ROOT/data/firewall.json")
-    if [[ $backend == ufw ]]; then
-        tag="vpskit-managed-$port-$proto-$action"
-        line=$(firewall_ufw_rule "$action" "$port" "$proto")
-        if [[ -n $line ]]; then
-            if [[ $line == *" comment '$tag'" || $line == *" comment $tag" ]]; then firewall_record add "$backend" "$zone" "$port" "$proto" "$action" all
-            else warn "已有外部同类规则 $port/$proto，未接管；请检查其优先级和最终效果。"; fi
-            return 0
-        fi
-        firewall_record add "$backend" "$zone" "$port" "$proto" "$action" all
-        run ufw insert 1 "$action" "$port/$proto" comment "$tag"
-    else
-        rule=$(firewall_rich_rule "$port" "$proto" "$action")
-        for scope in permanent runtime; do
-            local -a args=(--zone="$zone"); [[ $scope != permanent ]] || args+=(--permanent)
-            if firewall-cmd "${args[@]}" --query-rich-rule="$rule" >/dev/null; then
-                info "规则已存在：$scope $zone $port/$proto $action；不重复添加。"
-            else
-                rc=$?; ((rc==1)) || die '读取firewalld规则失败。'
-                firewall_record add "$backend" "$zone" "$port" "$proto" "$action" "$scope"
-                run firewall-cmd "${args[@]}" --add-rich-rule="$rule"
-            fi
-        done
-    fi
-}
-firewall_port_action() {
-    local operation=$1 port proto
-    firewall_prepare
-    ask_valid FW_PROTOCOL '协议 tcp / udp / both（两者）' tcp valid_choice '请选择tcp、udp或both。' 'tcp udp both'
-    FW_SSH_PORTS=$(firewall_ssh_ports | sort -nu)
-    ask_valid port '需要操作的端口（单个1～65535）' '' valid_firewall_port '端口格式错误，或选择了受保护的SSH端口（SSH规则由系统单独管理）。'
-    port=$((10#$port))
-    warn "将对新入站连接执行 $operation：$FW_BACKEND ${FW_ZONE:-} $port/$FW_PROTOCOL。已有连接可能继续；关闭80/443会影响网站、WS或HTTP证书验证。"
-    confirm '应用以上端口规则' || return 0
-    for proto in tcp udp; do
-        [[ $FW_PROTOCOL == both || $FW_PROTOCOL == "$proto" ]] || continue
-        firewall_change "$operation" "$port" "$proto"
-    done
-    ok '端口规则操作完成；请查看防火墙状态，并从外网验证新连接。'
-}
-firewall_required_ports() {
-    if [[ $(get '.sites|length') -gt 0 ]] || { [[ $(get '.wizard.selected // false') == true ]] && plan_needs_site; }; then printf '80 tcp\n443 tcp\n'; fi
-    jq -r '.nodes[]|select(.enabled and .mode!="ws" and .mode!="xhttp" and .listen!="127.0.0.1" and .listen!="::1")|"\(.port) tcp",(if .protocol=="shadowsocks" then "\(.port) udp" else empty end)' "$STATE"
-}
-firewall_sync() {
-    local ports port proto
-    firewall_prepare
-    ports=$(firewall_required_ports | sort -u)
-    [[ -n $ports ]] || { info '还没有需要放行的网站/公网代理端口。'; return 0; }
-    printf '将放行以下入站端口（WS/XHTTP本机内部端口不对公网开放）：\n%s\n' "$ports"
-    info '只添加当前需要的放行规则；停用/删除节点后的旧端口，请通过关闭端口功能处理。'
-    confirm '放行这些网站与节点端口' || return 0
-    while read -r port proto; do firewall_change open "$port" "$proto"; done <<< "$ports"
-    ok '所需端口规则已处理；云安全组需另行放行。'
-}
-firewall_cleanup() {
-    [[ -f $ROOT/data/firewall.json ]] || return 0
-    firewall_init
-    [[ $(jq length "$ROOT/data/firewall.json") -gt 0 ]] || return 0
-    if [[ ${1:-ask} != no ]]; then
-        warn '撤销本工具添加的允许/阻止规则，恢复由原有防火墙规则决定访问；网站和代理可能不可达。'
-        confirm '清理本工具的防火墙规则' || return 0
-    fi
-    local backend zone port proto action scope row present line tag
-    while IFS= read -r row; do
-        backend=$(jq -r .backend <<< "$row"); zone=$(jq -r .zone <<< "$row"); port=$(jq -r .port <<< "$row")
-        proto=$(jq -r .proto <<< "$row"); action=$(jq -r .action <<< "$row"); scope=$(jq -r .scope <<< "$row")
-        # Never remove an allow rule if that port has subsequently become SSH.
-        if [[ $proto == tcp && ( $action == allow || $action == accept ) ]] && grep -Fxq "$port" <<< "$(firewall_ssh_ports)"; then
-            present=true
-            if [[ $backend == ufw ]]; then
-                line=$(firewall_ufw_rule "$action" "$port" "$proto"); tag="vpskit-managed-$port-$proto-$action"
-                if [[ $line != *" comment '$tag'" && $line != *" comment $tag" ]]; then present=false; fi
-            elif [[ $backend == firewalld ]]; then
-                local -a check_args=(--zone="$zone"); [[ $scope != permanent ]] || check_args+=(--permanent)
-                if firewall-cmd --state >/dev/null 2>&1 && ! firewall-cmd "${check_args[@]}" --query-rich-rule="$(firewall_rich_rule "$port" "$proto" "$action")" >/dev/null 2>&1; then present=false; fi
-            fi
-            if [[ $present == true ]]; then die "端口$port现用于SSH，不能自动撤销其放行规则。请先建立独立SSH放行规则，并手动移除本工具对应规则后重试。"; fi
-        fi
-        firewall_remove_record "$backend" "$zone" "$port" "$proto" "$action" "$scope"
-    done < <(jq -c '.[]' "$ROOT/data/firewall.json")
-    ok '本工具记录的防火墙规则已清理；外部规则及防火墙软件保留。'
-}
-firewall_menu() {
-    local choice
-    while [[ -f $STATE ]]; do
-        panel_title '防火墙端口管理 · 已启用的UFW / firewalld'
-        menu_item 1 '查看状态与规则' '显示防火墙、zone和本工具操作记录'
-        menu_item 2 '开放端口' '输入端口及TCP/UDP，确认后放行新入站连接'
-        menu_item 3 '关闭端口' '增加阻止规则，保护SSH；已有连接可能继续'
-        menu_item 4 '放行网站与节点所需端口' '根据配置生成清单；WS/XHTTP本机内部端口不对公网开放'
-        menu_item 5 '撤销本工具的防火墙规则' '保留外部规则；不重置或卸载整机防火墙'
-        menu_item 0 '返回' '云安全组仍需在服务商控制台管理'
-        ask choice '选择编号' 0
-        case "$choice" in 1) menu_run firewall_status;; 2) menu_run firewall_port_action open;; 3) menu_run firewall_port_action close;;
-            4) menu_run firewall_sync;; 5) menu_run firewall_cleanup;; 0) return;; *) warn '无效选择，请重新输入。';; esac
-    done
-}
-firewall_action() {
-    case "$1" in status) firewall_status;; open|close) firewall_port_action "$1";; sync) firewall_sync;; cleanup) firewall_cleanup;; *) die '用法：vpskit firewall status|open|close|sync|cleanup';; esac
-}
-
-# Swap has its own ownership journal; never include a GiB-sized swapfile in
-# configuration snapshots, or touch any pre-existing system swap/fstab entries.
-swap_unit_name() { systemd-escape --path --suffix=swap "$ROOT/swap/swapfile"; }
-swap_active() { awk -v p="$ROOT/swap/swapfile" 'NR>1 && $1==p{found=1} END{exit !found}' /proc/swaps; }
-swap_used_kib() { awk -v p="$ROOT/swap/swapfile" 'NR>1 && $1==p{used=$4} END{print used+0}' /proc/swaps; }
-swap_available_kib() { awk '/^MemAvailable:/{print $2; found=1} END{if(!found)print 0}' /proc/meminfo; }
-swap_free_mib() { df -Pk "$ROOT" | awk 'NR==2{print int($4/1024)}'; }
-swap_filesystem() { findmnt -n -o FSTYPE --target "$ROOT"; }
-swap_container() { systemd-detect-virt --container --quiet; }
-valid_swap_size() { [[ $1 =~ ^[0-9]{3,4}$ ]] && ((10#$1>=256 && 10#$1<=4096 && 10#$1%256==0)); }
-swap_check_ownership() {
-    local file="$ROOT/swap/swapfile" record="$ROOT/data/swap.json" unit
-    unit=$(swap_unit_name)
-    [[ ! -L $ROOT/swap && ! -L $file && ! -L $record && ! -L $SYSTEMD/$unit ]] || die 'Swap路径为符号链接；拒绝接管。'
-    if [[ -e $SYSTEMD/$unit ]]; then
-        grep -Fxq '# VPSKIT_OWNED_SWAP' "$SYSTEMD/$unit" || die '存在同名外部Swap服务，拒绝修改。'
-    fi
-    if [[ -e $record ]]; then
-        [[ -f $record ]] || die 'Swap记录不是普通文件。'
-        jq -e --arg f "$file" --arg u "$unit" '.owner=="VPSKIT_SWAP_V1" and .path==$f and .unit==$u and (.phase=="creating" or .phase=="prepared" or .phase=="ready") and (.size_mib|type=="number")' "$record" >/dev/null || die 'Swap归属记录异常，保留现场。'
-        valid_swap_size "$(jq -r .size_mib "$record")" || die 'Swap容量记录异常。'
-        [[ ! -e $file || -f $file ]] || die 'Swap路径不是普通文件。'
-    elif [[ -e $file ]] || swap_active || [[ -e $SYSTEMD/$unit ]]; then
-        die '发现没有本工具归属记录的Swap文件/服务；拒绝覆盖或删除，请人工核实。'
-    fi
-}
-swap_record() {
-    local size=$1 phase=$2 tmp
-    tmp=$(mktemp "$ROOT/data/.swap.XXXXXXXX")
-    jq -n --arg p "$ROOT/swap/swapfile" --arg u "$(swap_unit_name)" --arg s "$phase" --argjson m "$size" \
-        '{owner:"VPSKIT_SWAP_V1",path:$p,unit:$u,size_mib:$m,phase:$s}' > "$tmp"
-    chmod 600 "$tmp"; mv -f "$tmp" "$ROOT/data/swap.json"
-}
-swap_caption() {
-    if [[ ! -f $ROOT/data/swap.json ]]; then printf '本工具未配置'; return; fi
-    if swap_active; then
-        if systemctl is-enabled --quiet "$(swap_unit_name)" 2>/dev/null; then printf '运行中 / 重启保留'; else printf '运行中 / 持久化待修复'; fi
-    else printf '已记录 / 未启用（可重试）'; fi
-}
-swap_status() {
-    panel_title 'Swap虚拟内存'
-    free -m
-    printf '\n系统所有Swap（只读）：\n'; cat /proc/swaps
-    printf '\n本工具：%s\n' "$(swap_caption)"
-    if [[ -f $ROOT/data/swap.json ]]; then
-        jq -r '"容量：\(.size_mib) MiB；阶段：\(.phase)\n文件：\(.path)\n持久化服务：\(.unit)"' "$ROOT/data/swap.json"
-    fi
-    printf 'Swap是磁盘缓冲，速度慢于RAM；不能替代物理内存或提高网络带宽。\n'
-}
-swap_enable() {
-    local mode=${1:-recommended} size=1024 free_mib phase=creating file="$ROOT/swap/swapfile" record="$ROOT/data/swap.json" unit tool
-    for tool in swapon swapoff mkswap dd findmnt systemd-escape systemd-detect-virt; do command -v "$tool" >/dev/null || die "缺少工具 $tool，请先安装util-linux、coreutils和systemd。"; done
-    swap_check_ownership
-    swap_container && die '容器通常不能自行配置Swap，请在宿主机或服务商控制台处理。'
-    case "$(swap_filesystem)" in ext2|ext3|ext4|xfs) ;; *) die '自动Swap仅支持ext2/ext3/ext4/XFS；其他文件系统需专门配置，未创建文件。';; esac
-    if [[ -f $record ]]; then
-        size=$(jq -r .size_mib "$record"); phase=$(jq -r .phase "$record")
-        info "继续使用已记录的 $size MiB Swap；变更容量请先安全移除再创建。"
-    elif [[ $mode == custom ]]; then
-        ask_valid size 'Swap容量MiB（256～4096，256的倍数）' 1024 valid_swap_size '请输入256～4096且为256倍数的整数。'
-        size=$((10#$size))
-    fi
-    unit=$(swap_unit_name)
-    if ! swap_active; then
-        if [[ ! -f $file || $phase == creating ]]; then
-            # A partial dd file is retained after interruption; retry can recreate
-            # it only while inactive. Reserve 1 GiB for OS, updates and the site.
-            free_mib=$(swap_free_mib)
-            if [[ -f $file ]]; then free_mib=$((free_mib + $(du -k "$file" | awk '{print int($1/1024)}'))); fi
-            ((free_mib-size>=1024)) || die "磁盘空间不足：创建${size}MiB后须至少剩余1024MiB。可选较小容量或清理磁盘。"
-            mkdir -p "$ROOT/swap"; chmod 700 "$ROOT/swap"
-            swap_record "$size" creating
-            info "分配 $size MiB Swap文件（512MiB RAM推荐1024MiB；现有系统Swap保留）。"
-            run dd if=/dev/zero of="$file" bs=1M count="$size" status=progress conv=fsync
-            chmod 600 "$file"
-            run mkswap "$file"
-            swap_record "$size" prepared
-        fi
-        info '启用Swap；若平台不允许，保留归属记录，稍后可重试或移除。'
-        run swapon --priority 10 "$file"
-        swap_active || die 'swapon返回成功但未发现活动Swap，保留文件供检查。'
-    fi
-    unit_write "$unit" <<UNIT
-# VPSKIT_OWNED
-# VPSKIT_OWNED_SWAP
-[Unit]
-Description=VPSKit persistent swap
-[Swap]
-What=$file
-Priority=10
-TimeoutSec=120
-[Install]
-WantedBy=swap.target
-UNIT
-    run systemctl daemon-reload
-    run systemctl enable "$unit"
-    systemctl is-enabled --quiet "$unit" || die 'Swap已启用但开机持久化失败；请再次运行swap enable修复。'
-    swap_record "$size" ready
-    ok "Swap已启用：$size MiB；开机通过 $unit 自动启用。"
-}
-swap_remove() {
-    local prompt=${1:-yes} file="$ROOT/swap/swapfile" record="$ROOT/data/swap.json" unit used available
-    swap_check_ownership
-    [[ -f $record ]] || { info '没有本工具管理的Swap。'; return 0; }
-    unit=$(swap_unit_name)
-    if [[ $prompt == yes ]]; then confirm '关闭并删除本工具Swap及开机服务（其他系统Swap保留）' || return 0; fi
-    if swap_active; then
-        used=$(swap_used_kib); available=$(swap_available_kib)
-        ((available>=used+131072)) || die '当前可用RAM不足以安全移除Swap（需已用Swap+128MiB余量）；请先停止占内存的程序再重试。'
-        info '仅停用本工具Swap；失败时保留文件和持久化服务。'
-        if ! swapoff "$file"; then die 'swapoff失败，未删除Swap；请释放内存后重试。'; fi
-        swap_active && die 'Swap仍然处于活动状态，拒绝删除。'
-    fi
-    if [[ -e $SYSTEMD/$unit ]]; then
-        run systemctl disable "$unit"
-        rm -f -- "$SYSTEMD/$unit"
-        run systemctl daemon-reload
-    fi
-    rm -f -- "$file" "$record"
-    if [[ -d $ROOT/swap ]]; then rmdir "$ROOT/swap" 2>/dev/null || warn 'Swap目录有其他文件，已保留。'; fi
-    ok '本工具Swap和开机服务已移除。'
-}
-swap_menu() {
-    local choice
-    while [[ -f $STATE ]]; do
-        panel_title "Swap虚拟内存 · $(swap_caption)"
-        menu_item 1 '一键添加 / 恢复Swap' '推荐1024MiB；文件集中存放，开机自动启用；已有配置则修复'
-        menu_item 2 '自定义容量' '256～4096MiB，256的倍数；至少保留1GiB磁盘空间'
-        menu_item 3 '内存与Swap状态' '查看实际使用量、其他系统Swap及开机持久化状态'
-        menu_item 4 '移除本工具Swap' '先检查可用RAM，成功停用后再删除；保留其他Swap'
-        menu_item 0 '返回' '回到主菜单'
-        ask choice '选择编号' 0
-        case "$choice" in 1) menu_run swap_enable;; 2) menu_run swap_enable custom;; 3) menu_run swap_status;; 4) menu_run swap_remove;; 0) return;; *) warn '无效选择。';; esac
-    done
-}
-swap_action() {
-    case "$1" in enable) swap_enable;; custom) swap_enable custom;; status) swap_status;; remove) swap_remove;; *) die '用法：vpskit swap status|enable|custom|remove';; esac
-}
-
-path_row() {
-    local label=$1 path=$2 state='未创建 / 无权查看' color=$YELLOW
-    if [[ -L $path && ! -e $path ]]; then state='链接目标缺失'; color=$RED
-    elif [[ -e $path ]]; then state='存在'; color=$GREEN; fi
-    printf '  %s[%s]%s %s\n      %s\n' "$color" "$state" "$RESET" "$label" "$path"
-}
-show_paths() {
-    panel_title '配置文件与安装目录（只显示路径，不显示凭据）'
-    path_row '集中安装目录' "$ROOT"
-    path_row '管理脚本' "$ROOT/vpskit.sh"
-    path_row '终端唤醒入口' "$ENTRY"
-    path_row 'Xray配置：所有代理协议共用' "$ROOT/config/xray.json"
-    path_row 'Xray可执行文件' "$XRAY"
-    path_row 'Nginx配置：网站、TLS、WS/XHTTP反向代理' "$ROOT/config/nginx.conf"
-    path_row 'Nginx可执行文件' "$NGINX"
-    path_row '管理状态：节点、域名、偏好（含敏感信息）' "$STATE"
-    path_row 'acme.sh程序' "$ACME"
-    path_row 'ACME账户及DNS验证配置（含敏感信息）' "$ROOT/acme/config"
-    path_row 'ACME证书存储' "$ROOT/acme/certstore"
-    path_row '网站内容总目录' "$ROOT/www"
-    path_row 'HTTP证书验证目录' "$ROOT/www/acme/.well-known/acme-challenge"
-    local d
-    if [[ -r $STATE ]] && command -v jq >/dev/null; then
-        while IFS= read -r d; do
-            valid_domain "$d" || continue
-            path_row "网站：$d" "$ROOT/www/$d"
-            path_row "证书链：$d" "$ROOT/certs/$d/current/fullchain.pem"
-            path_row "证书私钥：$d" "$ROOT/certs/$d/current/key.pem"
-        done < <(jq -r '.sites[]?.domain // empty' "$STATE" 2>/dev/null)
-    fi
-    path_row 'Xray日志' "$ROOT/logs/xray.log"
-    path_row 'Nginx日志' "$ROOT/logs/nginx.log"
-    path_row '管理日志' "$ROOT/logs/manage.log"
-    path_row '配置回滚快照' "$ROOT/backup/last"
-    path_row '方案B回源网段、公共AOP CA与更新时间' "$ROOT/config/edge"
-    path_row 'Swap文件' "$ROOT/swap/swapfile"
-    path_row 'Swap归属与阶段记录' "$ROOT/data/swap.json"
-    if command -v systemd-escape >/dev/null; then path_row 'Swap开机服务' "$SYSTEMD/$(swap_unit_name)"; fi
-    path_row '防火墙操作记录' "$ROOT/data/firewall.json"
-    path_row '内核调优配置' "$ROOT/data/sysctl.conf"
-    path_row '内核调优系统入口' "$SYSCTL_LINK"
-    for d in xray.service nginx.service maintain.service maintain.timer; do
-        path_row "systemd：vpskit-$d" "$SYSTEMD/vpskit-$d"
-    done
-    path_row '系统UFW配置（如已安装）' /etc/ufw
-    path_row '系统firewalld配置（如已安装）' /etc/firewalld
-    printf '\n生成的Xray/Nginx配置会被菜单操作重新生成；请优先通过面板修改。\n网站文件可以自行编辑；配置、状态和私钥不要上传到公开仓库。\n续期任务日志：journalctl -u vpskit-maintain.service -n 100 --no-pager\n'
-}
-
-help_text() {
-    cat <<'EOF'
-VPSKit 单文件管理器
-  sudo bash vpskit.sh                  首次启动/菜单
-  sudo vpskit                         管理菜单
-  sudo vpskit install [xray|nginx|acme] 完整向导/单组件安装
-  sudo vpskit node add                 添加节点/共享入口用户
-  sudo vpskit node list
-  sudo vpskit node migrate-xhttp [名称或序号]  保留旧节点，新增VLESS XHTTP
-  sudo vpskit node xhttp-version [名称或序号]  切换H2/经Cloudflare的H3
-  sudo vpskit node xhttp-json [名称或序号]     导出完整Xray客户端JSON（含凭据）
-  sudo vpskit node export [名称或序号]       输出含凭据的客户端链接
-  sudo vpskit node edit [名称或序号]         更换UUID/密码
-  sudo vpskit node rename [名称或序号]       修改节点名称
-  sudo vpskit node address [名称或序号] 修改连接域名/IPv4/IPv6，保留SNI
-  sudo vpskit node port [名称或序号]         修改整个入口端口
-  sudo vpskit node enable|disable|delete [名称或序号]
-  sudo vpskit site add|edit|list|remove|default
-  sudo vpskit wizard configure|status  保存默认值/查看逐步进度
-  sudo vpskit cert issue|renew|status|settings
-  sudo vpskit update xray|nginx|acme|manager|all
-  sudo vpskit optimize                 网络与网站优化菜单
-  sudo vpskit optimize status|bbr|mtu|restore|gzip-on|gzip-off
-  sudo vpskit rollback                 回滚最近一次配置事务（内核调优单独恢复）
-  sudo vpskit service start|stop|restart xray|nginx
-  sudo vpskit paths                    查看配置、证书、日志、服务等路径
-  sudo vpskit firewall                 防火墙管理菜单
-  sudo vpskit firewall status|open|close|sync|cleanup
-  sudo vpskit edge                     方案B防护与流量菜单
-  sudo vpskit edge status|profile|bots|limits|cache|origin|aop|probe|refresh|guide|traffic|reset
-  sudo vpskit swap                     Swap虚拟内存菜单
-  sudo vpskit swap status|enable|custom|remove
-  sudo vpskit status|doctor|repair
-  sudo vpskit logs xray|nginx|manager|cert
-  sudo vpskit uninstall xray|nginx|acme|all
-  bash vpskit.sh help|version|explain   不需要root，不修改系统
-  bash vpskit.sh selftest              本地静态功能测试，不联网、不部署
-选项: --no-color（放在命令之前）
-格式错误可原地重输，输入:q取消当前操作；已保存的方案和偏好保留。
-修改命令需要交互输入；定时续期为无人值守。无危险的全局--force。
-默认仓库文件: biao169/V2ray_deploy/main/vpskit.sh
-仅支持Debian 12+ / Ubuntu 18.04+、systemd、amd64/arm64。不创建用户、不修改SSH。
-Ubuntu旧版本需要仍可用的软件源及更新后的基础库；脚本不改软件源。
-仅一个Xray进程，Nginx单worker；面板无常驻Web进程，适合小型静态网站与少量连接。
-网站内容: /opt/vpskit/www/域名。证书续期依赖DNS和网络可用性。
-默认拒绝代理访问回环/私网/云元数据地址，不下载GeoIP/GeoSite大规则。
-默认内核锁定到本地验证版本；更新时可输入latest或指定版本。
-配置变更会重启Xray；大量持续连接时请安排维护窗口。
-完整卸载后系统软件包日志/已存在依赖不属于本工具文件，不擦除。
+paths_show() {
+    cat <<EOF
+管理代码：$ROOT/vpskit.sh
+快捷命令：$ENTRY
+持久配置：$STATE（包含凭据，禁止公开）
+Nginx生成配置：$ROOT/config/nginx.conf
+Xray生成配置：$ROOT/config/xray.json
+网站文件：$ROOT/www/<domain>/
+证书/私钥：$ROOT/certs/<domain>/current/
+ACME账户与DNS凭据：$ROOT/acme/config/
+历史快照：$ROOT/backup/history/（最近$HISTORY_KEEP份）
+最近事务回滚：$ROOT/backup/last/
+代码备份：$ROOT/backup/code/
+服务文件：$SYSTEMD/vpskit-*.service / vpskit-maintain.timer
+日志：$ROOT/logs/
+不要直接编辑自动生成的Nginx/Xray配置；使用高级配置和节点/网站菜单。
 EOF
 }
-panel_title() { printf '\n%s%s━━ %s ━━%s\n' "$BOLD" "$MAGENTA" "$1" "$RESET"; }
-menu_item() {
-    local tone=$BLUE
-    case "$2" in *卸载*|*删除*|*移除*|*关闭端口*) tone=$RED;; esac
-    [[ $1 != 0 ]] || tone=$DIM
-    printf '  %s%2s%s  %s%s%s\n      %s%s%s\n' "$tone" "$1" "$RESET" "$BOLD" "$2" "$RESET" "$DIM" "$3" "$RESET"
+logs_show() {
+    local name=${1:-nginx} lines=${2:-100} file
+    number "$lines" 1 2000 || die '日志行数应为1～2000。'
+    case "$name" in nginx) file=nginx.log;; xray) file=xray.log;; manager) file=manage.log;; service) file=nginx-service.log;; access) file=access.log;; *) die '日志类型：nginx/xray/manager/service/access。';; esac
+    [[ -f $ROOT/logs/$file && ! -L $ROOT/logs/$file ]] || { info '日志文件尚不存在。'; return; }
+    warn '日志可能包含IP、路径或上游错误信息；分享前请脱敏。'
+    tail -n "$lines" "$ROOT/logs/$file"
 }
-status_badge() {
-    local value=$1 tone=$YELLOW
-    case "$value" in *异常*|*失败*|*缺失*) tone=$RED;; *未*|*待*|*停*|*进行中*) tone=$YELLOW;; *正常*|*运行*|*就绪*|*已*|*完成*) tone=$GREEN;; esac
-    printf '%s%s%s' "$tone" "$value" "$RESET"
+service_action() {
+    local name=$1 action=$2
+    choice "$name" 'nginx xray' && choice "$action" 'start stop restart' || die '服务操作无效。'
+    ensure_component "$name"
+    [[ -f $SYSTEMD/vpskit-$name.service ]] && grep -Fq '# VPSKIT_OWNED' "$SYSTEMD/vpskit-$name.service" || die '服务文件不属于VPSKit。'
+    confirm "对vpskit-$name执行$action；可能中断现有连接" || return 0
+    systemctl "$action" "vpskit-$name.service"
+    if [[ $action != stop ]]; then systemctl is-active --quiet "vpskit-$name.service" || die '服务未运行。'; fi
 }
-panel_header() {
-    local memory disk last domain
-    refresh_deployment
-    memory=$(free -m | awk '/^Mem:/{printf "%s/%s MiB（可用%s）",$3,$2,$7}')
-    disk=$(df -h "$ROOT" | awk 'NR==2{printf "%s可用",$4}')
-    domain=$(default_domain); domain=${domain:-待配置}
-    panel_title "VPSKit $VERSION · 轻量终端面板"
-    printf '  %s方案 %s%s  |  默认网站 %s%s%s\n' "$BOLD" "$D_SCHEME" "$RESET" "$CYAN" "$domain" "$RESET"
-    printf '  部署：'; status_badge "$D_DEPLOYMENT"; printf '（%s/%s步骤）\n' "$D_DONE" "$D_TOTAL"
-    printf '  Xray：'; status_badge "$D_XRAY"; printf '  |  Nginx：'; status_badge "$D_NGINX"; printf '  |  acme.sh：'; status_badge "$D_ACME"; printf '\n'
-    printf '  节点 %s%s%s（配置启用%s） | 网站 %s | 有效证书 %s | 续期 ' "$CYAN" "$D_NODE_TOTAL" "$RESET" "$D_NODE_ENABLED" "$D_SITE_TOTAL" "$D_CERT_OK"
-    status_badge "$D_TIMER"; printf '\n'
-    printf '  %s内存 %s | 磁盘 %s%s\n' "$DIM" "$memory" "$disk" "$RESET"
-    printf '  Swap：'; status_badge "$(swap_caption)"; printf '\n'
-    printf '  网站防护：爬虫策略%s个 / 仅CF回源%s个 / AOP强制%s个（菜单12管理）\n' \
-        "$(get '[.sites[]|select((.protection.bots // "off")!="off")]|length')" \
-        "$(get '[.sites[]|select(.protection.origin==true)]|length')" \
-        "$(get '[.sites[]|select(.protection.aop=="enforce")]|length')"
-    if ((D_CERT_DUE>0)); then printf '  %s提醒：%s张证书不足14天，请检查续期。%s\n' "$YELLOW" "$D_CERT_DUE" "$RESET"; fi
-    last=$(get '.wizard.last_step // ""')
-    if [[ -n $last ]]; then printf '  上次步骤：%s / ' "$last"; status_badge "$(get '.wizard.last_result // ""')"; printf '\n'; fi
-    printf '  %s下一步：%s%s\n' "$CYAN" "$D_NEXT" "$RESET"
-    printf '  %s数据: %s | 唤醒: sudo vpskit | 输入错误可重试，:q取消%s\n' "$DIM" "$ROOT" "$RESET"
-    printf '  %s正常%s / %s待处理%s / %s异常或删除操作%s · 状态以文字同时标示\n' "$GREEN" "$RESET" "$YELLOW" "$RESET" "$RED" "$RESET"
+firewall_show() {
+    printf '本工具不会自动启用/重置防火墙，不修改SSH规则。\n'
+    if command -v ufw >/dev/null; then ufw status verbose; fi
+    if command -v nft >/dev/null; then nft list ruleset; elif command -v iptables >/dev/null; then iptables -S; fi
+    printf '\n本工具需要的公网端口（云厂商安全组仍需单独放行）：\n'
+    if component_ready nginx; then printf '80/tcp 443/tcp\n'; fi
+    jq -r '[.nodes[]|select(.enabled and .mode!="ws" and .mode!="xhttp")]|unique_by(.entry)[]|"\(.port)/tcp"+(if .mode=="ss" then " \(.port)/udp" else "" end)' "$STATE"
+}
+firewall_allow() {
+    local port=${1:-} proto=${2:-tcp}
+    need ufw
+    [[ -n $port ]] || ask_valid port '要添加的UFW放行端口' '' valid_port
+    valid_port "$port" && choice "$proto" 'tcp udp' || die '端口/协议无效。'
+    confirm "仅添加UFW allow $port/$proto，不启用或重置UFW" || return 0
+    ufw allow "$port/$proto" comment VPSKit
+}
+swap_show() { free -h; swapon --show; }
+swap_create() {
+    local size=${1:-} file=/var/lib/vpskit/swapfile available needed fstype
+    [[ -n $size ]] || ask_valid size 'Swap容量MiB（256～8192）' 1024 number 256 8192
+    number "$size" 256 8192 || die 'Swap容量超出范围。'
+    [[ ! -e /var/lib/vpskit && ! -L /var/lib/vpskit ]] || {
+        [[ -d /var/lib/vpskit && ! -L /var/lib/vpskit && -f /var/lib/vpskit/.owned ]] || die 'Swap目录被外部程序占用。'
+    }
+    [[ ! -e $file && ! -L $file ]] || die '已存在本工具Swap，不会反复创建或覆盖。'
+    fstype=$(stat -f -c %T /var/lib)
+    case "$fstype" in ext2/ext3|xfs) ;; *) die "当前文件系统${fstype}不在此简化Swap流程支持范围（ext4/XFS），请手工管理。";; esac
+    available=$(df -Pk /var/lib | awk 'NR==2{print $4}'); needed=$((size*1024+262144))
+    ((available>needed)) || die '磁盘空间不足（预留256MiB）。'
+    [[ -f /etc/fstab && ! -L /etc/fstab ]] || die '/etc/fstab必须为普通文件。'
+    confirm "创建${size}MiB Swap并添加一条带标识的fstab记录；不会变更已有Swap" || return 0
+    mkdir -p /var/lib/vpskit; chmod 700 /var/lib/vpskit; printf VPSKIT_SWAP > /var/lib/vpskit/.owned
+    if ! dd if=/dev/zero of="$file" bs=1M count="$size" status=none; then rm -f "$file"; die 'Swap文件分配失败。'; fi
+    chmod 600 "$file"
+    if ! mkswap "$file" || ! swapon "$file"; then rm -f "$file"; die 'Swap激活失败，已删除本次文件。'; fi
+    mkdir -p "$ROOT/backup/system"; cp -a /etc/fstab "$ROOT/backup/system/fstab-before-swap-$(date +%s)"
+    if ! grep -Fq "$file " /etc/fstab; then printf '%s none swap sw 0 0 # VPSKIT_SWAP\n' "$file" >> /etc/fstab; fi
+    ok 'Swap已启用；现有Swap未修改。'
+}
+swap_remove() {
+    local file=/var/lib/vpskit/swapfile
+    [[ -f /var/lib/vpskit/.owned && $(cat /var/lib/vpskit/.owned) == VPSKIT_SWAP && ! -L /var/lib/vpskit && -f $file && ! -L $file ]] || die '没有可验证的本工具Swap。'
+    confirm '关闭并删除本工具Swap；内存不足时swapoff可能失败，不处理其他Swap' || return 0
+    if swapon --noheadings --raw --show=NAME | grep -Fxq "$file"; then swapoff "$file" || die 'swapoff失败，文件及启动配置保持不变。'; fi
+    mkdir -p "$ROOT/backup/system"; cp -a /etc/fstab "$ROOT/backup/system/fstab-before-swap-remove-$(date +%s)"
+    sed -i '\|^/var/lib/vpskit/swapfile .*# VPSKIT_SWAP$|d' /etc/fstab
+    rm -f "$file" /var/lib/vpskit/.owned; rmdir /var/lib/vpskit || true
+    ok '只删除了本工具Swap。'
+}
+uninstall_keep_data() {
+    local u
+    warn '卸载只停止/删除本工具服务与命令入口。配置、证书、网站、代码、备份、Swap和防火墙规则全部保留。'
+    confirm '执行保留数据的卸载' || return 0
+    for u in "${UNITS[@]}"; do
+        if [[ -f $SYSTEMD/$u ]] && grep -Fq '# VPSKIT_OWNED' "$SYSTEMD/$u"; then systemctl disable --now "$u" || true; rm -f "$SYSTEMD/$u"; fi
+    done
+    [[ ! -L $ENTRY || $(readlink "$ENTRY") != "$ROOT/vpskit.sh" ]] || rm -f "$ENTRY"
+    systemctl daemon-reload
+    ok "服务已移除，数据保留。恢复运行：sudo bash $ROOT/vpskit.sh apply"
+}
+legacy_restore_transaction() {
+    local dir=$1 p u failed=0
+    [[ -f $dir/ready && -f $dir/state.json && -d $dir/tree ]] || return 1
+    state_basic "$dir/state.json" || return 1
+    warn '恢复1.6.0旧格式事务；不把旧快照当作新格式删除。'
+    systemctl stop vpskit-xray.service vpskit-nginx.service >/dev/null 2>&1 || true
+    for p in bin nginx config certs acme; do
+        [[ -d $dir/tree/$p && ! -L $dir/tree/$p ]] || return 1
+        rm -rf -- "$ROOT/$p"; cp -a "$dir/tree/$p" "$ROOT/$p" || failed=1
+    done
+    cp -a "$dir/state.json" "$STATE" || failed=1
+    for u in "${UNITS[@]}"; do
+        if [[ -f $dir/units/$u ]]; then cp -a "$dir/units/$u" "$SYSTEMD/$u" || failed=1
+        elif [[ -f $SYSTEMD/$u ]] && grep -Fq '# VPSKIT_OWNED' "$SYSTEMD/$u"; then systemctl disable --now "$u" >/dev/null 2>&1 || true; rm -f "$SYSTEMD/$u"; fi
+    done
+    chown 0:0 "$ROOT"; chmod 700 "$ROOT"
+    systemctl daemon-reload || failed=1
+    for u in "${UNITS[@]}"; do
+        if [[ -f $dir/enabled ]] && grep -Fxq "$u" "$dir/enabled"; then systemctl enable "$u" >/dev/null 2>&1 || failed=1
+        else systemctl disable "$u" >/dev/null 2>&1 || true; fi
+    done
+    if [[ -f $dir/active ]]; then while IFS= read -r u; do systemctl start "$u" || failed=1; done < "$dir/active"; fi
+    if [[ -f $dir/stopped-external ]]; then
+        while IFS= read -r u; do [[ -z $u ]] || systemctl start "$u" || failed=1; done < "$dir/stopped-external"
+    fi
+    ((failed==0))
+}
+usage() {
+    cat <<'EOF'
+VPSKit 1.7.0-enhanced 完整单文件管理器（非上游官方发布）
+用法：sudo bash ./vpskit.sh [命令]  /  sudo vpskit [命令]
+无参数进入面板。执行前建议先阅读随附README。
+
+  version | help | selftest                 无需root，不改变系统
+  install                                  新装或继续原部署（保留已填参数）
+  install xray|nginx|acme [Xray版本]         单独补装，不重复安装已有组件
+  apply                                    按现有state重新生成、检查并应用
+  status | doctor | paths                  状态、检查、文件位置
+  node list|add|share|export|client [名称]    节点、共享用户、客户端配置
+  node enable|disable|delete|rotate 名称
+  node rename|port|host 名称 [值]           改名、入口端口、连接地址
+  site list|add|edit|remove [域名]           网站配置，不覆盖网站内容
+  cert issue [域名] | cert status | cert renew
+  cert import 域名 /证书路径 /私钥路径
+  advanced show | advanced edit [键] | advanced defaults
+  advanced set nginx.workers 2 nginx.connections 2048 nginx.nofile 8192
+  advanced set nginx.worker_user auto
+  advanced set xray.nofile 16384
+  history list | history save [备注]
+  history restore [快照ID] [full|state|advanced]
+  rollback | repair                        最近事务回滚 / 恢复中断事务
+  update manager [/新版脚本.sh|HTTPS地址] [独立确认的SHA256]
+  update nginx|xray|acme [Xray版本]          组件更新，与代码更新分离
+  edge show [域名] | edge edit | edge refresh
+  edge set 域名 bots|rate|burst|connections|kbps|static_ttl|gzip|origin|aop 值
+  performance gzip [true|false]
+  service nginx|xray start|stop|restart
+  logs [nginx|xray|manager|service|access] [行数]
+  firewall status | firewall allow [端口] [tcp|udp]
+  swap status | swap create [MiB] | swap remove
+  maintenance                              定时证书/日志维护
+  uninstall                                卸载服务，保留所有数据
+
+示例：先 sudo bash ./vpskit.sh update manager ./vpskit.sh 仅换代码；
+再 sudo vpskit apply 明确应用降权与参数，不把代码更新当成部署重做。
+Xray默认版本固定为v26.3.27；update xray latest为显式选择最新版。
+原版1.6.0远程文件不含增强标识，拒绝用它覆盖本版；可上传本版到自己的仓库。
+端口/凭据/证书均保存在/opt/vpskit/data/state.json及私有目录。
+EOF
+}
+selftest() {
+    valid_domain example.com && ! valid_domain 'a;evil.com' && ! valid_domain '../example.com'
+    valid_host 127.0.0.1 && valid_host ::1 && ! valid_host 999.1.1.1 && ! valid_host 1::2::3
+    valid_path /abcdefgh1234 && ! valid_path / && ! valid_path '/../../etc'
+    valid_upstream http://127.0.0.1:8000 && ! valid_upstream http://127.0.0.1:80
+    valid_redirect https://example.com/path && ! valid_redirect 'https://example.com/;}'
+    valid_uuid 00112233-4455-6677-8899-aabbccddeeff && ! valid_uuid xyz
+    number 2048 128 65535 && ! number 08 1 10
+    if command -v jq >/dev/null; then nginx_defaults | jq -e '.workers==1 and .connections==1024 and .worker_user=="auto"' >/dev/null; fi
+    printf '内置纯校验自检通过；未安装组件、未变更系统。\n'
 }
 menu_run() {
-    # A subshell retains errexit and its rollback trap. Calling it in if/|| would
-    # disable errexit in Bash functions, allowing failed commands to be committed.
-    local rc
+    local rc answer
+    # Each command runs in a child with its own lock and errexit scope. Testing
+    # a mutating function in `if fn` would disable Bash errexit inside that fn.
     set +e
-    trap - ERR
-    (
-        set -Ee
-        trap 'on_error $? $LINENO' ERR
-        trap on_exit EXIT
-        [[ -f $STATE ]] || die '部署已被另一会话移除，请退出面板。'
-        flock -w 5 "$LOCK_FD" || die '另一个管理任务正在执行，请稍后再试。'
-        [[ $(stat -Lc '%d:%i' "/proc/self/fd/$LOCK_FD") == "$(stat -Lc '%d:%i' "$ROOT/run/manage.lock")" ]] || die '部署锁已被另一会话替换，请退出并重新运行vpskit。'
-        HAVE_LOCK=1
-        PANEL_IDLE=0
-        WORK=$(mktemp -d "$ROOT/tmp/menu.XXXXXXXX")
-        TX=0
-        recover
-        init_preferences
-        "$@"
-    )
+    bash "$SELF" "$@"
     rc=$?
     set -e
-    trap 'on_error $? $LINENO' ERR
-    flock -u "$LOCK_FD"
-    if ((rc != 0)); then warn "本次操作未完成（$rc），已返回面板。"; fi
-    if [[ -f $STATE ]]; then local answer; ask answer '按回车返回菜单' ''; fi
+    printf '\n操作退出码：%s\n' "$rc"
+    ask answer '回车返回面板（:q退出）' ''
 }
-component_menu() {
-    local action=$1 choice
-    while [[ -f $STATE ]]; do
-        refresh_deployment
-        panel_title "$action · 独立组件管理"
-        printf '  部署：%s | Xray：%s | Nginx：%s | acme.sh：%s\n' "$D_DEPLOYMENT" "$D_XRAY" "$D_NGINX" "$D_ACME"
-        case "$action" in
-            install) menu_item 1 "继续部署向导 · $D_DEPLOYMENT" "已完成步骤自动跳过；$D_NEXT";;
-            update) menu_item 1 '更新所有已装组件' '依次更新Xray、Nginx、证书工具、管理脚本';;
-            uninstall) menu_item 1 '完整卸载' '删除本工具全部资料，并恢复本工具内核调优';;
-        esac
-        menu_item 2 'Xray代理核心' '只处理代理程序；卸载会删除所有代理节点'
-        menu_item 3 'Nginx网站与WS/XHTTP入口' '只处理独立Nginx；有依赖的网站/节点时禁止卸载'
-        menu_item 4 'acme.sh自动证书' '只处理证书工具；有证书依赖时禁止卸载'
-        [[ $action != update ]] || menu_item 5 '管理脚本' '从你配置的GitHub地址更新；下次唤醒生效'
-        if [[ $action == install ]]; then
-            menu_item 5 '修改方案与默认值' '保存方案、域名、证书验证方式和网站类型；继续部署时应用'
-            menu_item 6 '查看逐步进度' '根据程序文件、配置、证书、服务和端口判断完成情况'
-        fi
-        menu_item 0 '返回' '回到主菜单'
-        ask choice '选择编号' 0
-        case "$choice" in
-            0) return;;
-            1) menu_run "${action}_all";;
-            2) menu_run "${action}_component" xray;;
-            3) menu_run "${action}_component" nginx;;
-            4) menu_run "${action}_component" acme;;
-            5) if [[ $action == update ]]; then menu_run update_manager; elif [[ $action == install ]]; then menu_run configure_wizard; else warn '无效选择。'; fi;;
-            6) if [[ $action == install ]]; then menu_run deployment_details; else warn '无效选择。'; fi;;
-            *) warn '无效选择。';;
-        esac
-    done
-}
-node_menu() {
-    local choice
-    while [[ -f $STATE ]]; do
-        refresh_deployment
-        panel_title "节点与用户管理 · 共$D_NODE_TOTAL个 / 配置启用$D_NODE_ENABLED个"
-        printf '  当前方案%s匹配节点：%s | Xray：%s\n' "$D_SCHEME" "$D_PLAN_ENABLED" "$D_XRAY"
-        menu_item 1 '添加节点 / 共享入口用户' '选择协议和传输；UUID、密码、端口可默认或自定义'
-        menu_item 2 '节点列表' '查看协议、传输、入口端口和启用状态'
-        menu_item 3 '导出客户端链接' '链接含凭据；请仅交给可信客户端'
-        menu_item 4 '更换UUID / 密码' '旧凭据立即失效，同入口其他用户保留'
-        menu_item 5 '修改入口端口' '检查占用；共享该入口的所有用户一起修改'
-        menu_item 6 '修改节点名称' '修改管理名称与导出链接备注'
-        menu_item 7 '启用节点' '检查入口端口，再恢复代理服务'
-        menu_item 8 '停用节点' '保留参数，可随时再次启用'
-        menu_item 9 '删除节点' '按列表序号选择；删除该用户凭据前确认'
-        menu_item 10 '修改连接域名 / IPv4 / IPv6' '按序号选择；保留证书域名/SNI，更新整个共享入口的连接地址'
-        menu_item 11 '迁移到VLESS XHTTP' '按序号选旧节点，新建独立节点，测试前保留旧节点'
-        menu_item 12 'XHTTP H2 / H3切换' 'H3仅经Cloudflare；切换后重新导入客户端'
-        menu_item 13 '导出XHTTP客户端JSON' '供不完整支持分享链接的Xray客户端使用；含凭据'
-        menu_item 0 '返回' '回到主菜单'
-        ask choice '选择编号' 0
-        case "$choice" in
-            1) menu_run node_add;; 2) menu_run node_list;; 3) menu_run node_export;;
-            4) menu_run node_action edit;; 5) menu_run node_action port;; 6) menu_run node_action rename;;
-            7) menu_run node_action enable;; 8) menu_run node_action disable;; 9) menu_run node_action delete;; 10) menu_run node_action address;;
-            11) menu_run node_migrate_xhttp;; 12) menu_run node_xhttp_version;; 13) menu_run node_xhttp_json;;
-            0) return;; *) warn '无效选择。';;
-        esac
-    done
-}
-site_list() { jq '.sites|map(del(.email))' "$STATE"; }
-site_default() { local domain; site_select domain; ok "默认网站已记住：$domain"; }
-site_menu() {
-    local choice
-    while [[ -f $STATE ]]; do
-        refresh_deployment
-        panel_title "网站与证书 · 网站$D_SITE_TOTAL个 / 有效证书$D_CERT_OK张"
-        printf '  默认域名：%s | 续期：%s | 14天内到期：%s\n' "$(default_domain)" "$D_TIMER" "$D_CERT_DUE"
-        menu_item 1 '添加 / 继续配置网站' '默认使用已记住域名；轻量模板、自建网站、反代或跳转'
-        menu_item 2 '修改网站' '修改站点内容入口等参数'
-        menu_item 3 '网站列表' '查看域名和部署状态'
-        menu_item 4 '删除网站' '先检查节点依赖，再确认删除'
-        menu_item 5 '签发 / 重新签发证书' 'HTTP验证或支持的DNS API验证'
-        menu_item 6 '检查续期' '调用ACME按到期策略续期，不强制重复签发'
-        menu_item 7 '证书状态' '查看当前证书与到期时间'
-        menu_item 8 '修改证书默认值' '设置邮箱、HTTP/DNS验证及泛域名选项'
-        menu_item 9 '选择默认网站' '记住已有域名，供后续网站和节点操作使用'
-        menu_item 0 '返回' '回到主菜单'
-        ask choice '选择编号' 0
-        case "$choice" in
-            1) menu_run site_add;; 2) menu_run site_edit;; 3) menu_run site_list;; 4) menu_run site_remove;;
-            5) menu_run cert_issue;; 6) menu_run cert_renew;; 7) menu_run cert_status;;
-            8) menu_run site_certificate_edit;; 9) menu_run site_default;;
-            0) return;; *) warn '无效选择。';;
-        esac
-    done
-}
-optimize_menu() {
-    local choice
-    while [[ -f $STATE ]]; do
-        panel_title '网络与网站优化（512MB保守设置）'
-        menu_item 1 '查看能力与当前状态' '检查内核算法、MTU探测、网卡队列和gzip'
-        menu_item 2 '启用BBR + 默认fq' '可能改善部分高延迟/丢包链路；需要内核支持'
-        menu_item 3 '启用按需MTU探测' '检测到MTU黑洞时尝试较小报文；不保证提速'
-        menu_item 4 '恢复内核原值' '撤销本工具的BBR/fq/MTU设置和持久化文件'
-        menu_item 5 '开启静态网站轻量gzip' '压缩HTML/CSS/JS等；级别2，减少文本传输量'
-        menu_item 6 '关闭静态网站gzip' '节省压缩CPU；适合CPU受限或已预压缩的站点'
-        menu_item 0 '返回' 'WS已关闭代理缓冲；TLS会话缓存、TCP_NODELAY默认启用'
-        ask choice '选择编号' 0
-        case "$choice" in
-            1) menu_run tuning_status;; 2) menu_run tuning_apply bbr;; 3) menu_run tuning_apply mtu;;
-            4) menu_run tuning_restore;; 5) menu_run gzip_action true;; 6) menu_run gzip_action false;;
-            0) return;; *) warn '无效选择。';;
-        esac
-    done
-}
-service_menu() {
-    local choice action component
-    panel_title '服务控制'
-    menu_item 1 '启动' '启动已经安装的组件'
-    menu_item 2 '停止' '停止组件；网站或代理会暂时不可用'
-    menu_item 3 '重启' '重新建立监听器；现有连接可能中断'
-    menu_item 0 '返回' '不修改服务'
-    ask_valid choice '操作编号' 0 valid_choice '请选择0～3。' '0 1 2 3'
-    case "$choice" in 0) return;; 1) action=start;; 2) action=stop;; 3) action=restart;; *) warn '无效选择。'; return;; esac
-    menu_item 1 'Xray' '代理节点服务'
-    menu_item 2 'Nginx' '网站和WS/XHTTP+TLS入口'
-    ask_valid choice '组件编号' 1 valid_choice '请选择1或2。' '1 2'
-    case "$choice" in 1) component=xray;; 2) component=nginx;; *) warn '无效选择。'; return;; esac
-    menu_run service_action "$action" "$component"
-}
-operations_menu() {
-    local choice
-    while [[ -f $STATE ]]; do
-        panel_title '状态、日志与维护'
-        menu_item 1 '运行状态' '查看资源、组件版本、节点和证书状态'
-        menu_item 2 '诊断检查' '验证配置，查看端口、DNS、HTTPS和续期timer'
-        menu_item 3 'Xray日志' '最近100行代理错误日志'
-        menu_item 4 'Nginx日志' '最近100行网站/WS/XHTTP入口错误日志'
-        menu_item 5 '管理日志' '最近100行安装与管理过程日志'
-        menu_item 6 '证书任务日志' '查看systemd续期任务结果'
-        menu_item 7 '恢复中断事务' '重试恢复上次未完成的配置或调优操作'
-        menu_item 8 '回滚最近一次配置' '恢复节点、证书和程序快照；内核调优在优化菜单恢复'
-        menu_item 9 '服务启动 / 停止 / 重启' '按组件控制，操作可能中断现有连接'
-        menu_item 10 '配置文件与安装目录' '显示Xray、Nginx、网站、证书和日志的实际路径'
-        menu_item 0 '返回' '回到主菜单'
-        ask choice '选择编号' 0
-        case "$choice" in
-            1) menu_run status;; 2) menu_run doctor;; 3) menu_run logs xray;; 4) menu_run logs nginx;;
-            5) menu_run logs manager;; 6) menu_run logs cert;; 7) menu_run recover;; 8) menu_run rollback_last;;
-            9) service_menu;; 10) menu_run show_paths;; 0) return;; *) warn '无效选择。';;
-        esac
-    done
-}
-main_menu() {
-    local choice
-    # An idle panel must not block hourly certificate renewal or another terminal.
-    PANEL_IDLE=1
-    HAVE_LOCK=0
-    flock -u "$LOCK_FD"
-    while [[ -f $STATE ]]; do
-        panel_header
-        menu_item 1 "部署与安装 · $D_DEPLOYMENT" '记住A/B方案和默认值；继续未完成步骤'
-        menu_item 2 "节点与用户 · $D_NODE_TOTAL个 / 启用$D_NODE_ENABLED个" '添加、导出、修改、停用或删除多个代理节点'
-        menu_item 3 "网站与证书 · $D_SITE_TOTAL个网站 / $D_CERT_OK张有效证书" "默认域名：$(default_domain)；自动续期：$D_TIMER"
-        menu_item 4 '网络与网站优化' "当前拥塞算法：$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf 未知)；静态gzip：$(get '.performance.gzip // false')"
-        menu_item 5 '组件更新' "Xray：$(get '.versions.xray // "未安装"')；Nginx：$(get '.versions.nginx // "未安装"')；支持独立或全部更新"
-        menu_item 6 '状态、日志与维护' '资源用量、诊断、服务控制与事务回滚'
-        menu_item 7 '卸载' '按组件卸载，或删除本工具全部资料'
-        menu_item 8 '方案说明与命令帮助' '查看要求、传输区别和命令行入口'
-        menu_item 9 '配置文件与目录' '查看Xray、Nginx、证书、日志与网站路径'
-        menu_item 10 '防火墙端口管理' 'UFW / firewalld状态、端口开闭和所需端口放行'
-        menu_item 11 'Swap虚拟内存' '一键添加1024MiB磁盘Swap，重启保留；支持状态、自定义容量和安全移除'
-        menu_item 12 '方案B防护与流量' '爬虫策略、网站限流、静态缓存、Cloudflare回源与AOP认证'
-        menu_item 0 '退出' '后台代理、网站和自动续期继续运行'
-        ask choice '请选择数字' 0
-        case "$choice" in
-            1) component_menu install;; 2) node_menu;; 3) site_menu;; 4) optimize_menu;;
-            5) component_menu update;; 6) operations_menu;; 7) component_menu uninstall;;
-            8) menu_run show_help;; 9) menu_run show_paths;; 10) firewall_menu;; 11) swap_menu;; 12) edge_menu;; 0) return;; *) warn '无效选择，请输入菜单编号。';;
-        esac
-    done
-}
-show_help() { explain; help_text; }
-
-selftest() {
-    command -v jq >/dev/null || die 'selftest需要jq。'
-    local t test_fail=0
-    for t in example.com xn--fiqs8s.example a-b.example; do valid_domain "$t" || test_fail=1; done
-    for t in 'a;reboot.com' '../x.com' '-a.example' 'a..example' 'a.com/new' '*.example.com'; do if valid_domain "$t"; then test_fail=1; fi; done
-    for t in 1 443 65535 08443; do valid_port "$t" || test_fail=1; done
-    for t in 0 65536 abc '80;id' -1; do if valid_port "$t"; then test_fail=1; fi; done
-    for t in 192.0.2.10 2001:db8::10 2001:db8:0:0:0:0:0:10 ::1; do valid_host "$t" || test_fail=1; done
-    for t in 256.0.0.1 '2001::1:' ':2001::1' '2001::db8::1' '[2001:db8::1]'; do if valid_host "$t"; then test_fail=1; fi; done
-    valid_uuid '12345678-1234-1234-1234-123456789abc' || test_fail=1
-    if valid_uuid '$(id)'; then test_fail=1; fi
-    valid_ws_path /abcdefgh || test_fail=1
-    if valid_ws_path '/x; }'; then test_fail=1; fi
-    valid_upstream 'http://127.0.0.1:8000' || test_fail=1
-    if valid_upstream 'http://example.com:80'; then test_fail=1; fi
-    ((test_fail == 0)) || die '输入验证自测失败。'
-    bash -n "${BASH_SOURCE[0]}"
-    ok '输入验证、注入字符拒绝和Bash语法自测通过（不代替实际VPS部署验收）。'
-}
-main() {
-    if [[ ${1:-} == _service ]]; then
-        (($# == 2)) || die '内部服务参数错误。'
-        service_runner "$2"; return
-    fi
-    if [[ ${1:-} == --no-color ]]; then NO_COLOR_FLAG=1; shift; fi
-    colors
-    validate_cli "$@"
-    case "${1:-}" in help|--help|-h) help_text; return;; version|--version) echo "$VERSION"; return;; explain) explain; return;; selftest) selftest; return;; paths) show_paths; return;; esac
-    check_root; detect_system
-    if { exec {TTY_FD}<> /dev/tty; } 2>/dev/null; then :; else TTY_FD=''; fi
-    trap 'on_error $? $LINENO' ERR
-    trap on_exit EXIT
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
-    safe_root
-    # Read-only commands on an empty system must not pretend that a deployment exists.
-    if [[ ! -e $STATE && ${1:-install} != install && $# -gt 0 ]]; then die '尚未安装，请运行 bash vpskit.sh install。'; fi
-    install_deps
-    init_state
-    recover
-    init_preferences
-    if [[ ! -f $ROOT/vpskit.sh ]]; then persist_self
-    elif [[ ${BASH_SOURCE[0]} != "$ROOT/vpskit.sh" && ${BASH_SOURCE[0]} != "$ENTRY" ]] && ! grep -Fxq "VERSION='$VERSION'" "$ROOT/vpskit.sh"; then
-        # A locally downloaded/new process-substitution invocation upgrades the
-        # installed service runner too. The caller explicitly executed this file.
-        cp "$ROOT/vpskit.sh" "$ROOT/backup/manager.previous"
-        persist_self
-        json_update --arg v "$VERSION" '.manager=$v'
-    fi
-    case "${1:-menu}" in
-        menu) main_menu;;
-        install) if [[ -n ${2:-} ]]; then install_component "$2"; else install_all; fi;;
-        node)
-            case "${2:-list}" in
-                add) node_add;; list) node_list;; export) node_export "${3:-}";;
-                migrate-xhttp) node_migrate_xhttp "${3:-}";; xhttp-version) node_xhttp_version "${3:-}";; xhttp-json) node_xhttp_json "${3:-}";;
-                edit|rename|port|address|enable|disable|delete) node_action "$2" "${3:-}";;
-                *) die '未知节点子命令。';;
+menu_group() {
+    local group=$1 option key d id value
+    case "$group" in
+        nodes)
+            printf '1.查看  2.新增  3.共享入口用户  4.启用  5.禁用  6.删除  7.轮换凭据  8.分享链接  9.XHTTP客户端JSON  0.返回\n'
+            ask option '选择' 0
+            case "$option" in 1) menu_run node list;; 2) menu_run node add;; 3) menu_run node share;; 4) menu_run node enable;; 5) menu_run node disable;; 6) menu_run node delete;; 7) menu_run node rotate;; 8) menu_run node export;; 9) menu_run node client;; esac;;
+        websites)
+            printf '1.网站列表  2.新增/编辑  3.移除绑定  4.签发证书  5.证书状态  6.续期检查  0.返回\n'
+            ask option '选择' 0
+            case "$option" in 1) menu_run site list;; 2) menu_run site add;; 3) menu_run site remove;; 4) menu_run cert issue;; 5) menu_run cert status;; 6) menu_run cert renew;; esac;;
+        update)
+            printf '1.Nginx组件  2.Xray组件  3.ACME组件  4.仅管理代码  0.返回\n'; ask option '选择' 0
+            case "$option" in 1) menu_run update nginx;; 2) ask value 'Xray版本（v数字.数字.数字或latest）' "$XRAY_DEFAULT_VERSION"; menu_run update xray "$value";; 3) menu_run update acme;; 4) menu_run update manager;; esac;;
+        advanced)
+            printf '1.显示已保存/实际参数  2.Worker/连接数/文件数  3.选择已有服务账户  4.其他Nginx参数  5.Xray文件数  6.恢复高级默认值  0.返回\n'
+            ask option '选择' 0
+            case "$option" in
+                1) menu_run advanced show;; 2) menu_run advanced edit capacity;; 3) menu_run advanced edit nginx.worker_user;;
+                4) printf 'keepalive keepalive_requests ssl_cache ssl_timeout http2 client_header_timeout client_body_timeout send_timeout proxy_connect_timeout proxy_read_timeout proxy_send_timeout site_proxy_timeout client_max_body_mb access_log worker_shutdown_timeout upstream_keepalive\n'
+                   ask key '参数名称（不含nginx.）' keepalive; menu_run advanced edit "nginx.$key";;
+                5) menu_run advanced edit xray.nofile;; 6) menu_run advanced defaults;;
             esac;;
-        wizard) case "${2:-status}" in configure) configure_wizard;; status) deployment_details;; *) die '用法：vpskit wizard configure|status';; esac;;
-        site) case "${2:-list}" in add) site_add;; edit) site_edit;; list) site_list;; default) site_default;; remove) site_remove;; *) die '未知网站子命令。';; esac;;
-        cert) case "${2:-status}" in issue) cert_issue;; renew) cert_renew;; status) cert_status;; settings) site_certificate_edit;; *) die '未知证书子命令。';; esac;;
-        update) if [[ ${2:-} == all ]]; then update_all; else update_component "${2:-xray}"; fi;;
-        uninstall) if [[ ${2:-} == all ]]; then uninstall_all; else uninstall_component "${2:-xray}"; fi;;
-        service) service_action "${2:-}" "${3:-}";;
-        status) status;; logs) logs "${2:-manager}";; doctor) doctor;; repair) recover; doctor;; rollback) rollback_last;;
-        firewall) if [[ -z ${2:-} ]]; then PANEL_IDLE=1; HAVE_LOCK=0; flock -u "$LOCK_FD"; firewall_menu; else firewall_action "$2"; fi;;
-        optimize) if [[ -z ${2:-} ]]; then PANEL_IDLE=1; HAVE_LOCK=0; flock -u "$LOCK_FD"; optimize_menu; else optimize_action "$2"; fi;;
-        swap) if [[ -z ${2:-} ]]; then PANEL_IDLE=1; HAVE_LOCK=0; flock -u "$LOCK_FD"; swap_menu; else swap_action "$2"; fi;;
-        edge) if [[ -z ${2:-} ]]; then PANEL_IDLE=1; HAVE_LOCK=0; flock -u "$LOCK_FD"; edge_menu; else edge_action "$2"; fi;;
-        maintenance) maintenance;;
-        *) help_text; die '未知命令。';;
+        history)
+            printf '1.列出历史  2.立即创建快照  3.恢复配置及证书  4.只恢复高级参数  5.回滚最近事务  6.恢复中断事务  0.返回\n'; ask option '选择' 0
+            case "$option" in 1) menu_run history list;; 2) menu_run history save manual;; 3) menu_run history restore;; 4) menu_run history restore '' advanced;; 5) menu_run rollback;; 6) menu_run repair;; esac;;
+        status)
+            printf '1.状态  2.完整本机检查  3.Nginx日志  4.Xray日志  5.按已保存配置应用  6.重启Nginx  0.返回\n'; ask option '选择' 0
+            case "$option" in 1) menu_run status;; 2) menu_run doctor;; 3) menu_run logs nginx;; 4) menu_run logs xray;; 5) menu_run apply;; 6) menu_run service nginx restart;; esac;;
+        firewall)
+            printf '1.显示规则与所需端口  2.添加UFW放行规则  0.返回\n'; ask option '选择' 0
+            case "$option" in 1) menu_run firewall status;; 2) menu_run firewall allow;; esac;;
+        swap)
+            printf '1.查看Swap  2.创建本工具Swap  3.移除本工具Swap  0.返回\n'; ask option '选择' 0
+            case "$option" in 1) menu_run swap status;; 2) menu_run swap create;; 3) menu_run swap remove;; esac;;
+        edge)
+            printf '1.显示网站防护  2.编辑防护  3.更新Cloudflare官方IP与AOP CA  0.返回\n'; ask option '选择' 0
+            case "$option" in 1) menu_run edge show;; 2) menu_run edge edit;; 3) menu_run edge refresh;; esac;;
     esac
 }
-# All function definitions are parsed before main. Source-only use is reserved for local tests.
+main_menu() {
+    local option
+    while :; do
+        printf '\nVPSKit %s 管理面板\n' "$VERSION"
+        if [[ -f $STATE ]] && command -v jq >/dev/null && state_basic "$STATE"; then
+            printf '已载入历史配置：%s个节点 / %s个网站；不会重置。\n' "$(get '.nodes|length')" "$(get '.sites|length')"
+        elif [[ -e $STATE ]]; then printf '状态文件异常；请选择14恢复，不会覆盖。\n'
+        else printf '尚未初始化；选择1部署，或先安装单独组件。\n'; fi
+        cat <<'EOF'
+ 1. 部署与安装 / 继续历史部署
+ 2. 节点与用户
+ 3. 网站与证书
+ 4. 网站压缩设置
+ 5. 组件更新（与代码分离）
+ 6. 状态、日志与维护
+ 7. 卸载服务（保留数据）
+ 8. 方案说明与命令帮助
+ 9. 配置文件与目录
+10. 防火墙端口管理
+11. Swap虚拟内存
+12. 网站防护与流量
+13. 高级配置 · Nginx / Xray
+14. 历史配置和恢复
+15. 仅更新管理脚本
+ 0. 退出
+EOF
+        ask option '选择' 0
+        case "$option" in
+            0) return;;
+            1) printf '1.向导/继续  2.只安装Nginx  3.只安装Xray  4.只安装ACME  0.返回\n'; ask option '选择' 1
+               case "$option" in 1) menu_run install;; 2) menu_run install nginx;; 3) menu_run install xray;; 4) menu_run install acme;; esac;;
+            2) menu_group nodes;; 3) menu_group websites;; 4) menu_run performance gzip;;
+            5) menu_group update;; 6) menu_group status;; 7) menu_run uninstall;; 8) menu_run help;; 9) menu_run paths;;
+            10) menu_group firewall;; 11) menu_group swap;; 12) menu_group edge;; 13) menu_group advanced;; 14) menu_group history;; 15) menu_run update manager;;
+            *) printf '无效选项。\n';;
+        esac
+    done
+}
+main() {
+    local command=${1:-menu} action=${2:-} rc
+    case "$command" in version|--version|-V) printf '%s\n' "$VERSION"; return;; help|--help|-h) usage; return;; selftest) selftest; return;; esac
+    if [[ $command == _service ]]; then service_runner "${2:-}"; return; fi
+    system_check
+    [[ -f $SELF && $SELF != /dev/fd/* && $SELF != /proc/* ]] || die '请先把完整脚本下载为本地普通文件，再执行 sudo bash ./vpskit.sh；不依赖在线旧脚本。'
+    SELF=$(realpath -- "$SELF")
+    # /dev/tty is optional for status/maintenance; mutations that need approval
+    # refuse to invent approval when no terminal is attached.
+    if { exec {TTY_FD}<>/dev/tty; } 2>/dev/null; then :; else TTY_FD=''; fi
+    if [[ $command == menu ]]; then main_menu; return; fi
+    safe_layout
+    trap cleanup EXIT
+    trap 'error_trap "$?" "$LINENO"' ERR
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    if [[ $command == install ]]; then install_dependencies; fi
+    need jq; need openssl
+    if [[ $command == update && $action == manager ]]; then
+        # Never initialize, migrate, render or reload state on code-only update.
+        update_manager "${3:-}" "${4:-}"; return
+    fi
+    if [[ $command == repair ]]; then repair_transaction; return; fi
+    if [[ $command == rollback ]]; then rollback_last; return; fi
+    if [[ $command == history ]]; then
+        case "$action" in list) history_list;; save) history_save "${3:-manual}";; restore) history_restore "${3:-}" "${4:-full}";; *) die 'history: list/save/restore。';; esac
+        return
+    fi
+    if [[ -d $ROOT/backup/transaction ]]; then die '检测到未完成事务；先运行repair再变更配置。'; fi
+    if [[ $command == status ]]; then status_show; return; fi
+    if [[ $command == paths ]]; then paths_show; return; fi
+    if [[ $command == install ]]; then init_state
+    else state_basic "$STATE" || die '没有可用state.json；新装请运行install，已有部署请从history恢复。'; fi
+    case "$command" in
+        install) if [[ -z $action ]]; then install_wizard; else install_component "$action" "${3:-$XRAY_DEFAULT_VERSION}"; fi;;
+        apply) apply_existing;;
+        doctor) doctor;;
+        node)
+            case "$action" in
+                list) node_list;; add) node_add;; share) node_share "${3:-}";; export) node_export "${3:-}";; client) node_client "${3:-}";;
+                enable|disable|delete|rotate|rename|port|host) node_change "$action" "${3:-}" "${4:-}";;
+                *) die 'node: list/add/share/enable/disable/delete/rotate/rename/port/host/export/client。';;
+            esac;;
+        site) case "$action" in list) site_list;; add|edit) site_configure "${3:-}";; remove) site_remove "${3:-}";; *) die 'site: list/add/edit/remove。';; esac;;
+        cert) case "$action" in issue) cert_issue "${3:-}";; status) cert_status;; renew) cert_renew;; import) (($#==5)) || die 'cert import需要域名、证书路径、私钥路径。'; cert_import "$3" "$4" "$5";; *) die 'cert: issue/status/renew/import。';; esac;;
+        advanced)
+            case "$action" in show) advanced_show;; edit) advanced_edit "${3:-}";; defaults) advanced_defaults;; set) shift 2; advanced_set "$@";; *) die 'advanced: show/edit/set/defaults。';; esac;;
+        update)
+            choice "$action" 'nginx xray acme' || die 'update: manager/nginx/xray/acme。'
+            confirm "更新组件$action，保留配置；必要时重启相关服务" || return 0
+            install_dependencies; install_component "$action" "${3:-$XRAY_DEFAULT_VERSION}" yes;;
+        edge) case "$action" in show) edge_show "${3:-}";; edit) edge_edit;; refresh) edge_refresh;; set) (($#==5)) || die 'edge set需要域名、键、值。'; edge_set "$3" "$4" "$5";; *) die 'edge: show/edit/refresh/set。';; esac;;
+        performance) [[ $action == gzip ]] || die 'performance仅支持gzip；不自动改动BBR或内核。'; performance_gzip "${3:-}";;
+        service) service_action "$action" "${3:-}";;
+        logs) logs_show "${2:-nginx}" "${3:-100}";;
+        firewall) case "$action" in status) firewall_show;; allow) firewall_allow "${3:-}" "${4:-tcp}";; *) die 'firewall: status/allow。';; esac;;
+        swap) case "$action" in status) swap_show;; create) swap_create "${3:-}";; remove) swap_remove;; *) die 'swap: status/create/remove。';; esac;;
+        maintenance) cert_renew; rotate_logs;;
+        uninstall) uninstall_keep_data;;
+        *) die '未知命令；运行help查看。';;
+    esac
+}
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then main "$@"; fi
