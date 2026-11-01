@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # VPSKIT_SINGLE_FILE
-# VPSKIT_FEATURE_LEVEL=14
+# VPSKIT_FEATURE_LEVEL=15
 # VPSKIT_STATE_SCHEMA=1
-# VPSKit 2.0.5-oneline — GitHub process-substitution bootstrap; independent release.
+# VPSKit 2.0.7-node-ux — creation-time credentials, transport guidance, online launch.
 # Based on the public VPSKit 1.6.0 data model and deployment layout.
 # MIT License — Copyright (c) 2026 VPSKit contributors.
 # Run: bash <(curl -fsSL https://raw.githubusercontent.com/biao169/V2ray_deploy/main/vpskit.sh)
@@ -16,8 +16,8 @@ shopt -s inherit_errexit
 umask 077
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export LC_ALL=C
-VERSION='2.0.5-oneline'
-FEATURE_LEVEL=14
+VERSION='2.0.7-node-ux'
+FEATURE_LEVEL=15
 ROOT='/opt/vpskit'
 STATE="$ROOT/data/state.json"
 ENTRY='/usr/local/bin/vpskit'
@@ -60,7 +60,10 @@ _vpskit_bootstrap_stream() {
     # normally (including when the calling shell uses `set -o pipefail`).
     # Do not touch stdin for /dev/fd/*: it may be the user's terminal.
     if [[ -z $SELF ]]; then
-        cat >/dev/null || true
+        # A script passed to `bash -c "..."` has no BASH_SOURCE. Do not read
+        # from a terminal in that case (it could wait forever for EOF).
+        # Drain only a piped/redirected stdin, such as `curl URL | bash`.
+        if [[ ! -t 0 ]]; then cat >/dev/null || true; fi
     else
         cat -- "$SELF" >/dev/null 2>&1 || true
     fi
@@ -83,8 +86,8 @@ _vpskit_bootstrap_stream() {
     fi
     version=$(sed -n "s/^VERSION='\([^']*\)'$/\1/p" "$file")
     if [[ $version != "$VERSION" ]]; then
-        printf '[ERROR] 两次下载的脚本版本不一致（入口 %s，实际 %s）；拒绝执行。请重试或下载本地文件。\n' \
-            "$VERSION" "${version:-未知}" >&2
+        printf '[ERROR] 在线脚本版本不一致（入口 %s，重新下载 %s）。\n' "$VERSION" "${version:-未知}" >&2
+        printf '[ERROR] 可能是 GitHub main 尚未更新或 raw CDN 缓存；请先提交新版 vpskit.sh 再重试。\n' >&2
         exit 1
     fi
     if [[ -n ${VPSKIT_BOOTSTRAP_SHA256:-} ]]; then
@@ -2239,6 +2242,81 @@ node_credential() {
         *) die '协议不支持。';;
     esac
 }
+# Creation-time credentials; unlike editing, default is to generate a fresh secret.
+# Bash printf -v writes to caller's named local; no secret is echoed to the terminal.
+node_new_credential_valid() {
+    local nc_proto=$1 nc_method=$2 nc_value=$3 nc_bytes nc_expect=32
+    case "$nc_proto" in
+        vless|vmess)
+            valid_uuid "$nc_value";;
+        shadowsocks)
+            if [[ $nc_method == 2022-* ]]; then
+                [[ $nc_value =~ ^[A-Za-z0-9+/]+={0,2}$ ]] || return 1
+                if [[ $nc_method == 2022-blake3-aes-128-gcm ]]; then nc_expect=16; fi
+                nc_bytes=$(printf '%s' "$nc_value" | base64 --decode 2>/dev/null | wc -c) || return 1
+                # A nonzero status from base64 should also fail (pipefail is enabled).
+                ((nc_bytes==nc_expect))
+            else
+                [[ ${#nc_value} -ge 12 && ${#nc_value} -le 256 && $nc_value != *[[:space:]]* ]]
+            fi;;
+        trojan|hysteria|masque|socks|http)
+            [[ ${#nc_value} -ge 12 && ${#nc_value} -le 256 && $nc_value != *[[:space:]]* ]];;
+        *) return 1;;
+    esac
+}
+node_choose_credential() {
+    local nc_dest=$1 nc_proto=$2 nc_method=${3:-} nc_action nc_value='' nc_hint
+    if [[ $nc_proto == vless || $nc_proto == vmess ]]; then
+        nc_hint='UUID（标准8-4-4-4-12格式）'
+    elif [[ $nc_proto == shadowsocks && $nc_method == 2022-* ]]; then
+        nc_hint='Shadowsocks 2022 Base64密钥（须与加密算法匹配）'
+    else
+        nc_hint='密码（至少12字符、不含空白）'
+    fi
+    select_value nc_action "创建时设置$nc_hint" auto \
+      'auto|自动生成独立随机凭据（推荐，默认）' \
+      'manual|现在手动输入UUID/密码（输入不回显）'
+    if [[ $nc_action == auto ]]; then
+        case "$nc_proto" in
+            vless|vmess|trojan|shadowsocks) nc_value=$(node_credential "$nc_proto" "$nc_method") || return 1;;
+            hysteria|masque|socks|http) nc_value=$(openssl rand -hex 24) || return 1;;
+        esac
+        node_new_credential_valid "$nc_proto" "$nc_method" "$nc_value" || die '随机凭据生成异常，未保存。'
+    else
+        while :; do
+            secret nc_value "手动填写$nc_hint"
+            if node_new_credential_valid "$nc_proto" "$nc_method" "$nc_value"; then break; fi
+            warn "格式不符合要求：$nc_hint。未保存，输入:q可取消。"
+        done
+    fi
+    printf -v "$nc_dest" '%s' "$nc_value"
+    # The credential is deliberately not printed in the menu; final export is opt-in.
+    info "已选择本次新节点凭据（$([[ $nc_action == auto ]] && printf '随机生成' || printf '手动填写')）；仅在确认保存后应用。"
+}
+node_transport_advice() {
+    local nt_proto=$1 nt_mode=$2
+    case "$nt_proto:$nt_mode" in
+        vless:reality) ui_note '参考：TLS握手外观较接近普通HTTPS；直连通常延迟较低、性能较好。无需网站证书，但不经过普通CDN。';;
+        vless:xhttp) ui_note '参考：以HTTPS请求承载，适合网站/反向代理/CDN；兼容性好时稳定性较好，但多一层转发。';;
+        *:ws|*:ws-plain) ui_note '参考：WebSocket兼容生态广，但有封装开销，Xray已提示WebSocket传输弃用；新部署优先评估XHTTP。';;
+        *:tls) ui_note '参考：TLS直连少一层Nginx反代，通常延迟开销小；需要真实证书，直连地址/服务器IP可见。';;
+        shadowsocks:ss) ui_note '参考：Shadowsocks本身较轻量、吞吐可能较好；但不具备普通HTTPS外观，无法保证流量不被识别。';;
+        trojan:*) ui_note '参考：使用TLS认证，传输表现取决于WS/直连模式；兼容性和性能应以客户端实际测试为准。';;
+        vmess:*) ui_note '参考：旧客户端兼容性较广，但有额外协议开销；新部署通常建议优先评估VLESS。';;
+    esac
+    ui_note '“更隐蔽/更快”仅是典型取舍，不是保证：运营商、CDN、拥塞、客户端实现和证书配置都会改变结果。'
+}
+native_transport_advice() {
+    case "$1" in
+        encryption) ui_note 'VLESS Encryption+TLS：保护载荷；该模板直连TLS，速度依赖实际链路与客户端支持。';;
+        hysteria) ui_note 'Hysteria2：UDP传输，部分丢包或高延迟链路可能更流畅；UDP受限环境会连接失败。';;
+        masque) ui_note 'MASQUE：H2/H3承载，与常见HTTP协议族相近；依赖双端兼容及TCP/UDP放行。';;
+        grpc) ui_note 'VLESS gRPC+TLS：HTTP/2体系，可利用已有H2组件；多路复用和资源占用需实测。';;
+        httpupgrade) ui_note 'VLESS HTTPUpgrade+TLS：HTTP升级握手，兼容性取决于客户端/中间代理。';;
+        socks|http) ui_note 'SOCKS/HTTP：仅限本机回环地址，不属于面向公网的伪装代理。';;
+    esac
+    ui_note '上述比较仅供选择：没有在所有网络下绝对最快或无法识别的协议；正式保存前仍校验Xray配置。'
+}
 s1_base_node_add() {
     local guided=${1:-no} id protocol mode host domain='' port path='' method='' credential listen='0.0.0.0'
     local target='' sni='' private='' public='' short='' keys http_version=h2 item scheme
@@ -2249,14 +2327,23 @@ s1_base_node_add() {
     if [[ $guided == yes ]]; then
         protocol=vless; if [[ $scheme == B ]]; then mode=xhttp; else mode=reality; fi
     else
-        select_value protocol '选择代理协议' vless 'vless|VLESS：支持REALITY、XHTTP、WS及TLS' 'vmess|VMess：支持WS及直接TLS' 'trojan|Trojan：需要TLS证书' 'shadowsocks|Shadowsocks：独立TCP/UDP端口'
+        select_value protocol '选择代理协议（流量外观与速度受传输方式影响）' vless \
+          'vless|VLESS：推荐优先评估，REALITY轻量直连或XHTTP网站/CDN' \
+          'vmess|VMess：偏旧客户端兼容，额外封装开销' \
+          'trojan|Trojan：TLS认证，速度取决于WS或直连模式' \
+          'shadowsocks|Shadowsocks：开销小、通常较快，但不具普通HTTPS流量外观'
         case "$protocol" in
-            vless) select_value mode '选择VLESS传输' reality 'reality|REALITY直连：无需本机网站证书' 'xhttp|XHTTP：Nginx TLS + 本机后端' 'ws|WebSocket：Nginx TLS + 本机后端' 'tls|直接TLS：独立公网端口和证书';;
-            vmess) select_value mode '选择VMess传输' ws 'ws|WebSocket + TLS' 'tls|直接TLS' 'ws-plain|裸WebSocket：无外层TLS，仅可信环境';;
-            trojan) select_value mode '选择Trojan传输' ws 'ws|WebSocket + TLS' 'tls|直接TLS';;
+            vless) select_value mode '选择VLESS传输（以下为典型特征，并非绝对排名）' reality \
+              'reality|REALITY直连：TLS外观较接近HTTPS；通常速度较快、低延迟' \
+              'xhttp|XHTTP：HTTPS请求、适合反代/CDN；额外中转开销' \
+              'ws|WebSocket：兼容广，但额外封装且Xray已提示弃用' \
+              'tls|直接TLS：少一层反代，通常较快；服务器直连地址可见';;
+            vmess) select_value mode '选择VMess传输' ws 'ws|WebSocket+TLS：常见旧客户端支持，额外封装' 'tls|直接TLS：较少中间处理' 'ws-plain|裸WebSocket：无外层TLS，只限可信环境';;
+            trojan) select_value mode '选择Trojan传输' ws 'ws|WebSocket+TLS：兼容旧方案，需网站/反代' 'tls|直接TLS：少一层反代，需证书';;
             shadowsocks) mode=ss;;
         esac
     fi
+    node_transport_advice "$protocol" "$mode"
     if [[ $mode == ws || $mode == xhttp || $mode == tls ]]; then
         site_select domain
         [[ $(jq -r --arg d "$domain" '.sites[]|select(.domain==$d)|.issued' "$STATE") == true ]] || die '所选网站尚未签发证书。'
@@ -2289,7 +2376,7 @@ s1_base_node_add() {
         ws-plain) warn '此模式没有外层TLS，仅用于明确需要的可信部署；不建议暴露到不可信网络。'
             ask_valid path 'WebSocket路径（至少8位，保留前导/）' "/$(randhex 12)" valid_path;;
     esac
-    credential=$(node_credential "$protocol" "$method")
+    node_choose_credential credential "$protocol" "$method"
     item=$(jq -n --arg id "$id" --arg p "$protocol" --arg m "$mode" --arg h "$host" --arg d "$domain" --argjson port "$port" --arg path "$path" --arg method "$method" --arg c "$credential" --arg l "$listen" --arg t "$target" --arg s "$sni" --arg pk "$private" --arg pub "$public" --arg sid "$short" --arg hv "$http_version" '{id:$id,runtime_id:$id,entry:$id,protocol:$p,mode:$m,host:$h,domain:$d,port:$port,path:$path,method:$method,credential:$c,listen:$l,target:$t,sni:$s,privateKey:$pk,publicKey:$pub,shortId:$sid,http_version:$hv,enabled:true}')
     confirm "新增 $id ($protocol/$mode)，保留其他节点；Xray将按需重启" || return 0
     begin_tx "node-add:$id"
@@ -2305,7 +2392,10 @@ node_share() {
     [[ $protocol != shadowsocks ]] || die '此实现不为Shadowsocks入口创建共享用户，请添加独立节点。'
     ask_valid id '新用户/节点名称' "user-$(randhex 3)" valid_name
     if jq -e --arg id "$id" '.nodes[]|select(.id==$id or .entry==$id or .runtime_id==$id)' "$STATE" >/dev/null; then die '名称已占用。'; fi
-    credential=$(node_credential "$protocol")
+    node_choose_credential credential "$protocol" "$(jq -r '.method // ""' <<< "$node")"
+    if jq -e --arg entry "$(jq -r .entry <<< "$node")" --arg cred "$credential" '.nodes[]|select(.entry==$entry and .credential==$cred)' "$STATE" >/dev/null; then
+        die '同一共享入口内已有相同凭据；请重新创建并选择其他UUID/密码。'
+    fi
     node=$(jq --arg id "$id" --arg c "$credential" '.id=$id|.runtime_id=$id|.credential=$c|.enabled=true' <<< "$node")
     confirm "共享 $source 的入口，新增独立凭据 $id；不新增监听端口" || return 0
     begin_tx "node-share:$id"; json_update --argjson n "$node" '.nodes+=[$n]'; apply_config; commit_tx; node_export "$id"
@@ -6070,6 +6160,17 @@ SOCKS5 / HTTP                新协议向导           认证；默认且限制�
 WireGuard/原生JSON组合         原生入站导入         安全校验+实际核心run -test，不接管系统路由
 TUN / Tunnel                 本阶段不创建         涉及系统路由/设备授权，不能当普通公网节点
 TEXT
+    cat <<'UX_HINT'
+
+选择建议（同一VPS/客户端/时段实测才有意义）：
+  偏低延迟、直连：优先比较 VLESS REALITY 与直接TLS。
+  已有网站或需要普通CDN：比较 VLESS XHTTP；不要假定WebSocket永远更隐蔽。
+  高丢包且允许UDP：可测试 Hysteria2 / MASQUE H3；被限UDP时可能更差。
+  较老客户端兼容：保留 VMess/Trojan/WS，但要关注Xray弃用提示。
+  不追求HTTPS外观而看重轻量：可测试 Shadowsocks；流量特征不同于HTTPS。
+  以上均不保证更隐蔽或更快，不应根据单一协议名称判断安全性。
+  所有创建向导均可在保存前选择自动生成或手动输入UUID/密码。
+UX_HINT
     printf '\n核验基线：Xray v26.10.31（2026-11-01查询）；安装时latest通过官方API解析正式版。\n'
     [[ ! -x $XRAY ]] || "$XRAY" version | head -n2
     ui_note '“列出协议”不是客户端端到端通过。创建前对完整候选配置进行实际核心校验；不支持则不保存。'
@@ -6198,18 +6299,29 @@ native_add() {
     local kind=${1:-} id host domain='' port listen=0.0.0.0 pass user tag protocol network=tcp settings stream client='' item method alpn uuid flow='' keys dec enc
     ensure_component xray
     if [[ -z $kind ]]; then
-        select_value kind '新协议/传输（编号选择；默认不改已有节点）' encryption \
-          'encryption|VLESS Encryption + TLS / RAW' 'hysteria|Hysteria2（Xray原生，UDP）' \
-          'masque|MASQUE CONNECT-IP（H2/H3）' 'grpc|VLESS gRPC + TLS直连' \
-          'httpupgrade|VLESS HTTPUpgrade + TLS直连' 'socks|认证SOCKS5（仅本机）' 'http|认证HTTP代理（仅本机）'
+        select_value kind '新协议/传输（典型速度与流量特征，非保证）' encryption \
+          'encryption|VLESS Encryption+TLS：安全载荷、直连，需较新核心' \
+          'hysteria|Hysteria2：UDP，丢包/高延迟环境可能更快，须UDP可达' \
+          'masque|MASQUE：HTTP/2或HTTP/3形态，兼容性与网络支持要求高' \
+          'grpc|VLESS gRPC+TLS：HTTP/2体系，可复用成熟H2设施' \
+          'httpupgrade|VLESS HTTPUpgrade+TLS：HTTP升级，需中间设施兼容' \
+          'socks|认证SOCKS5：本机代理，不对公网开放' \
+          'http|认证HTTP代理：本机代理，不对公网开放'
     fi
     choice "$kind" 'encryption hysteria masque grpc httpupgrade socks http' || die '未知新协议类型。'
+    native_transport_advice "$kind"
     if [[ $kind != socks && $kind != http ]]; then require_modern_xray; fi
     ask_valid id '显示名称' "native-$(randhex 3)" valid_name
     tag="vk-$(randhex 8)"
     smart_port_select port '独立监听端口' 9443
     [[ $port != 22 && $port != 80 && $port != 443 ]] || die '保留端口。'
-    pass=$(openssl rand -hex 24); user="u-$(randhex 4)"; uuid=$(new_uuid)
+    # Only generate the credential appropriate to the chosen protocol; the user
+    # may supply a validated UUID/password before any state or service change.
+    user="u-$(randhex 4)"; pass=''; uuid=''
+    case "$kind" in
+        encryption|grpc|httpupgrade) node_choose_credential uuid vless;;
+        hysteria|masque|socks|http) node_choose_credential pass "$kind";;
+    esac
     if [[ $kind == socks || $kind == http ]]; then
         host=127.0.0.1; listen=127.0.0.1; protocol=$kind
         settings=$(jq -n --arg u "$user" --arg p "$pass" --arg k "$kind" '{accounts:[{user:$u,pass:$p}]} + if $k=="socks" then {auth:"password",udp:false} else {} end')
@@ -6310,8 +6422,8 @@ node_add() {
     if [[ ${1:-} == yes ]]; then s1_base_node_add "$@"; return; fi
     local type
     select_value type '选择节点创建入口' legacy \
-      'legacy|常用：VLESS REALITY/XHTTP/WS/TLS、VMess、Trojan、SS/SS2022' \
-      'native|扩展：VLESS Encryption、Hysteria2、MASQUE、gRPC、HTTPUpgrade、SOCKS/HTTP' \
+      'legacy|常用：REALITY低延迟、XHTTP网站/CDN、SS轻量、旧协议兼容' \
+      'native|扩展：Hysteria2/UDP、MASQUE/H2-H3、VLESS Encryption等' \
       'catalog|查看协议与核心要求（不修改）'
     case "$type" in legacy) s1_base_node_add;; native) native_add;; catalog) xray_catalog;; esac
 }
@@ -10186,7 +10298,7 @@ usage() {
     s5_previous_usage "$@"
     cat <<'SMART_HELP'
 
-2.0.5 GitHub 一键运行：
+2.0.7 GitHub 一键运行：
   bash <(curl -fsSL https://raw.githubusercontent.com/biao169/V2ray_deploy/main/vpskit.sh)
   脚本检测到/dev/fd后，会从上述固定HTTPS地址再次下载完整文件、校验版本和语法，再执行临时副本。
   一键运行不会直接覆盖现有安装；仍按原有菜单与确认机制操作。临时文件在退出后删除。
@@ -10206,6 +10318,12 @@ usage() {
 强制不绕过：路径/挂载安全、运行管理锁、SSH/Swap保护、APT非Nginx包边界、停止失败/磁盘错误。
 不会用rm清空/etc/nginx，不自动复活旧凭据。未完成报告partial；只有成功才继续重装。
 普通向导的枚举改为编号；编辑凭据默认保留，新增仍独立随机生成。危险词确认有意保留。
+
+2.0.7 节点向导：
+  node add / node native-add              按编号创建常用/扩展节点，列表显示典型HTTPS外观、速度取舍和兼容性。
+  node share                              共享入口增加用户时可选择自动UUID或手动UUID。
+  所有新建入口在保存前显示“自动生成 / 手动输入”凭据选择：默认自动，手动输入不回显并校验格式。
+  SS2022手动密钥要求正确长度Base64；公网直连、CDN、UDP能力会影响实际速度和可用性。
 SMART_HELP
 }
 # Existing secrets are never shown or copied between users. Reuse means let ACME
