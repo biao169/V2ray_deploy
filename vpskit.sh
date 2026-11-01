@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # VPSKIT_SINGLE_FILE
-# VPSKIT_FEATURE_LEVEL=13
+# VPSKIT_FEATURE_LEVEL=14
 # VPSKIT_STATE_SCHEMA=1
-# VPSKit 2.0.4-smart — indexed defaults, port inventory and explicit emergency cleanup; independent release.
+# VPSKit 2.0.5-oneline — GitHub process-substitution bootstrap; independent release.
 # Based on the public VPSKit 1.6.0 data model and deployment layout.
 # MIT License — Copyright (c) 2026 VPSKit contributors.
-# Run: sudo bash ./vpskit.sh ; help: bash ./vpskit.sh help
+# Run: bash <(curl -fsSL https://raw.githubusercontent.com/biao169/V2ray_deploy/main/vpskit.sh)
+# Or:  sudo bash ./vpskit.sh ; help: bash ./vpskit.sh help
 # Debian 12+ / Ubuntu 18.04+, Bash 4.4+, systemd, amd64/arm64.
 # No useradd/adduser, no automatic firewall reset, no automatic SSH changes.
 # JSON is data, never sourced. The manager/master require root; Nginx workers do not.
@@ -15,8 +16,8 @@ shopt -s inherit_errexit
 umask 077
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export LC_ALL=C
-VERSION='2.0.4-smart'
-FEATURE_LEVEL=13
+VERSION='2.0.5-oneline'
+FEATURE_LEVEL=14
 ROOT='/opt/vpskit'
 STATE="$ROOT/data/state.json"
 ENTRY='/usr/local/bin/vpskit'
@@ -26,7 +27,92 @@ NGINX="$ROOT/nginx/usr/sbin/nginx"
 ACME="$ROOT/acme/acme.sh"
 SELF_URL='https://raw.githubusercontent.com/biao169/V2ray_deploy/main/vpskit.sh'
 XRAY_DEFAULT_VERSION='latest'
-SELF="${BASH_SOURCE[0]}"
+SELF="${BASH_SOURCE[0]:-}"
+# A Bash process-substitution path (/dev/fd/N) is a *pipe*, not a seekable
+# source file. Once Bash begins reading it, the original bytes cannot safely
+# be copied again for manager installation or recursive menu commands. Download
+# the trusted canonical HTTPS URL again into a private regular file and execute
+# that copy; this is a bootstrap only, not a configuration or package update.
+VPSKIT_BOOTSTRAP_DIR=''
+_vpskit_bootstrap_cleanup() {
+    [[ -z $VPSKIT_BOOTSTRAP_DIR ]] || rm -rf --one-file-system -- "$VPSKIT_BOOTSTRAP_DIR"
+}
+_vpskit_bootstrap_stream() {
+    local file version size digest rc=0
+    if [[ ${VPSKIT_STREAM_REEXEC:-0} == 1 ]]; then
+        printf '[ERROR] 流式启动重定向重复，已停止；请使用本地脚本执行。\n' >&2
+        exit 1
+    fi
+    if ! command -v curl >/dev/null 2>&1; then
+        printf '[ERROR] 一键启动需要 curl；请先安装 curl。\n' >&2
+        exit 1
+    fi
+    VPSKIT_BOOTSTRAP_DIR=$(mktemp -d /tmp/vpskit-bootstrap.XXXXXXXX) || {
+        printf '[ERROR] 无法创建安全临时目录。\n' >&2
+        exit 1
+    }
+    chmod 700 "$VPSKIT_BOOTSTRAP_DIR"
+    trap '_vpskit_bootstrap_cleanup' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    file="$VPSKIT_BOOTSTRAP_DIR/vpskit.sh"
+    # Drain any unread part of the original stream so its producer can exit
+    # normally (including when the calling shell uses `set -o pipefail`).
+    # Do not touch stdin for /dev/fd/*: it may be the user's terminal.
+    if [[ -z $SELF ]]; then
+        cat >/dev/null || true
+    else
+        cat -- "$SELF" >/dev/null 2>&1 || true
+    fi
+    printf '[INFO] 检测到 GitHub 一键启动，正在获取完整脚本到临时文件。\n' >&2
+    if ! curl --proto '=https' --proto-redir '=https' --fail --show-error --location \
+           --connect-timeout 15 --max-time 180 --retry 2 --output "$file" "$SELF_URL"; then
+        printf '[ERROR] 获取完整脚本失败；原有 VPSKit 配置未修改。\n' >&2
+        exit 1
+    fi
+    if [[ ! -f $file || -L $file ]]; then
+        printf '[ERROR] 下载结果不是普通脚本文件。\n' >&2
+        exit 1
+    fi
+    size=$(stat -c %s "$file") || exit 1
+    if ((size < 1024 || size > 4194304)) ||
+       ! grep -Fxq '# VPSKIT_SINGLE_FILE' "$file" ||
+       ! grep -Fxq '# VPSKIT_STATE_SCHEMA=1' "$file"; then
+        printf '[ERROR] 下载结果不完整或缺少 VPSKit 标识。\n' >&2
+        exit 1
+    fi
+    version=$(sed -n "s/^VERSION='\([^']*\)'$/\1/p" "$file")
+    if [[ $version != "$VERSION" ]]; then
+        printf '[ERROR] 两次下载的脚本版本不一致（入口 %s，实际 %s）；拒绝执行。请重试或下载本地文件。\n' \
+            "$VERSION" "${version:-未知}" >&2
+        exit 1
+    fi
+    if [[ -n ${VPSKIT_BOOTSTRAP_SHA256:-} ]]; then
+        if [[ ! ${VPSKIT_BOOTSTRAP_SHA256} =~ ^[a-fA-F0-9]{64}$ ]]; then
+            printf '[ERROR] VPSKIT_BOOTSTRAP_SHA256 必须是完整的64位SHA256。\n' >&2
+            exit 1
+        fi
+        digest=$(sha256sum "$file" | cut -d' ' -f1)
+        if [[ ${VPSKIT_BOOTSTRAP_SHA256,,} != "$digest" ]]; then
+            printf '[ERROR] 下载脚本 SHA256 与预期不一致；拒绝执行。\n' >&2
+            exit 1
+        fi
+    fi
+    if ! bash -n "$file"; then
+        printf '[ERROR] 下载脚本未通过 Bash 语法检查。\n' >&2
+        exit 1
+    fi
+    # The local copy stays alive for the entire menu session (including child
+    # Bash processes). It is removed when this wrapper exits, even on failure.
+    VPSKIT_STREAM_REEXEC=1 bash "$file" "$@" || rc=$?
+    exit "$rc"
+}
+case "$SELF" in
+    /dev/fd/*|/proc/self/fd/*|/proc/[0-9]*/fd/*|/dev/stdin)
+        if [[ ${BASH_SOURCE[0]} == "$0" ]]; then _vpskit_bootstrap_stream "$@"; fi;;
+    '') # curl URL | bash (Bash parses stdin without an associated source filename).
+        if [[ $0 == bash || $0 == */bash ]]; then _vpskit_bootstrap_stream "$@"; fi;;
+esac
 WORK='' LOCK_FD='' TTY_FD='' TX=0 LOGFILE='' BOOTSTRAP_DIR=''
 HISTORY_KEEP=20
 PREFLIGHT_BASE='/run'
@@ -5128,7 +5214,7 @@ main() {
         *) die '未知命令；使用help查看。';;
     esac
     system_check
-    [[ -f $SELF && $SELF != /dev/fd/* && $SELF != /proc/* ]] || die '请先下载完整脚本为本地普通文件，再运行sudo bash ./vpskit.sh。'
+    [[ -f $SELF && $SELF != /dev/fd/* && $SELF != /proc/* ]] || die '无法把当前入口保存为普通脚本；可使用GitHub一键命令或下载后运行。'
     SELF=$(realpath -- "$SELF")
     if { exec {TTY_FD}<>/dev/tty; } 2>/dev/null; then :; else TTY_FD=''; fi
     if [[ $command == menu ]]; then menu_group "${2:-main}"; return; fi
@@ -9983,7 +10069,7 @@ smart_emergency_entry() (
     choice "${SMART_REMOVE:-none}" 'none nginx acme nginx,acme acme,nginx' || die '共享删除仅支持nginx/acme；不接受任意路径或软件包名。'
     [[ ,$SMART_REMOVE, != *,nginx,* ]] || SMART_STOP_SHARED=yes
     for sp in flock findmnt realpath stat find ss tar sha256sum systemctl jq openssl; do need "$sp"; done
-    [[ $SELF != /dev/fd/* && $SELF != /proc/* ]] || die '请下载为完整文件，不支持进程替换。'
+    [[ $SELF != /dev/fd/* && $SELF != /proc/* ]] || die '无法安全读取当前脚本入口；请使用GitHub一键命令或下载后运行。'
     SELF=$(realpath -e -- "$SELF") || return 1
     [[ -f $SELF && ! -L $SELF ]] || die '强清/重装需要完整普通脚本文件。'
     if { exec {TTY_FD}<>/dev/tty; } 2>/dev/null; then :; else TTY_FD=''; fi
@@ -10100,6 +10186,12 @@ usage() {
     s5_previous_usage "$@"
     cat <<'SMART_HELP'
 
+2.0.5 GitHub 一键运行：
+  bash <(curl -fsSL https://raw.githubusercontent.com/biao169/V2ray_deploy/main/vpskit.sh)
+  脚本检测到/dev/fd后，会从上述固定HTTPS地址再次下载完整文件、校验版本和语法，再执行临时副本。
+  一键运行不会直接覆盖现有安装；仍按原有菜单与确认机制操作。临时文件在退出后删除。
+  也支持：curl -fsSL -o vpskit.sh URL && bash ./vpskit.sh
+
 2.0.4 操作简化与应急清理：
   ports show | ports suggest [8443]         本机端口/规则核对，或可用端口建议
   uninstall force --plan                  强清预览；损坏的state/installation也可用
@@ -10168,4 +10260,4 @@ cert_import_interactive() {
     cert_import "$d" "$cert" "$key"
 }
 
-if [[ ${BASH_SOURCE[0]} == "$0" ]]; then main "$@"; fi
+if [[ ${BASH_SOURCE[0]:-} == "$0" ]]; then main "$@"; fi
