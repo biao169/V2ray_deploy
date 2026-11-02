@@ -1,322 +1,5484 @@
-# V2ray_deploy · VPSKit
+# VPSKit 2.0.7-node-ux · 完整可折叠使用教程
 
-用于 Debian / Ubuntu 小型 VPS 的单文件终端管理工具。当前版本：**1.6.0**。
+本教程依次按 **在线一键运行 → 节点协议原理与实际操作 → 16 类面板的全部子功能** 组织。内容以本次会话中的完整 `2.0.7-node-ux` 脚本为基准；远端 GitHub 可能仍是其他版本。
 
-仓库：[biao169/V2ray_deploy](https://github.com/biao169/V2ray_deploy)。将 `vpskit.sh` 和本文件放在仓库 `main` 分支根目录即可；运行脚本不依赖 README 或其他配套脚本。
+## 第一步：GitHub 一键运行与安装方法
 
-## 1. 安装与打开面板
-
-支持 Debian 12+、Ubuntu 18.04+，amd64 / arm64，要求 systemd、Bash 4.4+，以 root 运行，不创建新系统账户。旧 Ubuntu 需要可用的软件源和基础库。
-
-适合 512MB 内存、10GB 硬盘 VPS 上的小型静态网站和少量代理连接；实际占用取决于流量与应用。部署向导要求至少 500MB 可用磁盘空间。面板无需常驻 Web 服务。
-
-先进入 root 终端（已经是 root 则跳过）：
-
-```bash
-sudo -i
-```
-
-如果系统没有 curl，先安装：
-
-```bash
-apt-get update && apt-get install -y curl
-```
-
-一键运行：
+在 Linux VPS 的 **Bash 终端**（例如 `root@vultr:~#`）执行：
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/biao169/V2ray_deploy/main/vpskit.sh)
 ```
 
-也可以先下载到本地、检查语法后运行，下载失败会停止后续步骤：
+**这条命令究竟做什么？** `curl -fsSL` 从 GitHub 仓库 `main` 分支获取 `vpskit.sh`，`<(...)` 把下载内容作为 Bash 可读取的临时描述符，外层 `bash` 执行脚本并进入 VPSKit 面板。**运行脚本不等于自动重装**：已有配置时先读取已保存状态；是否安装、修改或删除由菜单中选定的操作决定。此在线方式要求仓库实际上传了支持 `/dev/fd/*` 的新版（本教程针对 `2.0.7-node-ux`），否则可能再次看到“请先下载完整脚本为本地普通文件”的旧版报错。
+
+<details open>
+<summary><strong>1.1 首次使用前的检查（建议按顺序执行）</strong></summary>
+
+1. 系统为受支持的 Debian/Ubuntu、使用 `systemd`，能够访问 GitHub、系统软件源；确认至少有可用磁盘空间和足够内存。建议先在干净的测试 VPS 试运行。
+2. SSH 登录到 VPS；若不是 root，可先运行 `sudo -i` 进入 root Bash。不要在普通 `sh` 环境直接使用 Bash 的 `<(...)` 语法。
+3. 只运行可信来源的代码。远端的 `main` 会发生变化；用于生产环境时更稳妥的方式是先下载、审查并验证 SHA-256 或固定提交，再执行。
+4. 先查询仓库当前源码版本，确认与手册一致（无需安装）：
 
 ```bash
-curl -fL https://raw.githubusercontent.com/biao169/V2ray_deploy/main/vpskit.sh -o vpskit.sh && bash -n vpskit.sh && bash vpskit.sh
+curl -fsSL https://raw.githubusercontent.com/biao169/V2ray_deploy/main/vpskit.sh | grep -m1 '^VERSION='
 ```
 
-安装后，在终端输入以下命令打开面板：
+预期此版为 `VERSION='2.0.7-node-ux'`；**如显示其他版本，以实际远端源码为准，不能假定菜单完全相同**。本教程没有替你修改 GitHub 仓库。
+
+</details>
+
+<details>
+<summary><strong>1.2 从空白 VPS 安装：两种安装模式</strong></summary>
+
+运行开头的一键命令，进入彩色面板 → **1. 部署与安装模式**，选择：
+
+- **系统共享模式 `shared`（推荐用于一机多站点）**：复用/安装系统 Nginx，系统 `nginx.service` 与 `/etc/nginx/` 可供其他应用使用；VPSKit 只生成自己负责的站点片段。ACME 程序可以共享，但项目凭据和证书资料保持独立。
+- **独立隔离模式 `isolated`（适合专用代理 VPS）**：Nginx、ACME 及服务由 VPSKit 在 `/opt/vpskit` 管理，不覆盖另一套系统 Nginx。
+
+如事先将脚本保存到本地，则可跳过选择步骤，直接用：
 
 ```bash
-sudo vpskit
+bash ./vpskit.sh install shared
+# 或者二选一：
+bash ./vpskit.sh install isolated
 ```
 
-**从旧仓库版本迁移：** 先将新版脚本上传到新仓库，再运行一次上面的新地址一键命令。脚本会保留现有配置并更新管理入口。旧版本内置的更新地址仍指向旧仓库，因此首次迁移不要只依赖旧版 `vpskit update manager`。
+**安装向导会依次处理**：系统兼容检测 → 选择部署方案 A（偏 REALITY 直连）或 B（网站 TLS 网关）→ 安装/复用组件 → 网站、域名和证书（如需要）→ 节点与凭据 → 启动并校验。80/443 端口冲突和公网防火墙规则需单独核实。
 
-## 2. 第一次部署怎么选
+</details>
 
-| 方案 | 代理方式 | 要求与端口 |
-| --- | --- | --- |
-| A | VLESS + REALITY + Vision | 代理本身无需自有证书，默认公网端口从 8443 选择；可另外部署网站 |
-| B | 默认 VLESS + XHTTP + TLS（H2），可选 Cloudflare H3 | 需要自有域名、Nginx 和有效证书；网站与客户端共用 443，Xray 监听本机内部端口 |
-
-1. 主菜单选择 **1：部署与安装 → 1：继续部署向导**。
-2. 选择 A 或 B；填写连接地址、自有域名、证书联系邮箱等。
-3. 网站可选轻量模板、自建静态网站、本机应用反向代理、常用网站或自定义 HTTPS 跳转。
-4. 选择网站访问方式。首次选择方案 B 推荐 Cloudflare 橙云 + DNS-01，直连网站推荐 HTTP-01；沿用 Let's Encrypt / ECC P-256。后续保留你选择的验证方式，支持 Cloudflare、DNSPod 自动 DNS 验证。
-5. 按提示安装组件、签发证书、添加节点，最后导出客户端链接。
-6. 检查系统防火墙和云安全组，从客户端测试连接。
-
-方案、域名和偏好会保存；输入错误可以原地重输，回车使用默认值，输入 `:q` 取消当前操作。失败后重新进入向导，已完成步骤会跳过。面板显示的是本机状态，不能替代公网连通性验证。
-
-REALITY 的目标域名与自有网站域名分别保存。网站跳转只是浏览器跳转，不等于 REALITY 握手伪装。导出的节点链接包含访问凭据，请勿公开。
-
-## 3. 防火墙端口管理
-
-主菜单选择 **10：防火墙端口管理**，或执行：
+<details>
+<summary><strong>1.3 已安装 VPSKit：启动面板、查看版本、继续部署</strong></summary>
 
 ```bash
-sudo vpskit firewall          # 防火墙菜单
-sudo vpskit firewall status   # 状态、zone和规则记录
-sudo vpskit firewall open     # 交互输入端口及tcp/udp/both，确认开放
-sudo vpskit firewall close    # 交互输入端口及协议，确认阻止新入站连接
-sudo vpskit firewall sync     # 预览并放行当前网站、节点所需端口
-sudo vpskit firewall cleanup  # 撤销本工具添加的防火墙规则
+sudo vpskit                      # 打开已安装的本地管理面板
+sudo vpskit version              # 查看本机管理器版本
+sudo vpskit mode show            # 显示共享/独立模式
+sudo vpskit node overview        # 查看旧节点和扩展节点
+sudo vpskit doctor               # 诊断组件与运行状态
 ```
 
-- 支持**已安装并启用的 UFW 或 firewalld**。不会自动安装、启用、禁用或重置整机防火墙；同时启用两者时拒绝更改，避免规则冲突。原生 nftables / iptables 不在本版直接管理范围内。
-- UFW 使用带标记的入站规则；firewalld 需要选择公网网卡/来源所属的 zone，同时修改运行时和永久配置。firewalld 需支持富规则的 priority 参数，不支持时会停止操作并报错。
-- 保护 22 和检测到的 SSH 端口，这些 TCP 端口由系统单独管理。不会为清理代理端口而停止 SSH。
-- `sync` 放行网站的 80/443、启用节点的公网 TCP 端口，以及 Shadowsocks 的 UDP 端口；不会放行 WS/XHTTP 的本机内部端口或本机网站应用端口。
-- `sync` 只添加所需放行规则，不会自动关闭停用/删除节点的旧端口。关闭旧端口请使用 `close`；以后重新启用该节点，可再次 `sync`。
-- “关闭”通过阻止规则限制新连接，已有连接可能继续。关闭 80/443 会影响网站、WS 或 HTTP 证书验证。其他高优先级规则、Docker 网络和云安全组仍可能影响最终结果，请从外网测试。
-- 保留已有外部规则。若同类外部 UFW 规则已存在，脚本会提示保留，需要核对其优先级；不会宣称端口已经通过公网验收。
-- 操作中断或部分失败时，记录保留，可重试同一操作或执行 `cleanup`。完整卸载会清理本工具记录的规则，不卸载系统防火墙。若原代理端口后来改成 SSH，清理会停止，要求先建立独立 SSH 放行规则。
+- 使用一键命令启动**远端下载的管理程序**，而 `vpskit` 启动**本机已安装的管理程序**；两者版本可能不同。
+- 若首次安装被中断，用主菜单“继续部署向导”读取已有状态；不要为了“重试”执行 `install shared --clean`。
+- 如需更换 `shared / isolated` 模式，先执行 `sudo vpskit mode migrate shared --plan`（或改为 `isolated`），确认影响后才选择 `--apply`。这会切换 Nginx 入口，可能短暂中断现有连接。
 
-**使用 HTTP-01 签发前要放通 80；DNS-01 无需为签发开放 80。** 如果部署卡在 HTTP 验证，返回防火墙菜单开放 80/443，检查域名及云安全组，然后继续部署。若 UFW/firewalld 未启用，先由管理员配置 SSH 放行和整机策略，再启用其中一个；不要在远程终端盲目重置防火墙。
+</details>
 
-## 4. 查看配置文件在哪里
+<details>
+<summary><strong>1.4 一键命令仍报旧版 `/dev/fd` 错误怎么办？</strong></summary>
 
-主菜单选择 **9：配置文件与目录**，或执行：
+最常见原因是 GitHub `main` 的脚本没有替换为支持流式启动的新版。先检查仓库中 `VERSION=` 的实际值，再用一次下载、普通文件运行的方式绕过旧版限制：
 
 ```bash
-sudo vpskit paths
+curl -fsSL --retry 2 'https://raw.githubusercontent.com/biao169/V2ray_deploy/main/vpskit.sh' -o /root/vpskit-online.sh
+bash -n /root/vpskit-online.sh
+bash /root/vpskit-online.sh
 ```
 
-命令显示路径及“存在 / 未创建 / 链接目标缺失”等状态，只显示位置，不输出密码、UUID、Token 或私钥内容。未安装时也可运行 `bash vpskit.sh paths` 查看预设位置。
+这只是**兼容旧版本的启动方式**，不会自动修改 GitHub。若下载失败，请检查 DNS、网络和 GitHub 可达性；不要直接执行一个空文件。若要固定源码内容，在部署前使用可信 SHA-256 或固定提交链接。
 
-| 内容 | 默认路径 |
-| --- | --- |
-| 管理脚本 / 唤醒入口 | `/opt/vpskit/vpskit.sh` / `/usr/local/bin/vpskit` |
-| Xray 配置 / 程序 | `/opt/vpskit/config/xray.json` / `/opt/vpskit/bin/xray` |
-| Nginx 配置 / 程序 | `/opt/vpskit/config/nginx.conf` / `/opt/vpskit/nginx/usr/sbin/nginx` |
-| 节点、域名和偏好 | `/opt/vpskit/data/state.json` |
-| 网站内容 | `/opt/vpskit/www/你的域名/` |
-| 当前证书链 / 私钥 | `/opt/vpskit/certs/你的域名/current/fullchain.pem` / `key.pem` |
-| acme.sh 程序 / 账户配置 | `/opt/vpskit/acme/acme.sh` / `/opt/vpskit/acme/config/` |
-| ACME 证书存储 | `/opt/vpskit/acme/certstore/` |
-| Xray / Nginx / 管理日志 | `/opt/vpskit/logs/xray.log` / `nginx.log` / `manage.log` |
-| Cloudflare 网段 / AOP 公共 CA | `/opt/vpskit/config/edge/` |
-| Swap 文件 / 归属记录 | `/opt/vpskit/swap/swapfile` / `/opt/vpskit/data/swap.json` |
-| Swap 开机服务 | `/etc/systemd/system/opt-vpskit-swap-swapfile.swap` |
-| 防火墙操作记录 | `/opt/vpskit/data/firewall.json` |
-| 配置回滚快照 | `/opt/vpskit/backup/last/` |
-| 服务及续期任务 | `/etc/systemd/system/vpskit-*.service`、`vpskit-maintain.timer` |
-| 系统防火墙配置 | `/etc/ufw/` 或 `/etc/firewalld/`，由对应系统工具管理 |
+</details>
 
-这里的 Nginx 是脚本独立安装的实例，配置在 `/opt/vpskit/config/nginx.conf`。Xray/Nginx 配置由面板生成，手动修改可能在下一次操作时被覆盖；网站内容可以自行编辑。状态文件、配置和证书目录可能包含凭据，不要提交到公开仓库。
-
-## 5. 常用命令
+<details>
+<summary><strong>1.5 安装完成后如何核验？</strong></summary>
 
 ```bash
-sudo vpskit install                 # 继续部署向导
-sudo vpskit wizard configure        # 修改方案和默认值，继续部署时应用
-sudo vpskit wizard status           # 逐步进度
-sudo vpskit node add                # 添加节点或共享入口用户
-sudo vpskit node list               # 带序号的节点列表
-sudo vpskit node export             # 选择节点并导出链接
-sudo vpskit node edit               # 更换UUID或密码
-sudo vpskit node port               # 按序号选择，修改入口端口
-sudo vpskit node address            # 修改连接域名、IPv4或IPv6；保留证书域名/SNI
-sudo vpskit node enable             # 启用节点
-sudo vpskit node disable            # 停用节点
-sudo vpskit node delete             # 删除节点
-sudo vpskit site add                # 添加或继续配置网站
-sudo vpskit site edit               # 修改网站内容类型
-sudo vpskit cert settings           # 修改证书验证等设置
-sudo vpskit cert status             # 证书到期情况
-sudo vpskit cert issue              # 签发或重试签发
-sudo vpskit cert renew              # 按到期策略检查续期
-sudo vpskit status                 # 本机运行状态
-sudo vpskit doctor                 # 配置、DNS、HTTPS等诊断
-sudo vpskit logs xray               # 代理日志；也支持nginx/manager/cert
-sudo vpskit optimize               # BBR、MTU探测、静态网站gzip菜单
+sudo vpskit version
+sudo vpskit doctor
+sudo vpskit node overview
+sudo vpskit ports show
+sudo vpskit firewall status
 ```
 
-更改端口后还需执行 `vpskit firewall sync`，并同步修改客户端及云安全组。证书定时任务每小时触发检查，按到期策略续期，不是每小时重新签发。
+检查 Xray 和 Nginx（当前模式对应的服务）实际运行、已保存节点、监听端口、网站证书以及云平台安全组。**Xray 配置检查成功 ≠ 公网节点已可连接**；必须在真正的客户端网络中导入节点并测试。
 
-## 6. 更新与卸载
+</details>
+
+## 第二步：先理解“协议、传输方式、安全层”和两类节点
+
+在 VPSKit 中，菜单上看起来像“协议”的名称实际上包含不同层次：
+
+| 层次 | 常见选项 | 用途 |
+|---|---|---|
+| 代理协议 | VLESS、VMess、Trojan、Shadowsocks、Hysteria2、MASQUE | 定义认证、数据结构及代理行为 |
+| 承载/传输方式 | RAW/TCP、XHTTP、WebSocket、gRPC、HTTPUpgrade、QUIC/UDP | 决定连接怎么穿过网络 |
+| 传输安全 | TLS、REALITY、VLESS Encryption | 提供相应的安全或流量外观特征，不能把它们当成同一种功能 |
+| 访问方式 | 直连、Nginx HTTPS 反向代理、符合条件的 CDN | 决定客户端实际连接的入口 |
+
+**“传统节点”与“扩展原生节点”是 VPSKit 的两套管理记录，不是两套 Xray：**传统记录在 `nodes`；扩展记录在 `native_nodes`。生成配置时它们合并到同一 Xray 实例的入站列表。**新增扩展节点不会自动修改旧节点的 UUID、路径和端口**，但任何需要重启 Xray 的配置变更都可能短暂影响当前所有连接。
+
+- 主菜单 **2 → 2 新增节点**：先选“常用/扩展”再进入对应向导；**2 → 3 创建扩展协议节点**：直接进入扩展向导，两者不是重复部署同一个节点。
+- **2 → 4 传统节点管理**：维护旧节点；**2 → 5 扩展原生节点管理**：维护新协议节点；**2 → 6 统一编号批量启停**：两组节点共同编号，一次提交。
+- **2 → 7 添加共享入口用户**：在支持共享的既有入口上创建另一个 UUID/密码，复用同端口和传输。它不是“新增一个独立公网节点”，也不是为用户分配独立 Xray 进程。
+
+### 按需求选择节点
+
+| 使用需求 | 建议先尝试 | 性能及兼容取舍 |
+|---|---|---|
+| 需要低中转开销，客户端支持 REALITY | VLESS + REALITY | 通常直连延迟较低；普通 CDN 不能直接替代入口 |
+| 已有真实 HTTPS 网站、反代或 CDN | VLESS + XHTTP | 适配 HTTP 基础设施，但需服务器与客户端版本匹配 |
+| 沿用旧客户端/旧配置 | VLESS/VMess + WS/TLS | 兼容历史配置，但有协议维护和额外封装成本 |
+| 路线高丢包、有合适 UDP 网络 | Hysteria2 | 可能改善速度；UDP 被限制时反而不可用 |
+| 想测试 H2/H3 协议族 | MASQUE / gRPC | 版本支持和网络条件要求较高 |
+| 多设备需要分别停用/轮换凭据 | 共享入口用户 | 不增加公网端口，但共享同一个实例 |
+
+**“更隐蔽”不等于无法被识别，“更快”也不是协议的固定属性。** 域名信誉、TLS 特征、链路质量、服务器性能、CDN 和客户端版本都会影响结果。新协议建议先建立测试节点，验证后再决定是否迁移。
+
+### 逐个协议：作用、适用场景、创建和客户端使用
+
+以下菜单路径对应 **VPSKit `2.0.7-node-ux`**。具体可用协议以已安装的 Xray 实际校验及客户端支持为准；文中端口和域名都由用户现场选择，不预设你的服务器实际地址。
+
+<details id="protocol-reality">
+<summary><strong>1. VLESS + REALITY（传统）</strong> — 直连 / 通常低延迟</summary>
+
+**它是什么：** VLESS 认证与 REALITY 传输安全组合；通常省去 Nginx 反代层。
+
+**何时使用：** 有支持 REALITY 的客户端，希望测试直连的延迟和稳定性；不依赖普通 HTTPS 站点的现有证书。
+
+**准备条件：** Xray 已安装且支持 REALITY；公网 TCP 端口、正确的连接地址、SNI/目标、密钥、公钥和 shortId。需确认目标站点匹配要求。
+
+**创建、导出、在客户端使用：**
+
+1. 菜单 2 → 2 新增节点 → 1 常用 → VLESS → REALITY。
+2. 输入或使用默认节点名称，选择公网可用 TCP 端口与连接地址；设置合法 REALITY 目标和 SNI。
+3. 自动生成私钥/公钥与 shortId；创建时选择随机 UUID 或输入自己的合法 UUID。
+4. 保存前预览端口与配置；确认后 Xray 会按变更计划应用。
+5. 通过菜单 2 → 4 → 导出节点获取分享链接，在支持 REALITY 的客户端导入，核对 serverName/publicKey/shortId 并实测。
+
+**注意事项：** 流量外观与一般 TLS 相近，但没有绝对匿名保证；通常不能通过普通 Cloudflare 橙云代理入口。
+
+</details>
+
+<details id="protocol-xhttp">
+<summary><strong>2. VLESS + XHTTP（传统）</strong> — HTTPS 反代 / CDN 适配</summary>
+
+**它是什么：** 基于 HTTP 请求承载连接，可通过 Nginx HTTPS 网站入口转发给本机 Xray。
+
+**何时使用：** 已有可信域名、有效 TLS 证书，想与网站共用 HTTPS 入口或测试有条件的 CDN 路径。
+
+**准备条件：** 先创建网站并签发证书；客户端支持 XHTTP，需对应 URL path、HTTP 版本和传输模式。脚本服务端默认采用 packet-up。
+
+**创建、导出、在客户端使用：**
+
+1. 菜单 3 新增网站，菜单 4 签发有效证书；确认 HTTPS 网站可访问。
+2. 菜单 2 → 2 新增 → 1 常用 → VLESS → XHTTP；按序号选网站。
+3. 本机后端端口默认自动分配，路径使用随机值或按提示设置；选择自动/手动 UUID。
+4. 保存后查公网 443 的 Nginx 反代和本机后端是否就绪；必要时更新本地防火墙，**不要对公网开放后端回环端口**。
+5. 导出 XHTTP 配置/链接，在支持 XHTTP 的客户端校对 path、HTTP 模式、Host/SNI。
+
+**注意事项：** HTTP/3 访问侧并不等于源站 Nginx 已启用 HTTP/3；本脚本的 XHTTP 选项并不让 QUIC 自动穿越所有 CDN。
+
+</details>
+
+<details id="protocol-ws">
+<summary><strong>3. VLESS + WebSocket + TLS（传统）</strong> — 历史兼容 / HTTPS 网关</summary>
+
+**它是什么：** TLS 与 WS Upgrade 承载的 VLESS 连接；往往便于延用旧版客户端。
+
+**何时使用：** 已有 WS 节点、客户端需要保持兼容；不建议仅因菜单有此项就替换稳定的 XHTTP/REALITY。
+
+**准备条件：** 先有 Nginx 网站和有效 TLS 证书；客户端需准确设置域名、SNI、Host 与 WS Path。
+
+**创建、导出、在客户端使用：**
+
+1. 先创建网站并申请证书；确保页面 HTTPS 可访问。
+2. 菜单 2 → 2 → 1 常用 → VLESS → WebSocket，按序号选择网站。
+3. 使用自动随机路径，创建时选择 UUID 自动生成或手动输入。
+4. 保存后从传统节点管理菜单导出分享链接，客户端选择 WS/TLS 并填入相同路径。
+5. 检查 Nginx 443 与 Xray 本地上游，不要将本机后端端口单独开放。
+
+**注意事项：** 当前 Xray 在一些版本会给 WebSocket 传输弃用警告。已有可用节点不因此自动失效；日后迁移先创建新节点并测试。
+
+</details>
+
+<details id="protocol-direct_tls">
+<summary><strong>4. VLESS + 直接 TLS（传统）</strong> — 直连 / 需真实证书</summary>
+
+**它是什么：** 客户端直接与 Xray 的 TLS 入站连接，不经过本项目 Nginx 网站反代。
+
+**何时使用：** 有有效证书且希望减少 Nginx 转发开销，客户端支持直接 TLS 的情况。
+
+**准备条件：** 有效域名证书、独立 TCP 入口、匹配的 SNI、证书链和私钥。
+
+**创建、导出、在客户端使用：**
+
+1. 在菜单 3/4 配置网站域名及有效证书。
+2. 菜单 2 → 2 → 1 常用 → VLESS → 直接TLS。
+3. 选择证书所对应网站、自动推荐公网端口并配置 UUID。
+4. 在客户端导出或手工设置地址、端口、UUID、TLS、SNI；检查端口在云平台和本地防火墙均可达。
+
+**注意事项：** 直连地址通常暴露在连接路径中；不等同于 XHTTP/CDN。
+
+</details>
+
+<details id="protocol-vmess">
+<summary><strong>5. VMess（传统，WS / TLS / 裸 WS）</strong> — 旧环境兼容</summary>
+
+**它是什么：** 另一种 Xray 认证协议；本脚本可选择 WebSocket/TLS 或直接 TLS 等配置。
+
+**何时使用：** 沿用既有 VMess 客户端和配置；新建优先评估 VLESS 是否满足需要。
+
+**准备条件：** 标准 UUID；选择 TLS/WS 时需对应证书和路径；裸 WS 不提供外层 TLS，不建议直接用于不可信公网。
+
+**创建、导出、在客户端使用：**
+
+1. 菜单 2 → 2 → 1 常用 → VMess，选择 WS+TLS / 直接 TLS（或仅可信环境的裸 WS）。
+2. 按要求选择网站/证书，确定连接地址和端口。
+3. 创建时生成/输入 UUID；应用后使用传统节点导出入口。
+4. 在兼容客户端核对 UUID、传输方式和 TLS/Host/Path。
+
+**注意事项：** “能生成节点”不等于所有客户端都支持全部传输组合。
+
+</details>
+
+<details id="protocol-trojan">
+<summary><strong>6. Trojan（传统，TLS / WS）</strong> — TLS 网关 / 密码认证</summary>
+
+**它是什么：** 以密码认证为主的代理协议，常配 TLS 或 WS+TLS；旧部署支持此类方案。
+
+**何时使用：** 已有 Trojan 客户端，想继续延用密码认证的连接。
+
+**准备条件：** 高强度密码、正确 TLS 证书与 SNI，必要时配置 WS Path。
+
+**创建、导出、在客户端使用：**
+
+1. 菜单 2 → 2 → 1 常用 → Trojan，选择直接 TLS 或 WebSocket。
+2. 选对应站点与证书及监听端口，创建时自动生成或手动设密码。
+3. 保存后导出传统节点，客户端填写密码、地址、端口和证书域名。
+
+**注意事项：** 部分核心会提示旧式 Trojan 无 Flow 的兼容/弃用警告；不要仅凭提示就删除仍在使用的节点。
+
+</details>
+
+<details id="protocol-shadowsocks">
+<summary><strong>7. Shadowsocks / SS2022（传统）</strong> — 较轻量 / TCP+UDP</summary>
+
+**它是什么：** 基于加密的代理协议，通常配置独立端口，可处理 TCP 和部分 UDP 场景。
+
+**何时使用：** 客户端支持 SS/SS2022、需要轻量的独立入口并愿意对网络路径做实际测试。
+
+**准备条件：** 正确的加密方法、服务端端口及对应密码/密钥；SS2022 需正确长度的 Base64 密钥。
+
+**创建、导出、在客户端使用：**
+
+1. 菜单 2 → 2 → 1 常用 → Shadowsocks。
+2. 根据向导设置加密方法、公网端口和连接地址。
+3. 创建时自动生成密钥，或输入符合算法长度的密钥：常见 2022 AES-128 为16字节、其他相关算法为32字节（解码后的长度）。
+4. 在支持相同方法的客户端导入；按需要检查 TCP 与 UDP 防火墙规则。
+
+**注意事项：** 原脚本传统 Shadowsocks 不支持“添加共享入口用户”的多用户配置。Shadowsocks 也不会天然伪装成正常 HTTPS 流量。
+
+</details>
+
+<details id="protocol-encryption">
+<summary><strong>8. VLESS Encryption（扩展）</strong> — 较新核心 / 加密载荷</summary>
+
+**它是什么：** VLESS 的可选载荷加密方案；此脚本的扩展模板使用直接 TLS 和由核心产生的加密参数。
+
+**何时使用：** 希望测试支持新加密参数的 Xray 客户端，且能管理所需的证书与版本。
+
+**准备条件：** 较新 Xray 核心、有效 TLS 证书、支持 VLESS Encryption 的客户端；核心需提供 vlessenc。
+
+**创建、导出、在客户端使用：**
+
+1. 菜单 2 → 3 创建扩展协议 → VLESS Encryption。
+2. 选择证书域名、端口和连接地址，创建时输入/生成 UUID。
+3. 脚本调用已安装核心生成对应加解密参数并校验整个候选 Xray 配置。
+4. 保存后在菜单 2 → 5 扩展原生节点管理 → 导出客户端 JSON，在兼容 Xray 客户端核对完整设置。
+
+**注意事项：** VLESS Encryption 不等于 REALITY，也不保证任何网络下都不可分类。
+
+</details>
+
+<details id="protocol-hysteria">
+<summary><strong>9. Hysteria2（扩展）</strong> — UDP / QUIC / TLS</summary>
+
+**它是什么：** 基于 UDP/QUIC 的传输，在部分高延迟或丢包环境可能表现较好；需要 TLS。
+
+**何时使用：** 已确认 VPS 和客户端之间 UDP 可达，希望与 TCP 节点对比延迟和吞吐。
+
+**准备条件：** 支持的 Xray 版本、真实 TLS 证书、独立 UDP 端口和高强度认证密码；客户端必须支持对应实现。
+
+**创建、导出、在客户端使用：**
+
+1. 菜单 4 先为对应域名取得证书。
+2. 菜单 2 → 3 → Hysteria2，选择证书域名和推荐端口，生成或输入密码。
+3. 保存并检查 UDP 监听、云安全组和本地 UDP 放行。
+4. 菜单 2 → 5 → 导出客户端 JSON，使用支持 Hysteria2 的 Xray 客户端；在实际外网测试。
+
+**注意事项：** 普通 Cloudflare 橙云站点不能直接当作任意 UDP 代理；UDP 不通时增加 Nginx Worker 无济于事。
+
+</details>
+
+<details id="protocol-masque">
+<summary><strong>10. MASQUE H2/H3（扩展）</strong> — HTTP/2 或 HTTP/3 协议族</summary>
+
+**它是什么：** 代理传输协议族，脚本提供 H2、H3 和双模式选择，带证书和认证。
+
+**何时使用：** 想比较不同 HTTP 传输，且客户端、证书与网络环境满足要求。
+
+**准备条件：** 最新兼容的 Xray 核心及客户端；H2 通常需 TCP、H3 需 UDP、双模式需两者。
+
+**创建、导出、在客户端使用：**
+
+1. 创建/确认有效 TLS 证书。
+2. 菜单 2 → 3 → MASQUE，选择 H2、H3 或 both。
+3. 设置认证密码、连接地址和端口；查看 TCP/UDP 放行列表。
+4. 保存后到扩展原生节点管理导出客户端 JSON，使用支持 MASQUE 的对应客户端连接。
+
+**注意事项：** 即使 HTTPS 网页可以访问，也不表示所选 MASQUE H3 的 UDP 路径可达。
+
+</details>
+
+<details id="protocol-grpc">
+<summary><strong>11. VLESS gRPC + TLS（扩展）</strong> — HTTP/2 / ServiceName</summary>
+
+**它是什么：** 通过 gRPC 承载 VLESS，需客户端支持 gRPC 传输及匹配的服务名。
+
+**何时使用：** 已有支持 HTTP/2 的客户端和路径设施，想测试 gRPC 方案。
+
+**准备条件：** TLS 证书、gRPC 服务名、独立端口、支持该传输的客户端。
+
+**创建、导出、在客户端使用：**
+
+1. 菜单 2 → 3 → VLESS gRPC。
+2. 选择网站证书、端口、连接地址，创建时设置 UUID；脚本按入口生成 ServiceName。
+3. 保存并从菜单 2 → 5 导出客户端 JSON。
+4. 在客户端确认 gRPC、ServiceName、TLS SNI 和端口与服务端一致。
+
+**注意事项：** HTTP/2 协议可用不等于 gRPC 代理必然被某个 CDN/反代支持。
+
+</details>
+
+<details id="protocol-httpupgrade">
+<summary><strong>12. VLESS HTTPUpgrade + TLS（扩展）</strong> — HTTP Upgrade / 路径匹配</summary>
+
+**它是什么：** 使用 HTTP 升级传输，要求中间设施和客户端支持升级请求。
+
+**何时使用：** 已有支持 HTTPUpgrade 的客户端，需要与 WS/XHTTP 作传输兼容性比较。
+
+**准备条件：** TLS 证书，正确的 path/Host/ALPN，服务端和客户端都支持 HTTPUpgrade。
+
+**创建、导出、在客户端使用：**
+
+1. 菜单 2 → 3 → HTTPUpgrade。
+2. 选择网站证书及独立端口，输入/生成 UUID。
+3. 从扩展原生节点导出配置，校对 TLS、Host、路径与客户端支持情况。
+4. 确认连接成功再与旧节点对比。
+
+**注意事项：** HTTPUpgrade 并不是 WebSocket 的简单别名；不要直接把 WS 客户端网络类型改名。
+
+</details>
+
+<details id="protocol-localproxy">
+<summary><strong>13. 本机 SOCKS5 / HTTP 代理（扩展）</strong> — 仅本机入口</summary>
+
+**它是什么：** 供 VPS 本地程序调用的认证代理入口；脚本默认监听 127.0.0.1。
+
+**何时使用：** 同台服务器上有需要通过 Xray 本地入站代理的应用，而不是给远程手机/电脑发公网链接。
+
+**准备条件：** 本机端口和用户名/密码；避免将该类代理未经认证地暴露在公网。
+
+**创建、导出、在客户端使用：**
+
+1. 菜单 2 → 3 → SOCKS5 或 HTTP。
+2. 选择本机监听端口，自动生成或手动设置访问密码。
+3. 保存后仅在同机程序中使用 127.0.0.1 和相应端口，远程设备无法直接访问该回环地址。
+4. 在菜单 2 → 5 中查看、停用或删除该扩展入口。
+
+**注意事项：** 使用 SSH 转发等机制时需单独评估安全要求，不要为了“能连”把本地入口直接改成公网开放代理。
+
+</details>
+
+### 按实际操作走一遍（可展开）
+
+<details>
+<summary><strong>案例 A：从 GitHub 一键启动，第一次安装，并创建 REALITY 节点</strong></summary>
+
+1. 在 root Bash 执行本文第一行的一键命令，或先下载后运行。进入管理面板的“部署与安装模式”，选 `shared`（多站点）或 `isolated`（单独使用）。
+2. 安装向导选方案 A，检查 Xray 安装、网络与推荐端口；在菜单 2 创建“常用 → VLESS → REALITY”节点。
+3. 填入节点名及服务器连接地址、选择自动端口、设置 REALITY 目标/SNI；脚本自动生成密钥。UUID 选自动生成或手动输入。
+4. 保存后查看节点列表，导出传统节点分享链接；在支持 REALITY 的客户端导入，检查 SNI/publicKey/shortId、端口与 UUID。
+5. 客户端不能连接时查看 `vpskit doctor`、`vpskit ports show`、防火墙和云平台规则，不应直接删除旧安装。
 
 ```bash
-sudo vpskit update manager          # 更新管理脚本，下次打开面板生效
-sudo vpskit update xray             # 独立更新Xray
-sudo vpskit update nginx            # 独立更新Nginx
-sudo vpskit update acme             # 独立更新证书工具
-sudo vpskit update all              # 依次更新已安装组件及管理脚本
-sudo vpskit uninstall xray          # 独立卸载Xray，同时删除代理节点
-sudo vpskit uninstall nginx         # 有网站/节点依赖时拒绝卸载
-sudo vpskit uninstall acme          # 有证书依赖时拒绝卸载
-sudo vpskit uninstall all           # 确认后完整卸载
+sudo vpskit node overview
+sudo vpskit node export 1      # 示意编号，须按当前传统节点列表选择
+sudo vpskit doctor
 ```
 
-完整卸载会删除本工具的网站、节点、证书、日志、备份、服务和入口，并撤销其网络调优及记录的防火墙规则，安全停用并删除本工具的 Swap；先另行备份需要保留的内容。外部防火墙、外部规则、系统共享日志、原有依赖以及自行下载的源码文件不属于本工具清理范围。
+</details>
 
-本版本做过 Bash/ShellCheck、旧版 Bash 4.4 / jq 1.5、节点交互、配置与本机代理连接，以及隔离的防火墙、Swap 命令/状态测试。1.5.0 另通过本机 Nginx 的爬虫策略、限流、真实 IP 信任边界、缓存、AOP 客户端证书和 WS 连通性测试。真实 VPS 的防火墙内核规则、systemd 启动、ACME 签发、Cloudflare 线上回源、Swap 激活及重启恢复仍需现场验收。
+<details>
+<summary><strong>案例 B：在已有网站上新增 VLESS + XHTTP 节点</strong></summary>
 
-## 7. 节点序号、IPv4 / IPv6 与面板颜色
+1. 主菜单 3 新建域名网站，菜单 4 完成 HTTP-01 / DNS-01 验证、证书签发。先确认 HTTPS 正常。
+2. 主菜单 2 → 2 新建 → 常用 VLESS → XHTTP，选择已有网站；后端端口自动选本机回环端口，代理路径可用随机生成。
+3. 创建时自动生成 UUID 或手动输入；保存后查看候选配置计划及 Nginx/Xray 的运行情况。
+4. 导出 XHTTP 节点，使用支持此模式的客户端设置 path/Host/SNI/HTTP 配置，检查网页和代理路径是否能分别访问。
+5. 公网 443 必须可达；不要把 Xray 本地后端端口当公网端口放行，也不要对代理路径启用网页缓存。
 
-节点列表显示 `[1]`、`[2]` 等序号。导出、改凭据、改端口、改地址、停用、删除和添加共享用户都可按序号选择；错误序号可以重新输入。删除会先显示选中名称，再要求确认。删除后序号会重新排列，以最新列表为准。
+</details>
+
+<details>
+<summary><strong>案例 C：原有三个传统节点，再增加一个 Hysteria2；旧节点如何使用？</strong></summary>
+
+1. 原有 `safe_01 / safe_02 / safe_03` 保持不变；创建新节点只会在原有列表之外新增扩展记录，不会改旧 UUID/端口。
+2. 菜单 2 → 3 扩展 → Hysteria2，确认 TLS 证书、UDP 端口、认证密码并保存。
+3. 菜单 2 → 5 → 查看原生节点，再选择导出。**该导出是完整 Xray 客户端 JSON，不等同于所有 GUI 通用分享链接。**
+4. 在能读取 Xray JSON 且支持 Hysteria2 的客户端中配置并验证；注意导出配置内通常包括 `127.0.0.1:10808` 的**本地** SOCKS 入站，若本地端口冲突需调整。
+5. 新节点无法连接时，仍可按原有 URI 使用传统节点。注意：添加节点可能触发整个 Xray 服务重启一次，已有连接当时可能短暂中断，但原凭据并不会因此失效。
 
 ```bash
-sudo vpskit node list
-sudo vpskit node delete             # 交互输入序号，确认后删除
-sudo vpskit node export 2           # 导出当前第2个节点
-sudo vpskit node address            # 交互输入序号和新的连接地址
+sudo vpskit node overview
+sudo vpskit node native list
+sudo vpskit node native export 1
+sudo vpskit node native disable 1
 ```
 
-CLI 仍兼容旧的节点名称；若存在纯数字名称，显式命令参数优先按名称匹配，交互菜单始终按序号选择。
+</details>
 
-- REALITY、Shadowsocks、VMess 独立 WS 可直接填写 VPS 的 IPv4 / IPv6，无需自有代理域名。
-- XHTTP H2 / WS+TLS / TCP+TLS 可以把连接地址设成 IP，但仍保留有有效证书的域名作为 **TLS SNI**，XHTTP/WS 同时保留该域名作为 **Host**，不会关闭证书校验。
-- IPv6 输入示例：`2001:db8::10`，不输入方括号；导出的 URI 会按格式自动加括号。示例地址仅供说明，必须换成实际地址。独立入口的 IPv6 连接要求系统已启用 IPv6，并选择 `::` 监听。
-- 同入口的多个用户共享连接地址、监听地址和端口；修改这些参数会同步影响整个入口。域名与 IP 需要分别导出时，可建立不同入口。
+<details>
+<summary><strong>案例 D：给另一个人单独 UUID，但不增加一个独立端口</strong></summary>
 
-主面板用紫色标题、蓝色菜单序号、青色域名/数量、绿色正常、黄色待处理、红色异常或删除操作、灰色说明。颜色同时配有文字；重定向输出或使用 `vpskit --no-color` 时不输出颜色控制符。
+1. 已经存在支持共享用户的传统节点入口（例如 VLESS REALITY 或 WS）。
+2. 进入菜单 2 → 7“添加共享入口用户”，按编号选择已有节点。
+3. 输入新的显示名称；在凭据菜单中选择自动生成独立 UUID，或手动输入合法 UUID。**不要复用第一位用户的 UUID。**
+4. 保存后，导出新用户节点链接；两人使用相同入口端口与协议，但凭据不同。
+5. 需要停用某个人时，先按传统节点编号仅停用其记录。实际 Xray 配置变更可能使其他用户当前连接短暂中断。
 
-## 8. Cloudflare 橙云与源站地址
+**限制：**传统 Shadowsocks 不支持此共享用户管理入口；该功能不创建独立进程、带宽配额或真实租户隔离。
 
-推荐组合：**方案 B → Cloudflare 代理 → DNS-01 → VLESS + XHTTP + TLS H2**。
+</details>
 
-1. 在 Cloudflare 管理域名 DNS，把用于网站/XHTTP/WS 的记录设为橙云，并正确配置到源站。公开查询可返回 Cloudflare 边缘 IP；脚本不会强制 A/AAAA 等于 VPS IP。
-2. 选择 Cloudflare DNS-01，用限定区域的 DNS 编辑 Token 和 Account ID 完成 TXT 验证。DNS API 凭据仅用于证书；脚本不自动改橙云、源站或 SSL 控制台配置。
-3. 等源站有效证书就绪，在 Cloudflare 选择 **Full (strict)**，启用 **WebSockets**。云安全组和系统防火墙必须允许所需 HTTPS 回源。
-4. 客户端默认连接这个域名的 443，代理路径、Host 和 TLS SNI 使用导出值。
-
-也可在连接地址处填写可用的 Cloudflare 边缘 IPv4 / IPv6，保留自己的 Host/SNI；边缘地址的可用性需自行验证。填写 **VPS 源站 IP** 则是直连，会将该 IP 写入分享链接。
-
-普通 Cloudflare 橙云适用于 HTTP(S)/WebSocket，不能直接代理本脚本的 REALITY、独立 TCP+TLS 或 Shadowsocks。若目标是尽量隐藏源站，应避免同时分发源站直连节点，并检查其他 DNS 记录；橙云不清除历史 DNS，也不保证源站永远无法被发现。可在菜单 12 显式启用 Nginx 层的 Cloudflare 网段限制；本版不自动改变云防火墙或 SSH。
-
-## 9. 低内存 VPS 一键 Swap
-
-主菜单选择 **11：Swap虚拟内存**。512MB RAM / 10GB 磁盘建议先添加 **1024MiB**，再安装组件；实际磁盘剩余空间必须足够。
+<details>
+<summary><strong>案例 E：在扩展节点管理里导出 JSON，客户端应该如何使用？</strong></summary>
 
 ```bash
-sudo vpskit swap                    # 打开菜单
-sudo vpskit swap enable             # 一键创建1GiB；已配置时恢复/修复
-sudo vpskit swap custom             # 256～4096MiB，256的倍数
-sudo vpskit swap status             # 实际使用量、路径、开机状态
-sudo vpskit swap remove             # 确认后安全移除
+sudo vpskit node native list
+# 下面一组命令应在 root Bash 中执行
+umask 077
+vpskit node native export 1 > /root/vpskit-client.json
 ```
 
-- 使用独立文件和 systemd `.swap` 服务持久化，重启自动启用；不改 `/etc/fstab`，不覆盖、关闭或删除已有系统 Swap。
-- 创建后至少保留 **1GiB** 空闲磁盘；文件权限为 `600`，不进入配置回滚快照。
-- 自动创建支持 ext2/ext3/ext4/XFS；Btrfs、ZFS 等需专门配置，本功能会停止。容器环境需要宿主机支持，不保证可用。
-- 创建/启用失败会留下归属和阶段记录，可重试 `swap enable` 或安全移除。已有 Swap 不会重复分配；变更容量请先移除再创建。
-- 移除前要求可用 RAM ≥ 当前已用本工具 Swap + 128MiB。内存不足或 `swapoff` 失败时保留文件及开机配置，完整卸载也会停止，请先关闭占内存的应用再重试。
-- Swap 用于缓冲内存压力，磁盘速度比 RAM 慢，不能替代物理内存，也不会增加代理带宽。
+导出的客户端 JSON 可能含 UUID、密码、SNI 等敏感资料，默认**不允许普通用户读取**，建议在 root 终端先运行 `umask 077` 再保存。文件里有 `inbounds`（本地 SOCKS 监听）和 `outbounds`（实际远端节点），不是需要直接复制到服务器的配置。安装支持此协议的 Xray 客户端后，可校验 JSON 格式与版本兼容，再按客户端自己的方式加载。无法导入到某款 GUI 不等于服务器端节点已经损坏；部分 GUI 不支持这种完整配置格式。
 
-## 10. 方案 B 增强：防护、爬虫与带宽
+**特殊情况：**通过“导入原生入站 JSON”建立的节点，脚本可能没有客户端模板（`client:null`），这时不能自动导出，需要根据原始协议参数自行编写对应客户端出站。
 
-升级脚本后打开 **主菜单 12：方案B防护与流量**。旧站点保留原有爬虫、限额和回源设置，增强预设需要主动应用；所有策略按网站域名保存。一个 Xray、一个 Nginx worker，不额外安装防爬守护进程或磁盘代理缓存。
+</details>
 
-推荐顺序：
+## 第三步：按 VPSKit 面板结构逐级展开全部功能
 
-1. 确认网站和 XHTTP/WS+TLS 节点已经能通过橙云连接。
-2. 应用 **均衡预设**：仅拦截声明身份的 AI 爬虫；网站每 IP 5 请求/秒、允许突发 30、并发请求 20；静态资源缓存 1 小时，开启低等级 gzip。
-3. 阅读 **Cloudflare边缘配置指引**，在控制台配置爬虫拦截和缓存，并排除 XHTTP前缀及 WS/ACME 等特定路径。
-4. 确认网站与客户端正常后，开启 **限制Cloudflare回源**。
-5. 可选 AOP：先 `observe`，在 Cloudflare 开启 Global Authenticated Origin Pulls，再执行回源验证；最后切换 `enforce`。
+本手册以下部分与 **2.0.7-node-ux** 的菜单清单对应：**16 个一级模块 → 38 组下级菜单 → 332 个可展开的功能条目**（包含菜单返回项）。每条菜单均有**作用、适用场景、操作步骤、生效结果、使用要求/风险、完整菜单路径**；能够核对的操作提供命令。
+
+在终端输入数字选择，`0` 返回、`H` 回首页、`R` 刷新、`D` 折叠用途说明、`N/P` 翻页，`/关键词` 查找菜单。**编号以当前运行版本实际显示为准**；传统与扩展节点各自的局部序号不等于“统一编号批量启停”的序号。
+
+<details id="install">
+<summary><strong>1. 部署与安装模式</strong> — 安装 · 组件归属 · 迁移</summary>
+
+### 什么情况下选择哪种模式？
+
+**系统共享模式 `shared`（新装优先考虑）**：Nginx 由系统包管理器管理，VPSKit 只添加自己的配置片段；共享 ACME 的程序可被别的软件调用，但各项目的凭据和账户数据应隔离。适合一台 VPS 同时承载其他网站。
+
+**独立隔离模式 `isolated`**：Nginx 与 ACME 使用 `/opt/vpskit` 下的独立程序及服务，避免接管已有系统 Nginx。适合专用代理服务器。旧版本已有部署会优先按独立模式识别，不要直接删除原目录后重装。
+
+### 全新安装
+
+1. 以 root 或具备 sudo 的账户登录 Debian/Ubuntu VPS；确认 systemd、Bash、curl、磁盘、内存和 80/443/SSH 端口状态。
+2. 下载或在线运行可信的脚本并核对 `version`。在线仓库没有提交新版时，仍会执行旧版。
+3. 执行 `install shared` 或 `install isolated`，依提示配置方案 A/B、域名、证书及节点。完成后检查运行状态。
+4. 在云厂商安全组及本机防火墙分别核对 TCP/UDP 端口，实测客户端连接。
+
+### 已有部署迁移模式
+
+先运行 `mode migrate shared --plan` 或 `mode migrate isolated --plan`，核对外部站点、证书和系统 Nginx 后，在维护窗口执行 `--apply`。迁移可能短暂中断网站及经 Nginx 的代理连接。**不要把 `mode select` 当成迁移已有节点的命令。**
 
 ```bash
-sudo vpskit edge                    # 防护与流量菜单
-sudo vpskit edge status             # 每个网站的策略和更新时间
-sudo vpskit edge profile            # 选择网站，应用均衡预设
-sudo vpskit edge bots               # off / ai / common / all
-sudo vpskit edge limits             # 请求、突发、并发、每响应下载限额
-sudo vpskit edge cache              # 静态缓存时间与站点gzip
-sudo vpskit edge origin             # 开关Cloudflare网段限制
-sudo vpskit edge aop                # off / observe / enforce
-sudo vpskit edge probe              # 验证本次公网回源是否为SUCCESS
-sudo vpskit edge refresh            # 刷新官方IPv4/IPv6网段及公共AOP CA
-sudo vpskit edge guide              # 输出控制台配置指引与网站规则范围
-sudo vpskit edge traffic            # 网卡累计流量和约1秒速率采样
-sudo vpskit edge reset              # 关闭所选网站的新增增强设置
+# 先核对远程仓库实际版本；请先信任来源
+curl -fsSL https://raw.githubusercontent.com/biao169/V2ray_deploy/main/vpskit.sh | grep -m1 '^VERSION='
+
+# 两种新装模式（选一种）
+sudo bash ./vpskit.sh install shared
+sudo bash ./vpskit.sh install isolated
+
+# 已有部署只预览迁移
+sudo vpskit mode show
+sudo vpskit mode migrate shared --plan
+# 确认停机风险后，才使用 --apply
 ```
 
-### 各项功能的作用和边界
+> **注意**：`install shared --clean` 是先清除旧 VPSKit 数据再全新安装，不属于普通升级，旧 UUID/密码可能丢失。
 
-| 功能 | 行为 |
-| --- | --- |
-| 正常网站外观 | 网站照常展示；未配置的 Host、普通 HTTP 请求探测 WS 节点路径返回 404。WS 仍需正确握手和节点凭据；不保证流量无法被识别 |
-| AI 爬虫 `ai` | 拒绝匹配 GPTBot、ClaudeBot、Bytespider 等已知 User-Agent；普通搜索引擎爬虫通常保留 |
-| 常见采集器 `common` | 在 AI 名单上增加 Ahrefs、Semrush 等；适合不需要这些采集服务的网站 |
-| 广泛策略 `all` | 增加 bot/spider/crawler、curl/wget 等匹配，会影响 SEO、网站 API 和监控工具；需要确认 |
-| 网站限流 | 按访客 IP 控制请求速率、突发和并发，超限返回 429；同一 NAT 出口共享额度 |
-| 网站下载限额 | 以 KiB/s 限制每一个网站响应；不是整台 VPS 或每个代理用户的总带宽配额 |
-| 静态缓存 | CSS/JS/图片/字体设置缓存头；由浏览器/CDN减少重复请求。HTML和动态应用不强制缓存；WS/XHTTP禁用代理缓存 |
-| 压缩 | 仅静态文本轻量 gzip；不重复压缩加密代理流量；全局 gzip 开关仍独立生效 |
-| 回源限制 | Nginx 只接受来自已验证 Cloudflare 网段的网站/WS/XHTTP访问；保留 ACME HTTP-01 路径，不修改 SSH |
-| AOP | 使用 Cloudflare 公共回源 CA 检查客户端证书；先观察，公网验证通过后才允许强制，并在应用后再次验证 |
-| 更新与恢复 | 小型官方资料每 7 天通过现有维护任务刷新；失败保留旧资料。修改前验证配置，失败恢复；成功只重载 Nginx，不重启 Xray |
+### 此模块的完整菜单索引
 
-**爬虫并不会因为被列入名单就诚实报名字。** User-Agent 可以伪造，`robots.txt` 也只是一项约定。静态网站缺少 `robots.txt` 时提供对应默认声明；已有文件原样保留，动态应用的 robots 路由保留。部分 AI 产品使用 robots 产品标识而非同名 User-Agent，不能只靠字符串匹配覆盖所有抓取。
+<details class="menu-group">
+<summary><strong>install</strong>：10 个功能（逐项展开查看操作方法）</summary>
 
-想真正减少 VPS 回源流量，优先让 **Cloudflare 在边缘拦截或命中缓存**。本机规则只能减少后续响应和应用开销，请求及 TLS 握手已经到达 VPS；无法防御超出线路容量的攻击。WS/XHTTP 代理传输仍计入实际 VPS 带宽，CDN 不会缓存你的代理数据，也不会提高服务商的硬性速率上限。
+> **所在目录：** 1. 部署与安装模式
 
-### Cloudflare 配置与防误伤
+<details class="menu-item">
+<summary><strong>1. 新装共享模式</strong> — 以系统Nginx和共享ACME程序进行部署。</summary>
 
-- 脚本只信任从官方 Cloudflare 网段传来的 `CF-Connecting-IP`，用于按真实访客限流；直接访问时伪造该头不能变成受信任请求。回源限制检查原始连接对端，避免把正常访客 IP 当作 Cloudflare IP 来误封。
-- 跳转网站的 301/302 在 Nginx 请求限流阶段前返回，跳转请求速率应在 Cloudflare 边缘控制；爬虫和回源检查仍生效。
-- **WS 精确路径和 XHTTP 路径前缀不套用网站爬虫过滤、请求/并发限额、下载限额、gzip 或缓存；回源限制和 AOP 仍然适用。** ACME 路径不套用网站策略。WS 路径之外伪造 `Upgrade` 头不能绕过网站规则。
-- `edge guide` 输出的网站范围表达式只是规则的作用范围，必须再加拦截条件；不能把它直接设为 Block，否则会封禁正常网站流量。
-- 不要对共用代理域名盲目开启 **免费 Bot Fight Mode**：普通 Skip 规则无法豁免它，可能影响自动客户端。支持例外的产品/套餐才按具体 WS 精确路径和 XHTTP 前缀做豁免；不要因携带任意 Upgrade 头就全站放行。
-- Cloudflare 控制台的 AI 拦截策略、WAF、缓存和套餐能力以当前账户为准，脚本不自动发布这些规则，也不会把证书 DNS Token 用作 WAF 管理凭据。新增、改动或停用 WS/XHTTP 节点后，应同步更新边缘路径规则。
-- 开启回源限制/AOP后，源站 IP 直连网站和 WS/XHTTP 会被拒绝。REALITY、独立 TCP+TLS、Shadowsocks 等其他端口不受该网站规则控制，仍可能暴露源站。
-- 公共 AOP 证书由 Cloudflare 账户共享，仅证明来自 Cloudflare 网络，不绑定你的账户。需要更严格的账户/域名隔离时，应另外配置 zone-level/per-hostname 自有回源证书；本版不自动部署这一高级配置。
-- `observe` 允许不提供客户端证书的请求，但会验证已经提供的证书。`enforce` 拒绝缺少有效证书的 HTTPS 请求；HTTP-01 的 80 端口验证路径仍可用。
-- 修改完成后需从客户端检查网站、WS/XHTTP 节点和续期。Nginx 层限制不等于内核防火墙丢包；如需只允许 Cloudflare 网段进入源站的 80/443，应在云防火墙另行配置并安排网段更新。
+- **作用：** 以系统Nginx和共享ACME程序进行部署。
+- **什么时候用：** 需要执行“新装共享模式”而不是只查看状态时。
+- **操作步骤：** 在空服务器上选择该项，核对80/443及共享Nginx现状，依提示安装/复用系统Nginx与ACME，然后完成代理方案及域名设置；结束后验证服务、网站与客户端。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 已有部署不能直接改模式；需走迁移；会修改配置或服务；无需求时可直接取消。
+- **菜单路径：** 主菜单 → 1. 部署与安装模式 → 1. 新装共享模式
 
-旧 Ubuntu 如安装过缺少限流模块的 `nginx-light`，先运行 `sudo vpskit update nginx`。新版优先提取包含所需模块的发行版构建；缺少模块时会给出明确错误，不会默默按错误 IP 限流。不开启新防护时，不强制升级旧配置。
+</details>
 
-静态资源更新建议更换文件名或版本参数，并按需清理 CDN 缓存。关闭本机增强设置不会替你删除 Cloudflare 控制台规则；关闭站点 gzip 后，全局 gzip 如仍启用，还需在优化菜单关闭。
+<details class="menu-item">
+<summary><strong>2. 新装独立模式</strong> — 使用私有组件和服务。</summary>
 
-参考：[Nginx WebSocket](https://nginx.org/en/docs/http/websocket.html)、[Nginx Real IP](https://nginx.org/en/docs/http/ngx_http_realip_module.html)、[Cloudflare 缓存](https://developers.cloudflare.com/cache/concepts/default-cache-behavior/)、[Bot Fight Mode](https://developers.cloudflare.com/bots/get-started/bot-fight-mode/)、[公共 AOP](https://developers.cloudflare.com/ssl/origin-configuration/authenticated-origin-pull/set-up/global/)。
+- **作用：** 使用私有组件和服务。
+- **什么时候用：** 需要执行“新装独立模式”而不是只查看状态时。
+- **操作步骤：** 选择该项按向导安装VPSKit私有Nginx/ACME/Xray，依提示设置方案、端口和证书；若公网80/443已被外部程序占用，应先解决冲突。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 不抢占外部程序端口；会修改配置或服务；无需求时可直接取消。
+- **菜单路径：** 主菜单 → 1. 部署与安装模式 → 2. 新装独立模式
 
+</details>
 
-## 11. 1.6.0：XHTTP H2 / H3 与旧节点迁移
+<details class="menu-item">
+<summary><strong>3. 继续部署向导</strong> — 自动读取已保存参数，跳过已完成步骤。</summary>
 
-方案 B 的新节点默认 **VLESS + XHTTP + TLS，H2、packet-up 模式**。普通“添加节点”也默认选择 VLESS；方案 A 保持 VLESS REALITY Vision。明确选择 VMess/Trojan 时才创建旧协议节点，旧节点不会自动转换或删除。分享链接含 `type=xhttp`、`mode=packet-up`、`alpn=h2/h3`，客户端必须正确支持这些字段；无法完整导入时用客户端 JSON。
+- **作用：** 自动读取已保存参数，跳过已完成步骤。
+- **什么时候用：** 需要执行“继续部署向导”而不是只查看状态时。
+- **操作步骤：** 进入后脚本读取已保存的部署进度，依次补齐未完成的组件、站点或代理信息；每一段完成后返回面板核对状态。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 新机或未完成部署；需要联网；会修改配置或服务；无需求时可直接取消。
+- **菜单路径：** 主菜单 → 1. 部署与安装模式 → 3. 继续部署向导
 
-| 选择 | 实际连接链路 | 条件 |
-| --- | --- | --- |
-| H2（默认） | 客户端 → TLS/H2 → Nginx → 本机 Xray；也可经过 Cloudflare | Nginx 编译包含 http_v2 模块；客户端支持 XHTTP |
-| H3（Cloudflare） | 客户端 → QUIC/H3 → Cloudflare → HTTPS 回源 Nginx → 本机 Xray | 网站设为 Cloudflare、节点地址使用该网站域名、橙云、有效边缘证书、Cloudflare 开启 HTTP/3、客户端出站 UDP443 可用 |
+</details>
 
-本版 **不安装 VPS 原生 H3/QUIC 监听，不支持用源站 IP 直连 H3**，无需为此开放 VPS UDP443。H3 仅作用于客户端到 Cloudflare，回源使用 TCP；没有自动 H3→H2 回退，失败时用节点菜单切回 H2并重新导入。网站选择“Cloudflare”不代表控制台已设置成功，脚本不会冒用 DNS Token 修改 HTTP/3、WAF 或缓存开关。
+<details class="menu-item">
+<summary><strong>4. 查看当前部署进度</strong> — 核对现有历史参数和向导完成情况。</summary>
 
-Cloudflare 控制台：进入域名 → **Speed → Settings → Protocol Optimization → HTTP/3** 开启。为 XHTTP 的 `路径/` **前缀及全部子路径**设置缓存 Bypass，避免 JS 挑战、验证码和网站限流；不要只豁免一个精确 URL。`sudo vpskit edge guide` 会输出包含 XHTTP 前缀的规则范围。不要单独拦截该范围表达式，应叠加实际拦截条件。
+- **作用：** 核对现有历史参数和向导完成情况。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 选中后阅读方案、已完成步骤及组件状态；要继续安装，返回选择“继续部署向导”。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只读；不会重置部署；只读操作；不主动写入运行配置。
+- **菜单路径：** 主菜单 → 1. 部署与安装模式 → 4. 查看当前部署进度
 
-**操作步骤：**
+</details>
 
-1. 把本版 `vpskit.sh` 上传到仓库 `main` 根目录，再执行 README 开头的一键命令更新本机管理脚本；不会直接改掉现有节点。
-2. 新建：主菜单 **2 → 1**，默认 VLESS → XHTTP，选择已签发证书的网站；H2 默认，H3需确认条件。
-3. 迁移：主菜单 **2 → 11**，按序号选旧节点，创建独立名称、UUID、内部端口和路径的新节点。原节点及共享用户保留；这是逐个新增迁移，不是批量覆盖。
-4. 将新链接/JSON导入支持 XHTTP 的客户端，测试上下行、DNS和网站访问。确认正常后，使用 **2 → 8** 按序号停用旧节点。
-5. **2 → 12** 切换 H2/H3（同入口导出参数一起更新）；**2 → 13** 导出 Xray 客户端 JSON。
+<details class="menu-item">
+<summary><strong>5. 单独安装或补装组件</strong> — 进入下级功能菜单，包含：安装或复用 Nginx、单独安装 Xray、安装或复用 ACME。</summary>
+
+- **作用：** 进入下级功能菜单，包含：安装或复用 Nginx、单独安装 Xray、安装或复用 ACME。
+- **什么时候用：** 需要集中管理“单独安装或补装组件”相关操作时。
+- **操作步骤：** 在此项按序号进入下级菜单，先查看状态和用途，再选择具体操作；不需要输入长文本名称。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 查看当前状态后按序号选择；仅进入下级菜单；不会立刻修改系统。
+- **菜单路径：** 主菜单 → 1. 部署与安装模式 → 5. 单独安装或补装组件
+
+</details>
+
+<details class="menu-item">
+<summary><strong>6. 模式、归属与外部程序复用</strong> — 进入下级功能菜单，包含：安装模式与组件归属、选择共享模式（空部署）、选择独立模式（空部署）、显式复用外部 a</summary>
+
+- **作用：** 进入下级功能菜单，包含：安装模式与组件归属、选择共享模式（空部署）、选择独立模式（空部署）、显式复用外部 acme.sh、修复中断的APT启动抑制等。
+- **什么时候用：** 需要集中管理“模式、归属与外部程序复用”相关操作时。
+- **操作步骤：** 在此项按序号进入下级菜单，先查看状态和用途，再选择具体操作；不需要输入长文本名称。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 查看当前状态后按序号选择；仅进入下级菜单；不会立刻修改系统。
+- **菜单路径：** 主菜单 → 1. 部署与安装模式 → 6. 模式、归属与外部程序复用
+
+</details>
+
+<details class="menu-item">
+<summary><strong>7. 模式迁移</strong> — 进入下级功能菜单，包含：预览迁移到共享模式、执行迁移到共享模式、预览迁移到独立模式、执行迁移到独立模式、未完</summary>
+
+- **作用：** 进入下级功能菜单，包含：预览迁移到共享模式、执行迁移到共享模式、预览迁移到独立模式、执行迁移到独立模式、未完成事务状态等。
+- **什么时候用：** 需要集中管理“模式迁移”相关操作时。
+- **操作步骤：** 在此项按序号进入下级菜单，先查看状态和用途，再选择具体操作；不需要输入长文本名称。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 查看当前状态后按序号选择；仅进入下级菜单；不会立刻修改系统。
+- **菜单路径：** 主菜单 → 1. 部署与安装模式 → 7. 模式迁移
+
+</details>
+
+<details class="menu-item">
+<summary><strong>8. 修改方案与默认值</strong> — 保存方案 A/B 和新建节点的默认连接地址。</summary>
+
+- **作用：** 保存方案 A/B 和新建节点的默认连接地址。
+- **什么时候用：** 需要执行“修改方案与默认值”而不是只查看状态时。
+- **操作步骤：** 选择方案A（偏直连）或B（网站TLS网关），输入默认连接域名/IP；确认保存。此操作不会重写已有节点参数。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 不自动改动已有节点、证书或网站；会修改配置或服务；无需求时可直接取消。
+- **菜单路径：** 主菜单 → 1. 部署与安装模式 → 8. 修改方案与默认值
+
+</details>
+
+<details class="menu-item">
+<summary><strong>9. 配置文件与目录</strong> — 显示配置与资料保存位置。</summary>
+
+- **作用：** 显示配置与资料保存位置。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 直接查看程序、配置、证书、网站、日志和备份目录；遇到错误时根据目录定位文件，但不要把包含私钥的文件贴到公开渠道。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只显示路径；不要公开包含密钥的目录；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit paths`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 1. 部署与安装模式 → 9. 配置文件与目录
+
+</details>
+
+<details class="menu-item">
+<summary><strong>0. 返回上一级</strong> — 不修改配置。</summary>
+
+- **作用：** 不修改配置。
+- **什么时候用：** 看完当前菜单或想取消本次未提交输入时。
+- **操作步骤：** 输入0返回上一层；不保存当前尚未确认的输入。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 已提交的配置保留；返回上一级；已保存的设置不回退。
+- **菜单路径：** 主菜单 → 1. 部署与安装模式 → 0. 返回上一级
+
+</details>
+
+</details>
+
+<details class="menu-group">
+<summary><strong>installcomponents</strong>：4 个功能（逐项展开查看操作方法）</summary>
+
+> **所在目录：** 1. 部署与安装模式 → 5. 单独安装或补装组件
+
+<details class="menu-item">
+<summary><strong>1. 安装或复用 Nginx</strong> — 按当前模式选择APT系统包或独立程序。</summary>
+
+- **作用：** 按当前模式选择APT系统包或独立程序。
+- **什么时候用：** 需要执行“安装或复用 Nginx”而不是只查看状态时。
+- **操作步骤：** 先查看当前模式；共享模式优先复用APT系统Nginx，独立模式使用私有二进制。核对服务和80/443端口后再确认安装或补装。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 共享模式不覆盖系统主配置；会修改配置或服务；无需求时可直接取消。
+- **菜单路径：** 主菜单 → 1. 部署与安装模式 → 5. 单独安装或补装组件 → 1. 安装或复用 Nginx
+
+</details>
+
+<details class="menu-item">
+<summary><strong>2. 单独安装 Xray</strong> — 补装代理组件，不覆盖已保存节点。</summary>
+
+- **作用：** 补装代理组件，不覆盖已保存节点。
+- **什么时候用：** 需要执行“单独安装 Xray”而不是只查看状态时。
+- **操作步骤：** 检查当前核心是否存在；未安装时由向导获取核心。安装结束后核对版本与服务；不会自动覆盖已保存UUID。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 需 GitHub 可达；已安装时不重复安装；会修改配置或服务；无需求时可直接取消。
+- **菜单路径：** 主菜单 → 1. 部署与安装模式 → 5. 单独安装或补装组件 → 2. 单独安装 Xray
+
+</details>
+
+<details class="menu-item">
+<summary><strong>3. 安装或复用 ACME</strong> — 按当前模式安装程序，账户资料保持私有。</summary>
+
+- **作用：** 按当前模式安装程序，账户资料保持私有。
+- **什么时候用：** 需要执行“安装或复用 ACME”而不是只查看状态时。
+- **操作步骤：** 先核对已安装程序和账户归属，再确认安装或复用；为网站签发证书需另到“ACME与SSL证书”设置验证方式。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 不重复创建续期任务；会修改配置或服务；无需求时可直接取消。
+- **菜单路径：** 主菜单 → 1. 部署与安装模式 → 5. 单独安装或补装组件 → 3. 安装或复用 ACME
+
+</details>
+
+<details class="menu-item">
+<summary><strong>0. 返回上一级</strong> — 不修改配置。</summary>
+
+- **作用：** 不修改配置。
+- **什么时候用：** 看完当前菜单或想取消本次未提交输入时。
+- **操作步骤：** 输入0返回上一层；不保存当前尚未确认的输入。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 已提交的配置保留；返回上一级；已保存的设置不回退。
+- **菜单路径：** 主菜单 → 1. 部署与安装模式 → 5. 单独安装或补装组件 → 0. 返回上一级
+
+</details>
+
+</details>
+
+<details class="menu-group">
+<summary><strong>providers</strong>：9 个功能（逐项展开查看操作方法）</summary>
+
+> **所在目录：** 1. 部署与安装模式 → 6. 模式、归属与外部程序复用
+
+<details class="menu-item">
+<summary><strong>1. 安装模式与组件归属</strong> — 查看路径、来源和托管范围。</summary>
+
+- **作用：** 查看路径、来源和托管范围。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 查看每个组件的来源、服务名、程序路径及托管文件范围；尤其在迁移、共享卸载之前先确认是否属于外部程序。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只读；不把外部组件冒认为本工具安装；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit components show`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 1. 部署与安装模式 → 6. 模式、归属与外部程序复用 → 1. 安装模式与组件归属
+
+</details>
+
+<details class="menu-item">
+<summary><strong>2. 选择共享模式（空部署）</strong> — 空部署使用APT Nginx及共享ACME程序。</summary>
+
+- **作用：** 空部署使用APT Nginx及共享ACME程序。
+- **什么时候用：** 需要执行“选择共享模式（空部署）”而不是只查看状态时。
+- **操作步骤：** 仅空部署可选择：设置安装模式为shared，再通过安装向导部署；已有节点或网站不能用它直接切模式。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 已有节点或网站需走迁移，不能直接改标签；会修改配置或服务；无需求时可直接取消。
+- **命令示例：** `sudo vpskit mode select shared`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 1. 部署与安装模式 → 6. 模式、归属与外部程序复用 → 2. 选择共享模式（空部署）
+
+</details>
+
+<details class="menu-item">
+<summary><strong>3. 选择独立模式（空部署）</strong> — 沿用私有目录及服务。</summary>
+
+- **作用：** 沿用私有目录及服务。
+- **什么时候用：** 需要执行“选择独立模式（空部署）”而不是只查看状态时。
+- **操作步骤：** 仅空部署可选择：设置安装模式为isolated，再继续安装向导；已有部署应走迁移。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 不接管外部Nginx；会修改配置或服务；无需求时可直接取消。
+- **命令示例：** `sudo vpskit mode select isolated`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 1. 部署与安装模式 → 6. 模式、归属与外部程序复用 → 3. 选择独立模式（空部署）
+
+</details>
+
+<details class="menu-item">
+<summary><strong>4. 显式复用外部 acme.sh</strong> — 只登记可执行程序，项目账户仍独立。</summary>
+
+- **作用：** 只登记可执行程序，项目账户仍独立。
+- **什么时候用：** 需要执行“显式复用外部 acme.sh”而不是只查看状态时。
+- **操作步骤：** 核对外部acme.sh程序来源与可执行文件绝对路径，再在向导中确认复用；项目证书账户和DNS凭据仍分开保存。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 必须提供可信的已安装绝对路径；修改前建议查看配置计划；可能影响运行中的连接。
+- **菜单路径：** 主菜单 → 1. 部署与安装模式 → 6. 模式、归属与外部程序复用 → 4. 显式复用外部 acme.sh
+
+</details>
+
+<details class="menu-item">
+<summary><strong>5. 修复中断的APT启动抑制</strong> — 只处理本工具有归属的policy-rc.d。</summary>
+
+- **作用：** 只处理本工具有归属的policy-rc.d。
+- **什么时候用：** 需要执行“修复中断的APT启动抑制”而不是只查看状态时。
+- **操作步骤：** 系统包安装中断、留下本工具的启动抑制标记时使用；先读取归属，再由脚本只修复自己创建的文件。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 需要检查文件归属，不覆盖外部策略；修改前建议查看配置计划；可能影响运行中的连接。
+- **菜单路径：** 主菜单 → 1. 部署与安装模式 → 6. 模式、归属与外部程序复用 → 5. 修复中断的APT启动抑制
+
+</details>
+
+<details class="menu-item">
+<summary><strong>6. 查询Xray最新正式版本</strong> — 仅查询官方GitHub Release信息。</summary>
+
+- **作用：** 仅查询官方GitHub Release信息。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 联网查询Xray官方正式版本，只阅读版本及发布时间；若决定升级，返回“组件更新”显式执行。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 需联网；不下载、不升级、不重启；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit components latest-xray`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 1. 部署与安装模式 → 6. 模式、归属与外部程序复用 → 6. 查询Xray最新正式版本
+
+</details>
+
+<details class="menu-item">
+<summary><strong>7. 迁移安装模式</strong> — 进入下级功能菜单，包含：预览迁移到共享模式、执行迁移到共享模式、预览迁移到独立模式、执行迁移到独立模式、未完</summary>
+
+- **作用：** 进入下级功能菜单，包含：预览迁移到共享模式、执行迁移到共享模式、预览迁移到独立模式、执行迁移到独立模式、未完成事务状态等。
+- **什么时候用：** 需要集中管理“迁移安装模式”相关操作时。
+- **操作步骤：** 在此项按序号进入下级菜单，先查看状态和用途，再选择具体操作；不需要输入长文本名称。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 查看当前状态后按序号选择；仅进入下级菜单；不会立刻修改系统。
+- **菜单路径：** 主菜单 → 1. 部署与安装模式 → 6. 模式、归属与外部程序复用 → 7. 迁移安装模式
+
+</details>
+
+<details class="menu-item">
+<summary><strong>0. 返回上一级</strong> — 不修改配置。</summary>
+
+- **作用：** 不修改配置。
+- **什么时候用：** 看完当前菜单或想取消本次未提交输入时。
+- **操作步骤：** 输入0返回上一层；不保存当前尚未确认的输入。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 已提交的配置保留；返回上一级；已保存的设置不回退。
+- **菜单路径：** 主菜单 → 1. 部署与安装模式 → 6. 模式、归属与外部程序复用 → 0. 返回上一级
+
+</details>
+
+<details class="menu-item">
+<summary><strong>10. 清理残留后全新安装</strong> — 编号选择安装模式；先独立备份并强清项目，再安装。</summary>
+
+- **作用：** 编号选择安装模式；先独立备份并强清项目，再安装。
+- **什么时候用：** 确认不保留原项目配置、准备从干净状态重装时。
+- **操作步骤：** 选择shared/isolated，先备份并执行强力清理旧项目，核对成功后再新装；旧UUID/密码不自动继承。
+- **操作结果：** 可能停止节点或删除项目资料；部分系统程序移除不能靠配置快照自动撤销。
+- **要求与风险：** 旧节点/UUID会删除；共享程序默认保留；失败不假报成功；高风险：确认备份、外部依赖和停机影响后执行。
+- **命令示例：** `sudo bash ./vpskit.sh install shared --clean`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 1. 部署与安装模式 → 6. 模式、归属与外部程序复用 → 10. 清理残留后全新安装
+
+</details>
+
+</details>
+
+<details class="menu-group">
+<summary><strong>migration</strong>：7 个功能（逐项展开查看操作方法）</summary>
+
+> **所在目录：** 1. 部署与安装模式 → 7. 模式迁移
+
+<details class="menu-item">
+<summary><strong>1. 预览迁移到共享模式</strong> — 显示影响和执行次序。</summary>
+
+- **作用：** 显示影响和执行次序。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 已有独立模式先运行只读迁移预览，核对外部网站、证书、端口和服务切换影响；暂不执行迁移。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只读，不重启服务；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit mode migrate shared --plan`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 1. 部署与安装模式 → 7. 模式迁移 → 1. 预览迁移到共享模式
+
+</details>
+
+<details class="menu-item">
+<summary><strong>2. 执行迁移到共享模式</strong> — 保留Xray及网站资料，切换Nginx服务。</summary>
+
+- **作用：** 保留Xray及网站资料，切换Nginx服务。
+- **什么时候用：** 已有独立部署准备迁到系统共享Nginx时。
+- **操作步骤：** 完成备份和计划检查，在维护窗口确认从独立Nginx切换到系统共享Nginx；验证网站及WS/XHTTP，再决定清理旧文件。
+- **操作结果：** 会切换Nginx运行模式，网站和经Nginx转发的代理连接可能短暂中断。
+- **要求与风险：** 先备份；短暂断连；APT安装不能靠快照降级；修改前建议查看配置计划；可能影响运行中的连接。
+- **命令示例：** `sudo vpskit mode migrate shared --apply`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 1. 部署与安装模式 → 7. 模式迁移 → 2. 执行迁移到共享模式
+
+</details>
+
+<details class="menu-item">
+<summary><strong>3. 预览迁移到独立模式</strong> — 显示独立服务切换要求。</summary>
+
+- **作用：** 显示独立服务切换要求。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 已有共享模式先运行只读预览，检查系统Nginx是否还承载其他网站；有外部站点时不要停止共享服务。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只读；共享Nginx存在其他站点则不能切走；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit mode migrate isolated --plan`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 1. 部署与安装模式 → 7. 模式迁移 → 3. 预览迁移到独立模式
+
+</details>
+
+<details class="menu-item">
+<summary><strong>4. 执行迁移到独立模式</strong> — 安装私有组件并切换服务。</summary>
+
+- **作用：** 安装私有组件并切换服务。
+- **什么时候用：** 当前共享部署准备迁为独立服务且无外部网站依赖时。
+- **操作步骤：** 先备份并核对不存在其他共享网站，再在维护窗口切换到私有Nginx；验证原站点与节点，失败时走本次迁移恢复。
+- **操作结果：** 会切换Nginx运行模式，网站和经Nginx转发的代理连接可能短暂中断。
+- **要求与风险：** 其他共享站点存在时拒绝；保留旧程序备份；修改前建议查看配置计划；可能影响运行中的连接。
+- **命令示例：** `sudo vpskit mode migrate isolated --apply`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 1. 部署与安装模式 → 7. 模式迁移 → 4. 执行迁移到独立模式
+
+</details>
+
+<details class="menu-item">
+<summary><strong>5. 未完成事务状态</strong> — 查看阶段、受影响文件及外部编辑冲突。</summary>
+
+- **作用：** 查看阶段、受影响文件及外部编辑冲突。
+- **什么时候用：** 保存配置失败或存在中断的事务时。
+- **操作步骤：** 只读检查当前是否存在未完成事务、文件变化或恢复冲突；存在异常时先查原因，不应继续覆盖配置。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只读；不自动覆盖冲突；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit recovery status`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 1. 部署与安装模式 → 7. 模式迁移 → 5. 未完成事务状态
+
+</details>
+
+<details class="menu-item">
+<summary><strong>6. 修复未完成事务</strong> — 按本次事务记录恢复。</summary>
+
+- **作用：** 按本次事务记录恢复。
+- **什么时候用：** 需要执行“修复未完成事务”而不是只查看状态时。
+- **操作步骤：** 仅在检测到未完成事务时运行；脚本按已保存事务尝试恢复，遇到第三方改动会停止并保留资料。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 不重置防火墙；冲突时保留现场；修改前建议查看配置计划；可能影响运行中的连接。
+- **命令示例：** `sudo vpskit recovery repair`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 1. 部署与安装模式 → 7. 模式迁移 → 6. 修复未完成事务
+
+</details>
+
+<details class="menu-item">
+<summary><strong>0. 返回上一级</strong> — 不修改配置。</summary>
+
+- **作用：** 不修改配置。
+- **什么时候用：** 看完当前菜单或想取消本次未提交输入时。
+- **操作步骤：** 输入0返回上一层；不保存当前尚未确认的输入。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 已提交的配置保留；返回上一级；已保存的设置不回退。
+- **菜单路径：** 主菜单 → 1. 部署与安装模式 → 7. 模式迁移 → 0. 返回上一级
+
+</details>
+
+</details>
+
+</details>
+
+<details id="nodes">
+<summary><strong>2. 代理节点与用户</strong> — 创建 · 共享用户 · 编号 · 导出</summary>
+
+### 先理解四种不同的管理范围
+
+- **新增节点（菜单 2）**：创建向导，可再选择常用或扩展协议。适合新建一个代理入口。
+- **扩展协议节点（菜单 3）**：直接进入 Hysteria2、MASQUE、VLESS Encryption 等扩展向导，是快捷入口。
+- **传统节点管理（菜单 4）**：只管理传统 `.nodes` 记录，可调整端口、UUID、地址、启停与导出。
+- **扩展原生节点管理（菜单 5）**：只管理 `.native_nodes`，支持当前实现的创建、启停、改名、删除、导出及 JSON 导入；不等价于传统节点所有编辑项。
+- **统一编号批量启停（菜单 6）**：先看 `node overview` 中的统一编号；传统和原生编号集合与此不同，不可混用。
+- **添加共享入口用户（菜单 7）**：选择已存在的传统节点，复用同一入口的端口/传输/域名/路径，创建不同的 UUID 或密码；当前传统 Shadowsocks 不支持此操作。
+
+### 创建一个 VLESS + WebSocket 节点（你的 `safe_03` 场景）
+
+1. 如果没有对应的网站证书，先去 **3. 网站与反向代理**添加网站，再去 **4. ACME**签发证书。
+2. 进入“2 → 2. 新增节点”，选择“常用 → VLESS → WebSocket”。
+3. 节点名称可填 `safe_03`；从编号列表选择已签发证书的网站；代理路径可使用安全随机默认值。
+4. 凭据选择“自动生成”（默认），或者“手动输入 UUID”；输入不会回显，格式不对会要求重试。
+5. 确认生成，查看导出的客户端连接参数；核对 Host/SNI、路径、协议和 TLS，导入客户端测试。
+
+### 新增共享用户，不要重复创建相同端口
+
+进入“2 → 7”，选择现有传统入口，例如 `safe_03`，设置新用户名称及独立凭据。新用户与源节点共享监听入口，但可独立修改凭据/停用其用户记录；Xray 实例中的实际配置变化仍可能影响其他连接。
+
+### 常用协议参考
+
+| 类型 | 典型特点 | 主要限制 |
+|---|---|---|
+| VLESS + REALITY | 直连开销较低、一般延迟较小 | 目标/SNI要求；通常不走普通 CDN |
+| VLESS + XHTTP | 适合 HTTPS 网关/反代/CDN 场景 | 多一层转发，客户端/服务端须兼容 |
+| VLESS + WS + TLS | 老客户端兼容面广 | Xray 已提示旧 WS 模式弃用 |
+| Hysteria2 | 某些丢包/高延迟链路表现较好 | UDP 可达与客户端支持很重要 |
+| MASQUE H2/H3 | HTTP/2 / HTTP/3 协议体系 | H3 需要 UDP；实现与客户端有兼容门槛 |
+
+不存在对所有线路“最快”或“最隐蔽”的保证。新协议需用**实际安装的 Xray**校验并使用对应客户端实测。
 
 ```bash
-sudo vpskit node migrate-xhttp       # 交互选择旧节点并新建XHTTP节点
-sudo vpskit node xhttp-version       # 切换H2/H3，随后重新导入客户端
-sudo vpskit node xhttp-json          # 终端输出完整客户端JSON，含UUID
+sudo vpskit node overview            # 统一编号
+sudo vpskit node add                 # 常用或扩展向导
+sudo vpskit node native-add          # 直接扩展向导
+sudo vpskit node share               # 复用传统入口创建独立用户
+sudo vpskit node batch-all enable 1,3
+sudo vpskit node batch-all disable 2
+sudo vpskit node export              # 导出含密钥，注意隐私
+sudo vpskit node native list
+sudo vpskit node protocols
 ```
 
-JSON 使用本地 SOCKS `127.0.0.1:10808`，仅供客户端使用，不要覆盖 VPS 的服务端配置。客户端保留 TLS 证书校验。H2 支持自定义 IPv4/IPv6 连接地址，SNI/Host仍使用证书域名；若已开启仅 Cloudflare 回源或强制 AOP，源站直连会被拒绝。
+> **特别注意**：创建、启停、端口或凭据变更可能需要重启整个 Xray 服务。节点“显示名称”和“客户端连接地址”的纯管理变更通常可跳过重启；先看应用计划。
 
-Nginx 对 XHTTP 使用独立前缀 location，关闭请求/响应缓冲和缓存；网站爬虫、请求、并发与下载限额不套用到该代理路径，原有回源网段限制及 AOP仍生效。为减少旧系统依赖，H2/H3导出均固定 `packet-up`，不自动启用 stream-up、额外 mux 或试验性 VLESS Encryption/Seed。外层 HTTPS仍启用；不保证更快、完全无法识别或无限并发。
 
-Nginx 1.25.1+ 使用 `http2 on`，旧版本使用 `listen ... http2`。缺少 http_v2 模块时会停止新配置操作并提示先更新Nginx；Xray仍沿用本脚本已测试的 v26.3.27，不为消除警告盲目升级 latest。每次配置应用先验证Xray和Nginx；迁移失败回滚，成功应用仍可能短暂重启Xray。
+## 传统节点与扩展节点：创建、使用和替换完整示例
 
-**Cloudflare 签发诊断：** 输入 Token 时提示 `Zone/DNS/Edit` 与 `Zone/Zone/Read`，Account ID必须为32位十六进制。签发前只读查询所属区域，区分API连不上、查询被拒、查不到区域；失败可重新输入。查到Zone ID后明确传给acme.sh，避免旧区域ID干扰。该预检不写DNS，也不能证明DNS编辑权限正常；实际写TXT仍由ACME验证。DNS-01错误不再误提示开放80或关闭橙云。
+**关键结论：**“创建扩展协议节点”是另建一个新代理入口；“扩展原生节点管理”只管理这些新入口。它不会升级或替换旧节点。传统节点保存在 `nodes`，扩展原生节点保存在 `native_nodes`；生成 Xray 配置时会把**已启用**的两类入站合并，同一个 Xray 服务实例负责运行。
 
-**验证范围：** 使用真实 Xray v26.3.27、Nginx 1.24 和 Ubuntu 18.04 对应的 Nginx 1.14，在本机验证 XHTTP H2 的 IPv4/IPv6 下载及超过1MB上传；检查网站爬虫与限额不会误伤代理。检查H3客户端配置可被Xray接受；真实Cloudflare H3链路、权威DNS签发与公网吞吐需在目标VPS及客户端验收。本地测试不能替代这些外部条件。
+<details>
+<summary><strong>示例A：已有3个传统节点，新增一个Hysteria2，原节点还能用吗？</strong></summary>
 
-参考：[XHTTP 官方说明](https://github.com/XTLS/Xray-core/discussions/4113)、[Cloudflare HTTP/3](https://developers.cloudflare.com/speed/optimization/protocol/http3/)、[Nginx HTTP/2模块](https://nginx.org/en/docs/http/ngx_http_v2_module.html)。
+假设原来是：`safe_01`（REALITY）、`safe_02`（XHTTP）、`safe_03`（WebSocket）。打开 **主菜单 2 → 3. 创建扩展协议节点**，选择 Hysteria2、自动推荐端口、有效TLS证书以及随机或手动密码，核心检查通过后保存为 `fast_01`。现在是 **传统3个＋扩展1个**，不是把3个旧节点转换成4个新协议。
+
+原来的客户端继续保留原UUID、域名、端口与传输。只有主动停用、删除、轮换凭据或修改入口参数时才需要更改旧客户端。新增/启用扩展节点时，Xray的配置应用可能使所有节点连接短暂中断，成功重连后旧配置仍可以使用。
+
+```bash
+sudo vpskit node overview      # 统一显示传统3+扩展1
+sudo vpskit node native list   # 只显示扩展原生节点
+sudo vpskit node list          # 查看传统节点，勿混用序号
+```
+
+</details>
+
+<details>
+<summary><strong>示例B：如何在电脑或手机上使用一个扩展协议节点？</strong></summary>
+
+1. 创建时确保服务器安装的 **Xray核心支持选定协议**，域名解析正确，TLS证书有效；Hysteria2/MASQUE H3还需要公网UDP端口可达。
+2. 使用 **主菜单 2 → 5. 扩展原生节点管理 → 7. 导出客户端JSON**，或命令 `sudo vpskit node native export 1`（`1` 是**扩展节点列表内**的编号）。
+3. 导出的是 **Xray客户端完整JSON**，包含一个本机SOCKS入站（默认 `127.0.0.1:10808`）和一个远端出站。将其安全保存并用于支持此协议的Xray客户端；不能把它当成所有图形客户端都支持的通用导入链接。
+4. 在客户端核对远端地址/端口、TLS SNI、传输方式和认证信息，连接后测试网页/实际业务。导出配置含凭据，请不要公开上传。
+5. 如果节点来自“导入原生入站JSON”，而不是向导自动创建，可能**没有客户端模板**；这时需要按对应协议自行编写客户端出站配置。
+
+```bash
+sudo vpskit node native list
+sudo vpskit node native export 1
+sudo vpskit ports show
+sudo vpskit firewall status
+```
+
+**重要区别：** `sudo vpskit node export 1` 导出的是**传统节点编号 1**，`sudo vpskit node native export 1` 导出的是**扩展节点编号 1**，不是同一条记录。
+
+</details>
+
+<details>
+<summary><strong>示例C：扩展节点连不上、要停用或删除怎么办？</strong></summary>
+
+依次检查本机进程、TCP/UDP监听、系统/云防火墙、证书与客户端核心兼容性。Hysteria2和MASQUE H3主要依赖UDP，不能用“TCP能通”证明它们可用。需要暂停时先停用，保留凭据；确认长期不用再删除。
+
+```bash
+sudo vpskit node native list
+sudo vpskit node native disable 1    # 可恢复，不直接删除资料
+sudo vpskit node native enable 1     # 恢复启用
+sudo vpskit node native delete 1     # 先备份再删
+```
+
+**不要为了测试新协议先删除旧节点。** 建议保留旧连接作为回退方案，测试新节点成功后再决定是否停用旧节点。
+
+</details>
+
+<details>
+<summary><strong>示例D：什么时候用“添加共享入口用户”，而不是新增节点？</strong></summary>
+
+已有一个VLESS/Trojan等支持共享的**传统**入口，需要给同事、设备或其他客户端分配独立凭据，而不希望再开放新端口时，选择 **主菜单 2 → 7. 添加共享入口用户**。选择已有节点、输入新用户名，默认自动生成UUID/密码，也能在创建时手动指定。多个用户共享同一监听端口、域名、代理路径和传输设置，但使用不同凭据。
+
+共享用户并非独立的Xray进程；更改公共端口或服务重启仍可能影响所有共享用户。**传统Shadowsocks当前不支持该共享入口用户向导。**
+
+```bash
+sudo vpskit node share
+```
+
+</details>
+
+<details>
+<summary><strong>示例E：传统与扩展节点如何统一编号批量启停？</strong></summary>
+
+先运行 `sudo vpskit node overview`，读取其**统一编号**。然后进入 **主菜单 2 → 6. 统一编号批量启停** 或使用 `node batch-all`。不要把“传统节点列表编号”或“扩展节点列表编号”带到这个操作中。
+
+```bash
+sudo vpskit node overview
+sudo vpskit node batch-all disable 2,4
+sudo vpskit node batch-all enable 2,4
+```
+
+多个变化会合并提交，但一次Xray运行配置更新仍可能短暂影响其他活跃连接。
+
+</details>
+
+### 此模块的完整菜单索引
+
+<details class="menu-group">
+<summary><strong>nodes</strong>：12 个功能（逐项展开查看操作方法）</summary>
+
+> **所在目录：** 2. 代理节点与用户
+
+<details class="menu-item">
+<summary><strong>1. 全部节点总览</strong> — 传统和扩展节点统一编号，分TCP/UDP查看监听。</summary>
+
+- **作用：** 传统和扩展节点统一编号，分TCP/UDP查看监听。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 读取传统及扩展节点的统一编号、协议、端口和启用状态；要批量启停时使用此表的统一编号，不能拿单独列表编号代替。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 本机监听不等于公网/客户端连通；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit node overview`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 2. 代理节点与用户 → 1. 全部节点总览
+
+</details>
+
+<details class="menu-item">
+<summary><strong>2. 新增节点</strong> — 添加 REALITY、XHTTP、WS、TLS 或 Shadowsocks。</summary>
+
+- **作用：** 添加 REALITY、XHTTP、WS、TLS 或 Shadowsocks。
+- **什么时候用：** 想创建一个新的独立代理入口时。
+- **操作步骤：** 按序号选择常用或扩展入口。常用节点再选协议/传输，选择或自动推荐端口，必要时先选网站证书；UUID/密码可以默认随机生成或创建时手输，确认后导出客户端配置。
+- **操作结果：** 可能改变Xray运行配置；通常同一实例中的其他连接也可能受服务生命周期动作影响。
+- **要求与风险：** Xray 已安装；所选传输需满足域名/证书条件；会修改配置或服务；无需求时可直接取消。
+- **命令示例：** `sudo vpskit node add`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 2. 代理节点与用户 → 2. 新增节点
+
+</details>
+
+<details class="menu-item">
+<summary><strong>3. 创建扩展协议节点</strong> — VLESS Encryption、Hysteria2、MASQUE等。</summary>
+
+- **作用：** VLESS Encryption、Hysteria2、MASQUE等。
+- **什么时候用：** 需要测试新协议而保留旧节点时。
+- **操作步骤：** 按序号选择Hysteria2、MASQUE、VLESS Encryption、gRPC等扩展协议；确认新核心、证书、TCP/UDP端口及客户端支持，输入或随机生成凭据，核心测试通过后保存。
+- **操作结果：** 可能改变Xray运行配置；通常同一实例中的其他连接也可能受服务生命周期动作影响。
+- **要求与风险：** 编号选择；实际核心测试通过才保存；会修改配置或服务；无需求时可直接取消。
+- **命令示例：** `sudo vpskit node native-add`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 2. 代理节点与用户 → 3. 创建扩展协议节点
+
+</details>
+
+<details class="menu-item">
+<summary><strong>4. 传统节点管理</strong> — 进入下级功能菜单，包含：查看节点列表、启用节点、停用节点、删除节点、批量启停节点等。</summary>
+
+- **作用：** 进入下级功能菜单，包含：查看节点列表、启用节点、停用节点、删除节点、批量启停节点等。
+- **什么时候用：** 需要集中管理“传统节点管理”相关操作时。
+- **操作步骤：** 在此项按序号进入下级菜单，先查看状态和用途，再选择具体操作；不需要输入长文本名称。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 查看当前状态后按序号选择；仅进入下级菜单；不会立刻修改系统。
+- **菜单路径：** 主菜单 → 2. 代理节点与用户 → 4. 传统节点管理
+
+</details>
+
+<details class="menu-item">
+<summary><strong>5. 扩展原生节点管理</strong> — 进入下级功能菜单，包含：协议目录与核心版本、创建扩展协议节点、查看原生节点、启用原生节点、停用原生节点等。</summary>
+
+- **作用：** 进入下级功能菜单，包含：协议目录与核心版本、创建扩展协议节点、查看原生节点、启用原生节点、停用原生节点等。
+- **什么时候用：** 需要集中管理“扩展原生节点管理”相关操作时。
+- **操作步骤：** 在此项按序号进入下级菜单，先查看状态和用途，再选择具体操作；不需要输入长文本名称。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 查看当前状态后按序号选择；仅进入下级菜单；不会立刻修改系统。
+- **菜单路径：** 主菜单 → 2. 代理节点与用户 → 5. 扩展原生节点管理
+
+</details>
+
+<details class="menu-item">
+<summary><strong>6. 统一编号批量启停</strong> — 传统/原生节点合并一次提交。</summary>
+
+- **作用：** 传统/原生节点合并一次提交。
+- **什么时候用：** 要在传统与扩展节点间批量启停时。
+- **操作步骤：** 先查看“全部节点总览”的统一编号，按提示选择多个传统或原生节点及启/停操作；预览后合并一次提交，运行配置变化可能影响同一Xray实例。
+- **操作结果：** 可能改变Xray运行配置；通常同一实例中的其他连接也可能受服务生命周期动作影响。
+- **要求与风险：** 运行配置变更至多一次Xray生命周期动作；修改前建议查看配置计划；可能影响运行中的连接。
+- **命令示例：** `sudo vpskit node batch-all disable 1,3`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 2. 代理节点与用户 → 6. 统一编号批量启停
+
+</details>
+
+<details class="menu-item">
+<summary><strong>7. 添加共享入口用户</strong> — 复用同一监听端口，生成独立用户凭据。</summary>
+
+- **作用：** 复用同一监听端口，生成独立用户凭据。
+- **什么时候用：** 多设备或多用户需要独立凭据、又希望共用监听端口时。
+- **操作步骤：** 从已有支持共享的传统入口按序号选择节点，再为新用户设置名称和独立UUID/密码；端口、传输、域名和路径复用，无需新增公网监听。
+- **操作结果：** 可能改变Xray运行配置；通常同一实例中的其他连接也可能受服务生命周期动作影响。
+- **要求与风险：** 已有支持共享的入口；不新增公网端口；会修改配置或服务；无需求时可直接取消。
+- **命令示例：** `sudo vpskit node share`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 2. 代理节点与用户 → 7. 添加共享入口用户
+
+</details>
+
+<details class="menu-item">
+<summary><strong>8. 节点导出</strong> — 进入下级功能菜单，包含：导出分享链接、导出 XHTTP 客户端 JSON、导出客户端JSON。</summary>
+
+- **作用：** 进入下级功能菜单，包含：导出分享链接、导出 XHTTP 客户端 JSON、导出客户端JSON。
+- **什么时候用：** 需要集中管理“节点导出”相关操作时。
+- **操作步骤：** 在此项按序号进入下级菜单，先查看状态和用途，再选择具体操作；不需要输入长文本名称。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 查看当前状态后按序号选择；仅进入下级菜单；不会立刻修改系统。
+- **菜单路径：** 主菜单 → 2. 代理节点与用户 → 8. 节点导出
+
+</details>
+
+<details class="menu-item">
+<summary><strong>9. 协议目录与核心版本</strong> — 列出协议、传输和使用要求。</summary>
+
+- **作用：** 列出协议、传输和使用要求。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 只读查看当前脚本可用协议、客户端/核心版本门槛及特殊网络要求；不要把“可生成模板”视为已验证实际互通。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只读；目录不等于端到端已验证；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit node protocols`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 2. 代理节点与用户 → 9. 协议目录与核心版本
+
+</details>
+
+<details class="menu-item">
+<summary><strong>10. 同步当前所需端口</strong> — 预览后开放网站及启用节点需要的公网端口。</summary>
+
+- **作用：** 预览后开放网站及启用节点需要的公网端口。
+- **什么时候用：** 需要执行“同步当前所需端口”而不是只查看状态时。
+- **操作步骤：** 脚本列出已启用节点及网站的公网TCP/UDP端口；选择本机防火墙后核对并明确确认新增规则。云厂商安全组需另行检查。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 不会开放本机后端端口；不会自动关闭旧端口；会修改配置或服务；无需求时可直接取消。
+- **命令示例：** `sudo vpskit firewall sync`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 2. 代理节点与用户 → 10. 同步当前所需端口
+
+</details>
+
+<details class="menu-item">
+<summary><strong>11. 候选配置检查</strong> — 生成并校验完整候选配置，不发布。</summary>
+
+- **作用：** 生成并校验完整候选配置，不发布。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 生成候选Xray与Nginx配置并执行语法/核心检查，但不发布配置；报错先修复，不要反复强制应用。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 共享模式递归检查静态include；无需重启；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit config check`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 2. 代理节点与用户 → 11. 候选配置检查
+
+</details>
+
+<details class="menu-item">
+<summary><strong>0. 返回上一级</strong> — 不修改配置。</summary>
+
+- **作用：** 不修改配置。
+- **什么时候用：** 看完当前菜单或想取消本次未提交输入时。
+- **操作步骤：** 输入0返回上一层；不保存当前尚未确认的输入。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 已提交的配置保留；返回上一级；已保存的设置不回退。
+- **菜单路径：** 主菜单 → 2. 代理节点与用户 → 0. 返回上一级
+
+</details>
+
+</details>
+
+<details class="menu-group">
+<summary><strong>legacy</strong>：9 个功能（逐项展开查看操作方法）</summary>
+
+> **所在目录：** 2. 代理节点与用户 → 4. 传统节点管理
+
+<details class="menu-item">
+<summary><strong>1. 查看节点列表</strong> — 显示序号、名称、协议、入口和启用状态。</summary>
+
+- **作用：** 显示序号、名称、协议、入口和启用状态。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 显示传统节点的独立序号、名称、协议、端口、状态；要启停或编辑时使用该列表的编号。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只读；不显示访问凭据；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit node list`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 2. 代理节点与用户 → 4. 传统节点管理 → 1. 查看节点列表
+
+</details>
+
+<details class="menu-item">
+<summary><strong>2. 启用节点</strong> — 让保存的节点重新参与运行配置。</summary>
+
+- **作用：** 让保存的节点重新参与运行配置。
+- **什么时候用：** 需要执行“启用节点”而不是只查看状态时。
+- **操作步骤：** 按传统节点列表编号选中目标，确认启用；系统重新生成运行配置并检查监听及防火墙，不会给旧节点自动换UUID。
+- **操作结果：** 可能改变Xray运行配置；通常同一实例中的其他连接也可能受服务生命周期动作影响。
+- **要求与风险：** 需端口可用；客户端与防火墙需匹配；会修改配置或服务；无需求时可直接取消。
+- **命令示例：** `sudo vpskit node enable 1`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 2. 代理节点与用户 → 4. 传统节点管理 → 2. 启用节点
+
+</details>
+
+<details class="menu-item">
+<summary><strong>3. 停用节点</strong> — 保留节点资料，停止该用户的访问。</summary>
+
+- **作用：** 保留节点资料，停止该用户的访问。
+- **什么时候用：** 需要执行“停用节点”而不是只查看状态时。
+- **操作步骤：** 按传统节点编号选择并确认停用，保留保存的节点及UUID，需恢复时仍可再次启用。
+- **操作结果：** 可能改变Xray运行配置；通常同一实例中的其他连接也可能受服务生命周期动作影响。
+- **要求与风险：** 该用户连接可能中断；其他共享用户保留；修改前建议查看配置计划；可能影响运行中的连接。
+- **命令示例：** `sudo vpskit node disable 1`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 2. 代理节点与用户 → 4. 传统节点管理 → 3. 停用节点
+
+</details>
+
+<details class="menu-item">
+<summary><strong>4. 删除节点</strong> — 删除选中用户的节点记录。</summary>
+
+- **作用：** 删除选中用户的节点记录。
+- **什么时候用：** 明确需要“删除节点”且已确认备份和影响时。
+- **操作步骤：** 按传统节点编号确认删除。删除后客户端旧链接无效；重要操作前保存快照，避免误删。
+- **操作结果：** 可能改变Xray运行配置；通常同一实例中的其他连接也可能受服务生命周期动作影响。
+- **要求与风险：** 删除不可直接撤销；可从历史快照恢复；高风险：确认备份、外部依赖和停机影响后执行。
+- **命令示例：** `sudo vpskit node delete 1`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 2. 代理节点与用户 → 4. 传统节点管理 → 4. 删除节点
+
+</details>
+
+<details class="menu-item">
+<summary><strong>5. 批量启停节点</strong> — 按编号多选节点，一次提交并应用。</summary>
+
+- **作用：** 按编号多选节点，一次提交并应用。
+- **什么时候用：** 需要执行“批量启停节点”而不是只查看状态时。
+- **操作步骤：** 使用传统节点列表编号，输入多个目标和启用/停用方向，一次提交。若包含原生节点请改用统一编号批量启停。
+- **操作结果：** 可能改变Xray运行配置；通常同一实例中的其他连接也可能受服务生命周期动作影响。
+- **要求与风险：** 若改变Xray配置会影响本实例连接；0取消；修改前建议查看配置计划；可能影响运行中的连接。
+- **命令示例：** `sudo vpskit node batch`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 2. 代理节点与用户 → 4. 传统节点管理 → 5. 批量启停节点
+
+</details>
+
+<details class="menu-item">
+<summary><strong>6. 编辑传统节点</strong> — 进入下级功能菜单，包含：修改节点名称、修改入口端口、修改连接地址、指定 UUID 或密码、修改监听地址等。</summary>
+
+- **作用：** 进入下级功能菜单，包含：修改节点名称、修改入口端口、修改连接地址、指定 UUID 或密码、修改监听地址等。
+- **什么时候用：** 需要集中管理“编辑传统节点”相关操作时。
+- **操作步骤：** 在此项按序号进入下级菜单，先查看状态和用途，再选择具体操作；不需要输入长文本名称。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 查看当前状态后按序号选择；仅进入下级菜单；不会立刻修改系统。
+- **菜单路径：** 主菜单 → 2. 代理节点与用户 → 4. 传统节点管理 → 6. 编辑传统节点
+
+</details>
+
+<details class="menu-item">
+<summary><strong>7. 添加共享入口用户</strong> — 复用同一监听端口，生成独立用户凭据。</summary>
+
+- **作用：** 复用同一监听端口，生成独立用户凭据。
+- **什么时候用：** 多设备或多用户需要独立凭据、又希望共用监听端口时。
+- **操作步骤：** 从已有支持共享的传统入口按序号选择节点，再为新用户设置名称和独立UUID/密码；端口、传输、域名和路径复用，无需新增公网监听。
+- **操作结果：** 可能改变Xray运行配置；通常同一实例中的其他连接也可能受服务生命周期动作影响。
+- **要求与风险：** 已有支持共享的入口；不新增公网端口；会修改配置或服务；无需求时可直接取消。
+- **命令示例：** `sudo vpskit node share`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 2. 代理节点与用户 → 4. 传统节点管理 → 7. 添加共享入口用户
+
+</details>
+
+<details class="menu-item">
+<summary><strong>8. 导出节点</strong> — 进入下级功能菜单，包含：导出分享链接、导出 XHTTP 客户端 JSON、导出客户端JSON。</summary>
+
+- **作用：** 进入下级功能菜单，包含：导出分享链接、导出 XHTTP 客户端 JSON、导出客户端JSON。
+- **什么时候用：** 需要集中管理“导出节点”相关操作时。
+- **操作步骤：** 在此项按序号进入下级菜单，先查看状态和用途，再选择具体操作；不需要输入长文本名称。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 查看当前状态后按序号选择；仅进入下级菜单；不会立刻修改系统。
+- **菜单路径：** 主菜单 → 2. 代理节点与用户 → 4. 传统节点管理 → 8. 导出节点
+
+</details>
+
+<details class="menu-item">
+<summary><strong>0. 返回上一级</strong> — 不修改配置。</summary>
+
+- **作用：** 不修改配置。
+- **什么时候用：** 看完当前菜单或想取消本次未提交输入时。
+- **操作步骤：** 输入0返回上一层；不保存当前尚未确认的输入。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 已提交的配置保留；返回上一级；已保存的设置不回退。
+- **菜单路径：** 主菜单 → 2. 代理节点与用户 → 4. 传统节点管理 → 0. 返回上一级
+
+</details>
+
+</details>
+
+<details class="menu-group">
+<summary><strong>nodeedit</strong>：7 个功能（逐项展开查看操作方法）</summary>
+
+> **所在目录：** 2. 代理节点与用户 → 4. 传统节点管理 → 6. 编辑传统节点
+
+<details class="menu-item">
+<summary><strong>1. 修改节点名称</strong> — 修改用户显示名称，保留共享入口关系。</summary>
+
+- **作用：** 修改用户显示名称，保留共享入口关系。
+- **什么时候用：** 需要执行“修改节点名称”而不是只查看状态时。
+- **操作步骤：** 选择传统节点后修改显示名称；通常不改变UUID、监听或共享用户关系，名称已占用会拒绝保存。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 名称须唯一；不会轮换访问凭据；会修改配置或服务；无需求时可直接取消。
+- **菜单路径：** 主菜单 → 2. 代理节点与用户 → 4. 传统节点管理 → 6. 编辑传统节点 → 1. 修改节点名称
+
+</details>
+
+<details class="menu-item">
+<summary><strong>2. 修改入口端口</strong> — 同步修改整个共享入口的监听端口。</summary>
+
+- **作用：** 同步修改整个共享入口的监听端口。
+- **什么时候用：** 需要执行“修改入口端口”而不是只查看状态时。
+- **操作步骤：** 选择已有节点，输入或从推荐候选选择新端口；共享入口用户会一起受影响，客户端、防火墙和云安全组需要同步。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 同步客户端、防火墙和安全组；WS/XHTTP 仍走公网443；修改前建议查看配置计划；可能影响运行中的连接。
+- **菜单路径：** 主菜单 → 2. 代理节点与用户 → 4. 传统节点管理 → 6. 编辑传统节点 → 2. 修改入口端口
+
+</details>
+
+<details class="menu-item">
+<summary><strong>3. 修改连接地址</strong> — 修改客户端连接域名、IPv4 或 IPv6。</summary>
+
+- **作用：** 修改客户端连接域名、IPv4 或 IPv6。
+- **什么时候用：** 需要执行“修改连接地址”而不是只查看状态时。
+- **操作步骤：** 选择节点后从保存的地址或新域名/IP中选择；更改的是客户端连接地址，证书SNI、代理路径须另外匹配。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 保留 TLS SNI/Host；同入口用户同步修改；会修改配置或服务；无需求时可直接取消。
+- **菜单路径：** 主菜单 → 2. 代理节点与用户 → 4. 传统节点管理 → 6. 编辑传统节点 → 3. 修改连接地址
+
+</details>
+
+<details class="menu-item">
+<summary><strong>4. 指定 UUID 或密码</strong> — 手动设置凭据，可留空自动生成。</summary>
+
+- **作用：** 手动设置凭据，可留空自动生成。
+- **什么时候用：** 需要执行“指定 UUID 或密码”而不是只查看状态时。
+- **操作步骤：** 选择已有节点，默认“保留原凭据”；需更换时明确选择自动生成或手动输入UUID/密码；旧客户端凭据会失效。
+- **操作结果：** 可能改变Xray运行配置；通常同一实例中的其他连接也可能受服务生命周期动作影响。
+- **要求与风险：** 需符合协议格式；客户端必须同步更新；注意影响范围。
+- **命令示例：** `sudo vpskit node credential 1`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 2. 代理节点与用户 → 4. 传统节点管理 → 6. 编辑传统节点 → 4. 指定 UUID 或密码
+
+</details>
+
+<details class="menu-item">
+<summary><strong>5. 修改监听地址</strong> — 选择 IPv4、IPv6 或双栈监听入口。</summary>
+
+- **作用：** 选择 IPv4、IPv6 或双栈监听入口。
+- **什么时候用：** 需要执行“修改监听地址”而不是只查看状态时。
+- **操作步骤：** 选择节点，按序号选IPv4、IPv6或仅本机监听地址；WS/XHTTP本机后端固定回环，不能直接改成公网。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 仅直连入口；WS/XHTTP 后端保持回环监听；修改前建议查看配置计划；可能影响运行中的连接。
+- **菜单路径：** 主菜单 → 2. 代理节点与用户 → 4. 传统节点管理 → 6. 编辑传统节点 → 5. 修改监听地址
+
+</details>
+
+<details class="menu-item">
+<summary><strong>6. 自动轮换凭据</strong> — 重新生成 UUID 或密码。</summary>
+
+- **作用：** 重新生成 UUID 或密码。
+- **什么时候用：** 需要执行“自动轮换凭据”而不是只查看状态时。
+- **操作步骤：** 选定已有传统节点后确认随机轮换UUID/密码，立即更新对应客户端；不要在无必要时频繁轮换。
+- **操作结果：** 可能改变Xray运行配置；通常同一实例中的其他连接也可能受服务生命周期动作影响。
+- **要求与风险：** 客户端必须更新；现有连接可能中断；修改前建议查看配置计划；可能影响运行中的连接。
+- **命令示例：** `sudo vpskit node rotate 1`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 2. 代理节点与用户 → 4. 传统节点管理 → 6. 编辑传统节点 → 6. 自动轮换凭据
+
+</details>
+
+<details class="menu-item">
+<summary><strong>0. 返回上一级</strong> — 不修改配置。</summary>
+
+- **作用：** 不修改配置。
+- **什么时候用：** 看完当前菜单或想取消本次未提交输入时。
+- **操作步骤：** 输入0返回上一层；不保存当前尚未确认的输入。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 已提交的配置保留；返回上一级；已保存的设置不回退。
+- **菜单路径：** 主菜单 → 2. 代理节点与用户 → 4. 传统节点管理 → 6. 编辑传统节点 → 0. 返回上一级
+
+</details>
+
+</details>
+
+<details class="menu-group">
+<summary><strong>nodeexport</strong>：4 个功能（逐项展开查看操作方法）</summary>
+
+> **所在目录：** 2. 代理节点与用户 → 8. 节点导出
+
+<details class="menu-item">
+<summary><strong>1. 导出分享链接</strong> — 输出可导入客户端的节点 URI。</summary>
+
+- **作用：** 输出可导入客户端的节点 URI。
+- **什么时候用：** 为传统节点导出已有连接链接时。
+- **操作步骤：** 选择传统节点编号输出连接分享链接；复制到支持协议的客户端，并妥善保管其中的UUID/密码。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 链接含访问凭据，禁止公开发布；注意影响范围。
+- **命令示例：** `sudo vpskit node export 1`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 2. 代理节点与用户 → 8. 节点导出 → 1. 导出分享链接
+
+</details>
+
+<details class="menu-item">
+<summary><strong>2. 导出 XHTTP 客户端 JSON</strong> — 生成本地 SOCKS 的 Xray 客户端配置。</summary>
+
+- **作用：** 生成本地 SOCKS 的 Xray 客户端配置。
+- **什么时候用：** 需要执行“导出 XHTTP 客户端 JSON”而不是只查看状态时。
+- **操作步骤：** 选择传统XHTTP节点，导出匹配其域名、路径、传输和凭据的客户端JSON；检查客户端核心是否支持对应XHTTP模式。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 仅 XHTTP 节点；JSON 含 UUID；注意影响范围。
+- **命令示例：** `sudo vpskit node client 1`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 2. 代理节点与用户 → 8. 节点导出 → 2. 导出 XHTTP 客户端 JSON
+
+</details>
+
+<details class="menu-item">
+<summary><strong>3. 导出客户端JSON</strong> — 编号选择并输出客户端配置。</summary>
+
+- **作用：** 编号选择并输出客户端配置。
+- **什么时候用：** 创建扩展节点后要在兼容Xray客户端使用时。
+- **操作步骤：** 选择扩展原生节点编号，输出包含本地SOCKS入口（默认127.0.0.1:10808）和远端出站的Xray客户端JSON；用兼容核心运行或按客户端格式转换。原生导入节点可能没有自动客户端模板。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 包含凭据；只提供给可信客户端；注意影响范围。
+- **命令示例：** `sudo vpskit node native export 1`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 2. 代理节点与用户 → 8. 节点导出 → 3. 导出客户端JSON
+
+</details>
+
+<details class="menu-item">
+<summary><strong>0. 返回上一级</strong> — 不修改配置。</summary>
+
+- **作用：** 不修改配置。
+- **什么时候用：** 看完当前菜单或想取消本次未提交输入时。
+- **操作步骤：** 输入0返回上一层；不保存当前尚未确认的输入。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 已提交的配置保留；返回上一级；已保存的设置不回退。
+- **菜单路径：** 主菜单 → 2. 代理节点与用户 → 8. 节点导出 → 0. 返回上一级
+
+</details>
+
+</details>
+
+<details class="menu-group">
+<summary><strong>native</strong>：10 个功能（逐项展开查看操作方法）</summary>
+
+> **所在目录：** 2. 代理节点与用户 → 5. 扩展原生节点管理
+
+<details class="menu-item">
+<summary><strong>1. 协议目录与核心版本</strong> — 列出协议、传输和使用要求。</summary>
+
+- **作用：** 列出协议、传输和使用要求。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 只读查看当前脚本可用协议、客户端/核心版本门槛及特殊网络要求；不要把“可生成模板”视为已验证实际互通。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只读；目录不等于端到端已验证；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit node protocols`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 2. 代理节点与用户 → 5. 扩展原生节点管理 → 1. 协议目录与核心版本
+
+</details>
+
+<details class="menu-item">
+<summary><strong>2. 创建扩展协议节点</strong> — VLESS Encryption、Hysteria2、MASQUE等。</summary>
+
+- **作用：** VLESS Encryption、Hysteria2、MASQUE等。
+- **什么时候用：** 需要测试新协议而保留旧节点时。
+- **操作步骤：** 按序号选择Hysteria2、MASQUE、VLESS Encryption、gRPC等扩展协议；确认新核心、证书、TCP/UDP端口及客户端支持，输入或随机生成凭据，核心测试通过后保存。
+- **操作结果：** 可能改变Xray运行配置；通常同一实例中的其他连接也可能受服务生命周期动作影响。
+- **要求与风险：** 编号选择；实际核心测试通过才保存；会修改配置或服务；无需求时可直接取消。
+- **命令示例：** `sudo vpskit node native-add`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 2. 代理节点与用户 → 5. 扩展原生节点管理 → 2. 创建扩展协议节点
+
+</details>
+
+<details class="menu-item">
+<summary><strong>3. 查看原生节点</strong> — 列出端口、协议、启用状态。</summary>
+
+- **作用：** 列出端口、协议、启用状态。
+- **什么时候用：** 想看扩展节点和它们自己的编号时。
+- **操作步骤：** 列出扩展原生节点的独立编号、入站协议、端口、TCP/UDP和状态；此编号不等于传统或统一总览编号。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 不打印凭据；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit node native list`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 2. 代理节点与用户 → 5. 扩展原生节点管理 → 3. 查看原生节点
+
+</details>
+
+<details class="menu-item">
+<summary><strong>4. 启用原生节点</strong> — 编号选择后启用。</summary>
+
+- **作用：** 编号选择后启用。
+- **什么时候用：** 需要执行“启用原生节点”而不是只查看状态时。
+- **操作步骤：** 从扩展原生列表选择编号，确认启用保存的入站对象；检查Xray核心、证书、TCP/UDP端口及客户端配置。
+- **操作结果：** 可能改变Xray运行配置；通常同一实例中的其他连接也可能受服务生命周期动作影响。
+- **要求与风险：** Xray运行配置变化会重启本实例；会修改配置或服务；无需求时可直接取消。
+- **命令示例：** `sudo vpskit node native enable 1`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 2. 代理节点与用户 → 5. 扩展原生节点管理 → 4. 启用原生节点
+
+</details>
+
+<details class="menu-item">
+<summary><strong>5. 停用原生节点</strong> — 编号选择后停用。</summary>
+
+- **作用：** 编号选择后停用。
+- **什么时候用：** 需要执行“停用原生节点”而不是只查看状态时。
+- **操作步骤：** 从扩展原生列表选择并停用，保留其JSON、认证数据与客户端模板；已连接客户端可能断开。
+- **操作结果：** 可能改变Xray运行配置；通常同一实例中的其他连接也可能受服务生命周期动作影响。
+- **要求与风险：** 其他节点仍保留但可能因重启短暂断连；修改前建议查看配置计划；可能影响运行中的连接。
+- **命令示例：** `sudo vpskit node native disable 1`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 2. 代理节点与用户 → 5. 扩展原生节点管理 → 5. 停用原生节点
+
+</details>
+
+<details class="menu-item">
+<summary><strong>6. 修改原生节点名称</strong> — 只更改显示名称，保留内部tag。</summary>
+
+- **作用：** 只更改显示名称，保留内部tag。
+- **什么时候用：** 需要执行“修改原生节点名称”而不是只查看状态时。
+- **操作步骤：** 选择扩展原生节点，只改管理显示名称，内部tag和访问凭据保持不变。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 无实质配置变化不重启；会修改配置或服务；无需求时可直接取消。
+- **命令示例：** `sudo vpskit node native rename 1`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 2. 代理节点与用户 → 5. 扩展原生节点管理 → 6. 修改原生节点名称
+
+</details>
+
+<details class="menu-item">
+<summary><strong>7. 导出客户端JSON</strong> — 编号选择并输出客户端配置。</summary>
+
+- **作用：** 编号选择并输出客户端配置。
+- **什么时候用：** 创建扩展节点后要在兼容Xray客户端使用时。
+- **操作步骤：** 选择扩展原生节点编号，输出包含本地SOCKS入口（默认127.0.0.1:10808）和远端出站的Xray客户端JSON；用兼容核心运行或按客户端格式转换。原生导入节点可能没有自动客户端模板。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 包含凭据；只提供给可信客户端；注意影响范围。
+- **命令示例：** `sudo vpskit node native export 1`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 2. 代理节点与用户 → 5. 扩展原生节点管理 → 7. 导出客户端JSON
+
+</details>
+
+<details class="menu-item">
+<summary><strong>8. 删除原生节点</strong> — 编号选择后删除。</summary>
+
+- **作用：** 编号选择后删除。
+- **什么时候用：** 明确需要“删除原生节点”且已确认备份和影响时。
+- **操作步骤：** 选择扩展原生节点后确认删除配置记录；旧客户端不能再使用此节点。操作前保存配置快照。
+- **操作结果：** 可能改变Xray运行配置；通常同一实例中的其他连接也可能受服务生命周期动作影响。
+- **要求与风险：** 不可撤销前会创建快照；不关闭全局防火墙；高风险：确认备份、外部依赖和停机影响后执行。
+- **命令示例：** `sudo vpskit node native delete 1`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 2. 代理节点与用户 → 5. 扩展原生节点管理 → 8. 删除原生节点
+
+</details>
+
+<details class="menu-item">
+<summary><strong>9. 导入受支持的原生入站JSON</strong> — 校验协议、监听、证书引用及当前核心。</summary>
+
+- **作用：** 校验协议、监听、证书引用及当前核心。
+- **什么时候用：** 需要执行“导入受支持的原生入站JSON”而不是只查看状态时。
+- **操作步骤：** 准备受支持的单个Inbound对象JSON（不是整个Xray配置），按提示选择TCP/UDP、节点名称与连接地址；候选核心测试通过后才保存。导入节点未必带客户端模板。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 本机普通文件；不接管系统路由；修改前建议查看配置计划；可能影响运行中的连接。
+- **命令示例：** `sudo vpskit node import /root/inbound.json tcp`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 2. 代理节点与用户 → 5. 扩展原生节点管理 → 9. 导入受支持的原生入站JSON
+
+</details>
+
+<details class="menu-item">
+<summary><strong>0. 返回上一级</strong> — 不修改配置。</summary>
+
+- **作用：** 不修改配置。
+- **什么时候用：** 看完当前菜单或想取消本次未提交输入时。
+- **操作步骤：** 输入0返回上一层；不保存当前尚未确认的输入。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 已提交的配置保留；返回上一级；已保存的设置不回退。
+- **菜单路径：** 主菜单 → 2. 代理节点与用户 → 5. 扩展原生节点管理 → 0. 返回上一级
+
+</details>
+
+</details>
+
+</details>
+
+<details id="websites">
+<summary><strong>3. 网站与反向代理</strong> — 静态站 · 反代 · 缓存</summary>
+
+### 可创建哪些站点？
+
+支持静态网站、内置模板、本机应用反向代理、HTTP 重定向。网站和代理节点使用相同域名时，需要将 WS/XHTTP 代理路径与普通网页路径区分。**先有可用网站/证书，再创建依赖它的 WS/XHTTP 节点**。
+
+### 最常见操作
+
+1. `site list` 查看已登记的网站和证书登记状态。
+2. `site add` 创建新网站，选择模板/静态/本机 HTTP 反向代理/跳转。
+3. 有需要再去 **4. ACME**完成 HTTPS 签发。
+4. 修改 gzip、静态缓存 TTL、应用后端超时；对登录页、个性化网页、代理流量避免一刀切缓存。
+5. `config check` 和 `config plan` 查看变更，通过后 `config apply`。共享模式只写 VPSKit 所管片段。
+
+```bash
+sudo vpskit site list
+sudo vpskit site add
+sudo vpskit site edit
+sudo vpskit config check
+sudo vpskit config plan
+sudo vpskit config apply
+```
+
+> **共享模式**：VPSKit 不应覆盖 `/etc/nginx/nginx.conf` 和其他网站配置。全局 Worker 参数属于所有站点，不要用普通站点设置直接修改。
+
+### 此模块的完整菜单索引
+
+<details class="menu-group">
+<summary><strong>websites</strong>：12 个功能（逐项展开查看操作方法）</summary>
+
+> **所在目录：** 3. 网站与反向代理
+
+<details class="menu-item">
+<summary><strong>1. 查看网站列表</strong> — 显示域名、内容类型、访问方式和证书状态。</summary>
+
+- **作用：** 显示域名、内容类型、访问方式和证书状态。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 列出VPSKit登记的网站、类型、域名和证书状态；用于选择随后编辑或删除的对象。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只读；不显示 DNS API 凭据；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit site list`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 3. 网站与反向代理 → 1. 查看网站列表
+
+</details>
+
+<details class="menu-item">
+<summary><strong>2. 新增网站</strong> — 创建模板、静态站、本机反代或 HTTPS 跳转。</summary>
+
+- **作用：** 创建模板、静态站、本机反代或 HTTPS 跳转。
+- **什么时候用：** 需要执行“新增网站”而不是只查看状态时。
+- **操作步骤：** 按编号选择静态站/模板/反向代理/重定向，输入域名与必要的本机上游；若要HTTPS，再单独申请证书。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 已安装 Nginx；需自有域名；会修改配置或服务；无需求时可直接取消。
+- **命令示例：** `sudo vpskit site add`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 3. 网站与反向代理 → 2. 新增网站
+
+</details>
+
+<details class="menu-item">
+<summary><strong>3. 修改网站内容与访问方式</strong> — 编辑已有网站；保留内容文件和证书。</summary>
+
+- **作用：** 编辑已有网站；保留内容文件和证书。
+- **什么时候用：** 需要执行“修改网站内容与访问方式”而不是只查看状态时。
+- **操作步骤：** 选择网站编号，修改内容类型、代理地址或访问规则；不改变其他项目站点，保存前检查候选。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 不覆盖已存在模板；修改后检查依赖节点；会修改配置或服务；无需求时可直接取消。
+- **命令示例：** `sudo vpskit site edit`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 3. 网站与反向代理 → 3. 修改网站内容与访问方式
+
+</details>
+
+<details class="menu-item">
+<summary><strong>4. 移除网站绑定</strong> — 停止该域名网站和自动续期，保留文件。</summary>
+
+- **作用：** 停止该域名网站和自动续期，保留文件。
+- **什么时候用：** 明确需要“移除网站绑定”且已确认备份和影响时。
+- **操作步骤：** 选择网站绑定并确认撤下；若有节点仍引用该域名/证书会阻止删除，网站文件和证书是否保留按提示处理。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 必须先删除引用该网站的节点；高风险：确认备份、外部依赖和停机影响后执行。
+- **命令示例：** `sudo vpskit site remove`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 3. 网站与反向代理 → 4. 移除网站绑定
+
+</details>
+
+<details class="menu-item">
+<summary><strong>5. 静态网站 gzip</strong> — 启停轻量文本压缩，不压缩节点代理流量。</summary>
+
+- **作用：** 启停轻量文本压缩，不压缩节点代理流量。
+- **什么时候用：** 需要执行“静态网站 gzip”而不是只查看状态时。
+- **操作步骤：** 选择全局静态站gzip开启或关闭，确认后应用；节点代理流量不会因开启网站gzip而自动压缩。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** Nginx 已安装；站点单独设置可覆盖全局值；会修改配置或服务；无需求时可直接取消。
+- **菜单路径：** 主菜单 → 3. 网站与反向代理 → 5. 静态网站 gzip
+
+</details>
+
+<details class="menu-item">
+<summary><strong>6. 静态缓存与 gzip</strong> — 设置静态资源缓存头和站点压缩。</summary>
+
+- **作用：** 设置静态资源缓存头和站点压缩。
+- **什么时候用：** 需要执行“静态缓存与 gzip”而不是只查看状态时。
+- **操作步骤：** 先按编号选网站，再设置静态缓存时间和文本gzip；个性化页面、登录页和代理路径不应缓存。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 不强制缓存HTML/动态应用/节点流量；会修改配置或服务；无需求时可直接取消。
+- **菜单路径：** 主菜单 → 3. 网站与反向代理 → 6. 静态缓存与 gzip
+
+</details>
+
+<details class="menu-item">
+<summary><strong>7. 普通网站反代超时</strong> — 本机应用的读写空闲超时。</summary>
+
+- **作用：** 本机应用的读写空闲超时。
+- **什么时候用：** 需要调整“普通网站反代超时”而不是修改节点凭据时。
+- **操作步骤：** 打开该项，查看保存的当前值和允许范围；按提示选择开关或输入新数值，确认前先看配置差异。普通网站反代读写超时；与WS/XHTTP节点超时分开设置。
+- **操作结果：** 保存值与实际生效值可能不同；按计划应用后再核对运行状态。
+- **要求与风险：** 5–3600 秒；与节点长连接参数分开；会修改配置或服务；无需求时可直接取消。
+- **菜单路径：** 主菜单 → 3. 网站与反向代理 → 7. 普通网站反代超时
+
+</details>
+
+<details class="menu-item">
+<summary><strong>8. 网站上游连接池</strong> — 每Worker保留的应用上游空闲连接数。</summary>
+
+- **作用：** 每Worker保留的应用上游空闲连接数。
+- **什么时候用：** 需要调整“网站上游连接池”而不是修改节点凭据时。
+- **操作步骤：** 打开该项，查看保存的当前值和允许范围；按提示选择开关或输入新数值，确认前先看配置差异。普通网站反向代理的上游空闲连接池大小（非总并发）。
+- **操作结果：** 保存值与实际生效值可能不同；按计划应用后再核对运行状态。
+- **要求与风险：** 0–128；0关闭；并非最大上游连接总数；会修改配置或服务；无需求时可直接取消。
+- **菜单路径：** 主菜单 → 3. 网站与反向代理 → 8. 网站上游连接池
+
+</details>
+
+<details class="menu-item">
+<summary><strong>9. 网站权限修复</strong> — 显式修复上传文件的读取权限。</summary>
+
+- **作用：** 显式修复上传文件的读取权限。
+- **什么时候用：** 需要执行“网站权限修复”而不是只查看状态时。
+- **操作步骤：** 当静态文件访问403或非root Worker读取/写入临时目录失败时使用；选择后脚本只修复受管网站目录权限，不要手动全树chmod 777。
+- **操作结果：** 保存值与实际生效值可能不同；按计划应用后再核对运行状态。
+- **要求与风险：** 不重启服务；扫描网站树并拒绝不安全链接；修改前建议查看配置计划；可能影响运行中的连接。
+- **菜单路径：** 主菜单 → 3. 网站与反向代理 → 9. 网站权限修复
+
+</details>
+
+<details class="menu-item">
+<summary><strong>10. 候选配置检查</strong> — 生成并校验完整候选配置，不发布。</summary>
+
+- **作用：** 生成并校验完整候选配置，不发布。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 生成候选Xray与Nginx配置并执行语法/核心检查，但不发布配置；报错先修复，不要反复强制应用。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 共享模式递归检查静态include；无需重启；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit config check`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 3. 网站与反向代理 → 10. 候选配置检查
+
+</details>
+
+<details class="menu-item">
+<summary><strong>11. 配置计划与发布</strong> — 进入下级功能菜单，包含：候选配置检查、服务动作计划、脱敏差异摘要、应用保存配置、未完成事务状态等。</summary>
+
+- **作用：** 进入下级功能菜单，包含：候选配置检查、服务动作计划、脱敏差异摘要、应用保存配置、未完成事务状态等。
+- **什么时候用：** 需要集中管理“配置计划与发布”相关操作时。
+- **操作步骤：** 在此项按序号进入下级菜单，先查看状态和用途，再选择具体操作；不需要输入长文本名称。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 查看当前状态后按序号选择；仅进入下级菜单；不会立刻修改系统。
+- **菜单路径：** 主菜单 → 3. 网站与反向代理 → 11. 配置计划与发布
+
+</details>
+
+<details class="menu-item">
+<summary><strong>0. 返回上一级</strong> — 不修改配置。</summary>
+
+- **作用：** 不修改配置。
+- **什么时候用：** 看完当前菜单或想取消本次未提交输入时。
+- **操作步骤：** 输入0返回上一层；不保存当前尚未确认的输入。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 已提交的配置保留；返回上一级；已保存的设置不回退。
+- **菜单路径：** 主菜单 → 3. 网站与反向代理 → 0. 返回上一级
+
+</details>
+
+</details>
+
+</details>
+
+<details id="certificates">
+<summary><strong>4. ACME 与 SSL 证书</strong> — 签发 · 续期 · 私钥</summary>
+
+### 首次为网站签发 HTTPS 证书
+
+1. 域名先正确解析到对应 VPS，核对云安全组及本机 80/443 状态。
+2. `cert settings` 设置邮箱、HTTP-01 或 DNS-01；泛域名一般需要 DNS-01。
+3. `cert issue` 选择已添加的网站申请，成功后 `cert status`、`cert audit` 核实。
+4. 定时续期由本项目维护任务处理其登记证书。手动导入的证书与自动续期的处理方式不同。
+
+```bash
+sudo vpskit cert settings
+sudo vpskit cert issue
+sudo vpskit cert status
+sudo vpskit cert audit
+sudo vpskit cert renew
+```
+
+> **注意**：共享 ACME 是共享可执行程序，不表示共享 DNS API Token、证书私钥或续期任务。不要把 `/opt/vpskit/acme/config` 或 `state.json` 上传到公共仓库。
+
+### 此模块的完整菜单索引
+
+<details class="menu-group">
+<summary><strong>certificates</strong>：10 个功能（逐项展开查看操作方法）</summary>
+
+> **所在目录：** 4. ACME 与 SSL 证书
+
+<details class="menu-item">
+<summary><strong>1. 证书有效期</strong> — 查看当前证书到期时间。</summary>
+
+- **作用：** 查看当前证书到期时间。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 列出证书有效期、域名和当前引用；接近到期时再选择续期检查，不盲目重复签发。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只读；尚未签发会明确提示；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit cert status`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 4. ACME 与 SSL 证书 → 1. 证书有效期
+
+</details>
+
+<details class="menu-item">
+<summary><strong>2. 签发 / 重试证书</strong> — 按已保存设置申请或重新签发证书。</summary>
+
+- **作用：** 按已保存设置申请或重新签发证书。
+- **什么时候用：** 需要执行“签发 / 重试证书”而不是只查看状态时。
+- **操作步骤：** 从网站列表选择域名，先配置HTTP-01/DNS-01验证，确认DNS及网络要求后签发并部署；失败时保留旧证书。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 需 ACME；HTTP-01 需80可达，DNS-01 需 API权限；会修改配置或服务；无需求时可直接取消。
+- **命令示例：** `sudo vpskit cert issue`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 4. ACME 与 SSL 证书 → 2. 签发 / 重试证书
+
+</details>
+
+<details class="menu-item">
+<summary><strong>3. 修改证书验证设置</strong> — 保存邮箱、HTTP/DNS 验证及泛域名选项。</summary>
+
+- **作用：** 保存邮箱、HTTP/DNS 验证及泛域名选项。
+- **什么时候用：** 需要执行“修改证书验证设置”而不是只查看状态时。
+- **操作步骤：** 选择HTTP-01或DNS-01、邮箱和所需DNS服务商凭据；已有凭据可复用，仅更换时重新输入。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 保存不立即重签；泛域名需要 DNS-01；会修改配置或服务；无需求时可直接取消。
+- **命令示例：** `sudo vpskit cert settings`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 4. ACME 与 SSL 证书 → 3. 修改证书验证设置
+
+</details>
+
+<details class="menu-item">
+<summary><strong>4. 导入证书与私钥</strong> — 校验域名和密钥匹配后部署手动证书。</summary>
+
+- **作用：** 校验域名和密钥匹配后部署手动证书。
+- **什么时候用：** 需要执行“导入证书与私钥”而不是只查看状态时。
+- **操作步骤：** 从本机可信PEM文件选择完整证书链和匹配的私钥，验证域名、有效期和密钥后部署；注意手动证书不等于ACME自动续期。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 提供本机 PEM 文件；暂停此域名 ACME 自动续期；注意影响范围。
+- **命令示例：** `sudo vpskit cert import`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 4. ACME 与 SSL 证书 → 4. 导入证书与私钥
+
+</details>
+
+<details class="menu-item">
+<summary><strong>5. 检查续期</strong> — 按 ACME 到期策略检查，不强制重复签发。</summary>
+
+- **作用：** 按 ACME 到期策略检查，不强制重复签发。
+- **什么时候用：** 需要执行“检查续期”而不是只查看状态时。
+- **操作步骤：** 按已登记的自动续期规则检查证书是否需要更新，成功后按实际变更重载对应Nginx；避免重复全量签发。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 需联网；手动导入的证书不自动续期；会修改配置或服务；无需求时可直接取消。
+- **命令示例：** `sudo vpskit cert renew`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 4. ACME 与 SSL 证书 → 5. 检查续期
+
+</details>
+
+<details class="menu-item">
+<summary><strong>6. 证书与续期检查</strong> — 有效期、来源和常见重复cron引用。</summary>
+
+- **作用：** 有效期、来源和常见重复cron引用。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 读取证书来源/有效期及常见续期任务引用，帮助识别重复调度；这是只读检查，不会撤销证书。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 不打印DNS凭据；不能发现全部外部调度；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit cert audit`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 4. ACME 与 SSL 证书 → 6. 证书与续期检查
+
+</details>
+
+<details class="menu-item">
+<summary><strong>7. 证书与维护日志</strong> — 查看定时续期服务的近期 journal 记录。</summary>
+
+- **作用：** 查看定时续期服务的近期 journal 记录。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 读取证书签发与维护记录，判断续期是正常跳过还是验证失败。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 需要 systemd journal；分享前脱敏；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit logs cert 100`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 4. ACME 与 SSL 证书 → 7. 证书与维护日志
+
+</details>
+
+<details class="menu-item">
+<summary><strong>8. 维护定时器</strong> — 进入下级功能菜单，包含：查看维护状态、启动定时器、停止定时器、启用维护自启、关闭维护自启等。</summary>
+
+- **作用：** 进入下级功能菜单，包含：查看维护状态、启动定时器、停止定时器、启用维护自启、关闭维护自启等。
+- **什么时候用：** 需要集中管理“维护定时器”相关操作时。
+- **操作步骤：** 在此项按序号进入下级菜单，先查看状态和用途，再选择具体操作；不需要输入长文本名称。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 查看当前状态后按序号选择；仅进入下级菜单；不会立刻修改系统。
+- **菜单路径：** 主菜单 → 4. ACME 与 SSL 证书 → 8. 维护定时器
+
+</details>
+
+<details class="menu-item">
+<summary><strong>9. 安装模式与组件归属</strong> — 查看路径、来源和托管范围。</summary>
+
+- **作用：** 查看路径、来源和托管范围。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 查看每个组件的来源、服务名、程序路径及托管文件范围；尤其在迁移、共享卸载之前先确认是否属于外部程序。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只读；不把外部组件冒认为本工具安装；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit components show`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 4. ACME 与 SSL 证书 → 9. 安装模式与组件归属
+
+</details>
+
+<details class="menu-item">
+<summary><strong>0. 返回上一级</strong> — 不修改配置。</summary>
+
+- **作用：** 不修改配置。
+- **什么时候用：** 看完当前菜单或想取消本次未提交输入时。
+- **操作步骤：** 输入0返回上一层；不保存当前尚未确认的输入。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 已提交的配置保留；返回上一级；已保存的设置不回退。
+- **菜单路径：** 主菜单 → 4. ACME 与 SSL 证书 → 0. 返回上一级
+
+</details>
+
+</details>
+
+</details>
+
+<details id="nginx">
+<summary><strong>5. Nginx 高级配置</strong> — 连接容量 · Worker · TLS</summary>
+
+### 先区分“项目参数”和“全局参数”
+
+- **独立模式**：VPSKit 可以管理自己的 Worker 数、连接槽位、文件描述符及服务沙箱；切换非 root Worker 前先运行预检。
+- **系统共享模式**：网站/节点代理超时、压缩等项目参数可按站点调整；**Worker 总数、`worker_connections` 等属于系统级全局参数**，要经 `shared-global` 独立授权，会影响其他程序。
+
+### 调优顺序
+
+先读 `dashboard advanced` 和实际系统资源；再 `config plan` 预览；低配 VPS 不应盲目用 65535 连接、很多 Worker 或过大 TLS 缓存。仅在连接数/FD/CPU确实成为瓶颈时逐项测试。
+
+```bash
+sudo vpskit dashboard advanced
+sudo vpskit advanced show
+sudo vpskit config check
+sudo vpskit config plan
+
+# 共享模式：只读查看，设置另需独立明确确认
+sudo vpskit shared-global show
+sudo vpskit shared-global plan 2 2048
+
+# 系统共享Nginx的标准命令
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+> 标准 Nginx 命令是 `nginx -s reload`，**不是** `nginx --reload`。Reload 通常优雅切换 Worker，Restart 则可能中断现有连接。
+
+### 此模块的完整菜单索引
+
+<details class="menu-group">
+<summary><strong>advanced</strong>：10 个功能（逐项展开查看操作方法）</summary>
+
+> **所在目录：** 5. Nginx 高级配置
+
+<details class="menu-item">
+<summary><strong>1. 查看保存值与实际值</strong> — 显示合并默认值后的参数、CPU/内存及Worker身份。</summary>
+
+- **作用：** 显示合并默认值后的参数、CPU/内存及Worker身份。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 对比保存的Nginx参数、实际Worker与文件描述符限制；修改后仍应检查进程是否真正加载了新配置。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只读；连接上限不是用户人数；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit advanced show`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 5. Nginx 高级配置 → 1. 查看保存值与实际值
+
+</details>
+
+<details class="menu-item">
+<summary><strong>2. Worker / 连接数 / 文件数</strong> — 一起调整并发容量，防止参数互相冲突。</summary>
+
+- **作用：** 一起调整并发容量，防止参数互相冲突。
+- **什么时候用：** 需要执行“Worker / 连接数 / 文件数”而不是只查看状态时。
+- **操作步骤：** 一次调整Worker、每Worker连接数及nofile预算，避免单项临时冲突；共享模式影响其他网站的全局值需走独立授权。
+- **操作结果：** 保存值与实际生效值可能不同；按计划应用后再核对运行状态。
+- **要求与风险：** 仅独立模式；共享全局参数从单独授权入口调整；会修改配置或服务；无需求时可直接取消。
+- **菜单路径：** 主菜单 → 5. Nginx 高级配置 → 2. Worker / 连接数 / 文件数
+
+</details>
+
+<details class="menu-item">
+<summary><strong>3. 查看系统全局Nginx参数</strong> — 区分系统全局与项目保存值。</summary>
+
+- **作用：** 区分系统全局与项目保存值。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 在系统共享模式下只读查看全局Worker/连接槽位；它与VPSKit单站保存的参数不是同一范围。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 仅共享模式；不修改；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit shared-global show`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 5. Nginx 高级配置 → 3. 查看系统全局Nginx参数
+
+</details>
+
+<details class="menu-item">
+<summary><strong>4. 调整共享全局并发</strong> — 仅改主文件唯一Worker和connections指令。</summary>
+
+- **作用：** 仅改主文件唯一Worker和connections指令。
+- **什么时候用：** 明确需要“调整共享全局并发”且已确认备份和影响时。
+- **操作步骤：** 先查看共享全局值并输入目标Worker/连接数，预览影响，需额外输入GLOBAL NGINX确认；所有共享网站受影响。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 影响全部网站；需独立输入GLOBAL NGINX确认；高风险：确认备份、外部依赖和停机影响后执行。
+- **菜单路径：** 主菜单 → 5. Nginx 高级配置 → 4. 调整共享全局并发
+
+</details>
+
+<details class="menu-item">
+<summary><strong>5. HTTP、TLS与超时参数</strong> — 进入下级功能菜单，包含：HTTP Keepalive、Keepalive 请求数、TLS 会话缓存、TLS </summary>
+
+- **作用：** 进入下级功能菜单，包含：HTTP Keepalive、Keepalive 请求数、TLS 会话缓存、TLS 会话复用时间、HTTP/2 开关等。
+- **什么时候用：** 需要集中管理“HTTP、TLS与超时参数”相关操作时。
+- **操作步骤：** 在此项按序号进入下级菜单，先查看状态和用途，再选择具体操作；不需要输入长文本名称。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 查看当前状态后按序号选择；仅进入下级菜单；不会立刻修改系统。
+- **菜单路径：** 主菜单 → 5. Nginx 高级配置 → 5. HTTP、TLS与超时参数
+
+</details>
+
+<details class="menu-item">
+<summary><strong>6. 连接复用和压缩</strong> — 进入下级功能菜单，包含：网站上游连接池、XHTTP上游连接池、上游空闲连接回收、网站压缩级别、应用网站压缩等</summary>
+
+- **作用：** 进入下级功能菜单，包含：网站上游连接池、XHTTP上游连接池、上游空闲连接回收、网站压缩级别、应用网站压缩等。
+- **什么时候用：** 需要集中管理“连接复用和压缩”相关操作时。
+- **操作步骤：** 在此项按序号进入下级菜单，先查看状态和用途，再选择具体操作；不需要输入长文本名称。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 查看当前状态后按序号选择；仅进入下级菜单；不会立刻修改系统。
+- **菜单路径：** 主菜单 → 5. Nginx 高级配置 → 6. 连接复用和压缩
+
+</details>
+
+<details class="menu-item">
+<summary><strong>7. Worker 与权限预检</strong> — 进入下级功能菜单，包含：选择非 root 服务账户、查看可复用服务账户、非root与沙箱启动预检、服务沙箱模</summary>
+
+- **作用：** 进入下级功能菜单，包含：选择非 root 服务账户、查看可复用服务账户、非root与沙箱启动预检、服务沙箱模式、启动校验等待时间等。
+- **什么时候用：** 需要集中管理“Worker 与权限预检”相关操作时。
+- **操作步骤：** 在此项按序号进入下级菜单，先查看状态和用途，再选择具体操作；不需要输入长文本名称。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 查看当前状态后按序号选择；仅进入下级菜单；不会立刻修改系统。
+- **菜单路径：** 主菜单 → 5. Nginx 高级配置 → 7. Worker 与权限预检
+
+</details>
+
+<details class="menu-item">
+<summary><strong>8. 候选配置和发布</strong> — 进入下级功能菜单，包含：候选配置检查、服务动作计划、脱敏差异摘要、应用保存配置、未完成事务状态等。</summary>
+
+- **作用：** 进入下级功能菜单，包含：候选配置检查、服务动作计划、脱敏差异摘要、应用保存配置、未完成事务状态等。
+- **什么时候用：** 需要集中管理“候选配置和发布”相关操作时。
+- **操作步骤：** 在此项按序号进入下级菜单，先查看状态和用途，再选择具体操作；不需要输入长文本名称。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 查看当前状态后按序号选择；仅进入下级菜单；不会立刻修改系统。
+- **菜单路径：** 主菜单 → 5. Nginx 高级配置 → 8. 候选配置和发布
+
+</details>
+
+<details class="menu-item">
+<summary><strong>9. 恢复高级默认值</strong> — 只恢复Nginx/Xray高级参数。</summary>
+
+- **作用：** 只恢复Nginx/Xray高级参数。
+- **什么时候用：** 需要执行“恢复高级默认值”而不是只查看状态时。
+- **操作步骤：** 只重置高级性能参数到脚本默认值，不清节点和证书；先查看会引起哪些Nginx/Xray服务动作。
+- **操作结果：** 保存值与实际生效值可能不同；按计划应用后再核对运行状态。
+- **要求与风险：** 保留节点和网站；共享模式不修改全局主配置；修改前建议查看配置计划；可能影响运行中的连接。
+- **菜单路径：** 主菜单 → 5. Nginx 高级配置 → 9. 恢复高级默认值
+
+</details>
+
+<details class="menu-item">
+<summary><strong>0. 返回上一级</strong> — 不修改配置。</summary>
+
+- **作用：** 不修改配置。
+- **什么时候用：** 看完当前菜单或想取消本次未提交输入时。
+- **操作步骤：** 输入0返回上一层；不保存当前尚未确认的输入。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 已提交的配置保留；返回上一级；已保存的设置不回退。
+- **菜单路径：** 主菜单 → 5. Nginx 高级配置 → 0. 返回上一级
+
+</details>
+
+</details>
+
+<details class="menu-group">
+<summary><strong>worker</strong>：7 个功能（逐项展开查看操作方法）</summary>
+
+> **所在目录：** 5. Nginx 高级配置 → 7. Worker 与权限预检
+
+<details class="menu-item">
+<summary><strong>1. 选择非 root 服务账户</strong> — 自动检测或手工选择已有合格服务账户。</summary>
+
+- **作用：** 自动检测或手工选择已有合格服务账户。
+- **什么时候用：** 需要执行“选择非 root 服务账户”而不是只查看状态时。
+- **操作步骤：** 从已存在的合格非登录账户列表选择非root Worker；应用前先执行独立预检，不能用root作为常规Worker。
+- **操作结果：** 保存值与实际生效值可能不同；按计划应用后再核对运行状态。
+- **要求与风险：** 不创建用户；拒绝root及高权限/可交互登录账户；修改前建议查看配置计划；可能影响运行中的连接。
+- **菜单路径：** 主菜单 → 5. Nginx 高级配置 → 7. Worker 与权限预检 → 1. 选择非 root 服务账户
+
+</details>
+
+<details class="menu-item">
+<summary><strong>2. 查看可复用服务账户</strong> — 列出自动候选账户的UID及资格检查结果。</summary>
+
+- **作用：** 列出自动候选账户的UID及资格检查结果。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 只读列出可复用服务账户和UID/GID，确认不会重复创建新账户；无可用账户时先补齐系统环境。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只读；不会创建、删除或修改系统账户；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit advanced users`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 5. Nginx 高级配置 → 7. Worker 与权限预检 → 2. 查看可复用服务账户
+
+</details>
+
+<details class="menu-item">
+<summary><strong>3. 非root与沙箱启动预检</strong> — 独立UNIX套接字测试身份、静态读取和上传缓冲。</summary>
+
+- **作用：** 独立UNIX套接字测试身份、静态读取和上传缓冲。
+- **什么时候用：** 需要执行“非root与沙箱启动预检”而不是只查看状态时。
+- **操作步骤：** 在私有UNIX套接字上验证非root Worker实际UID、文件数、能力及文件读写；预检失败不切正式服务。
+- **操作结果：** 保存值与实际生效值可能不同；按计划应用后再核对运行状态。
+- **要求与风险：** 不重启正式服务；会短暂启动受限测试进程；修改前建议查看配置计划；可能影响运行中的连接。
+- **命令示例：** `sudo vpskit advanced preflight`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 5. Nginx 高级配置 → 7. Worker 与权限预检 → 3. 非root与沙箱启动预检
+
+</details>
+
+<details class="menu-item">
+<summary><strong>4. 服务沙箱模式</strong> — 编号选择兼容或严格隔离，先预检再切换。</summary>
+
+- **作用：** 编号选择兼容或严格隔离，先预检再切换。
+- **什么时候用：** 需要调整“服务沙箱模式”而不是修改节点凭据时。
+- **操作步骤：** 打开该项，查看保存的当前值和允许范围；按提示选择开关或输入新数值，确认前先看配置差异。独立Nginx systemd隔离模式；切换前必须通过非root预检。
+- **操作结果：** 保存值与实际生效值可能不同；按计划应用后再核对运行状态。
+- **要求与风险：** 1兼容/2严格；Worker保持非root，私钥保持root私有；修改前建议查看配置计划；可能影响运行中的连接。
+- **菜单路径：** 主菜单 → 5. Nginx 高级配置 → 7. Worker 与权限预检 → 4. 服务沙箱模式
+
+</details>
+
+<details class="menu-item">
+<summary><strong>5. 启动校验等待时间</strong> — 容忍低配VPS和服务启动延迟。</summary>
+
+- **作用：** 容忍低配VPS和服务启动延迟。
+- **什么时候用：** 需要调整“启动校验等待时间”而不是修改节点凭据时。
+- **操作步骤：** 打开该项，查看保存的当前值和允许范围；按提示选择开关或输入新数值，确认前先看配置差异。非root Worker预检或启动验证等待时长；不解决权限缺失本身。
+- **操作结果：** 保存值与实际生效值可能不同；按计划应用后再核对运行状态。
+- **要求与风险：** 5–180 秒；不跳过身份和实际文件数检查；会修改配置或服务；无需求时可直接取消。
+- **菜单路径：** 主菜单 → 5. Nginx 高级配置 → 7. Worker 与权限预检 → 5. 启动校验等待时间
+
+</details>
+
+<details class="menu-item">
+<summary><strong>6. 网站权限修复</strong> — 显式修复上传文件的读取权限。</summary>
+
+- **作用：** 显式修复上传文件的读取权限。
+- **什么时候用：** 需要执行“网站权限修复”而不是只查看状态时。
+- **操作步骤：** 当静态文件访问403或非root Worker读取/写入临时目录失败时使用；选择后脚本只修复受管网站目录权限，不要手动全树chmod 777。
+- **操作结果：** 保存值与实际生效值可能不同；按计划应用后再核对运行状态。
+- **要求与风险：** 不重启服务；扫描网站树并拒绝不安全链接；修改前建议查看配置计划；可能影响运行中的连接。
+- **菜单路径：** 主菜单 → 5. Nginx 高级配置 → 7. Worker 与权限预检 → 6. 网站权限修复
+
+</details>
+
+<details class="menu-item">
+<summary><strong>0. 返回上一级</strong> — 不修改配置。</summary>
+
+- **作用：** 不修改配置。
+- **什么时候用：** 看完当前菜单或想取消本次未提交输入时。
+- **操作步骤：** 输入0返回上一层；不保存当前尚未确认的输入。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 已提交的配置保留；返回上一级；已保存的设置不回退。
+- **菜单路径：** 主菜单 → 5. Nginx 高级配置 → 7. Worker 与权限预检 → 0. 返回上一级
+
+</details>
+
+</details>
+
+<details class="menu-group">
+<summary><strong>nginxparams</strong>：15 个功能（逐项展开查看操作方法）</summary>
+
+> **所在目录：** 5. Nginx 高级配置 → 5. HTTP、TLS与超时参数
+
+<details class="menu-item">
+<summary><strong>1. HTTP Keepalive</strong> — 空闲HTTP连接保留时间。</summary>
+
+- **作用：** 空闲HTTP连接保留时间。
+- **什么时候用：** 需要调整“HTTP Keepalive”而不是修改节点凭据时。
+- **操作步骤：** 打开该项，查看保存的当前值和允许范围；按提示选择开关或输入新数值，确认前先看配置差异。网站HTTP空闲连接保留时间；仅影响空闲连接复用，不等于代理应用层心跳。
+- **操作结果：** 保存值与实际生效值可能不同；按计划应用后再核对运行状态。
+- **要求与风险：** 5–300 秒；影响普通HTTP复用，不是WS连接寿命；会修改配置或服务；无需求时可直接取消。
+- **菜单路径：** 主菜单 → 5. Nginx 高级配置 → 5. HTTP、TLS与超时参数 → 1. HTTP Keepalive
+
+</details>
+
+<details class="menu-item">
+<summary><strong>2. Keepalive 请求数</strong> — 单连接最多处理的请求数。</summary>
+
+- **作用：** 单连接最多处理的请求数。
+- **什么时候用：** 需要调整“Keepalive 请求数”而不是修改节点凭据时。
+- **操作步骤：** 打开该项，查看保存的当前值和允许范围；按提示选择开关或输入新数值，确认前先看配置差异。同一HTTP连接可复用的请求次数；过大可能增加资源占用。
+- **操作结果：** 保存值与实际生效值可能不同；按计划应用后再核对运行状态。
+- **要求与风险：** 100–100000 次；过大不是无条件更快；会修改配置或服务；无需求时可直接取消。
+- **菜单路径：** 主菜单 → 5. Nginx 高级配置 → 5. HTTP、TLS与超时参数 → 2. Keepalive 请求数
+
+</details>
+
+<details class="menu-item">
+<summary><strong>3. TLS 会话缓存</strong> — 共享TLS会话缓存容量。</summary>
+
+- **作用：** 共享TLS会话缓存容量。
+- **什么时候用：** 需要调整“TLS 会话缓存”而不是修改节点凭据时。
+- **操作步骤：** 打开该项，查看保存的当前值和允许范围；按提示选择开关或输入新数值，确认前先看配置差异。TLS会话缓存大小；适当复用能降低重复握手开销，但需内存预算。
+- **操作结果：** 保存值与实际生效值可能不同；按计划应用后再核对运行状态。
+- **要求与风险：** 1–128 MiB；修改后重载验证，按内存设置；会修改配置或服务；无需求时可直接取消。
+- **菜单路径：** 主菜单 → 5. Nginx 高级配置 → 5. HTTP、TLS与超时参数 → 3. TLS 会话缓存
+
+</details>
+
+<details class="menu-item">
+<summary><strong>4. TLS 会话复用时间</strong> — 可复用TLS会话的有效时间。</summary>
+
+- **作用：** 可复用TLS会话的有效时间。
+- **什么时候用：** 需要调整“TLS 会话复用时间”而不是修改节点凭据时。
+- **操作步骤：** 打开该项，查看保存的当前值和允许范围；按提示选择开关或输入新数值，确认前先看配置差异。TLS会话复用信息的保留期限；不是证书有效期。
+- **操作结果：** 保存值与实际生效值可能不同；按计划应用后再核对运行状态。
+- **要求与风险：** 1–1440 分钟；不是HTTP连接超时；会修改配置或服务；无需求时可直接取消。
+- **菜单路径：** 主菜单 → 5. Nginx 高级配置 → 5. HTTP、TLS与超时参数 → 4. TLS 会话复用时间
+
+</details>
+
+<details class="menu-item">
+<summary><strong>5. HTTP/2 开关</strong> — 控制网站是否启用HTTP/2。</summary>
+
+- **作用：** 控制网站是否启用HTTP/2。
+- **什么时候用：** 需要调整“HTTP/2 开关”而不是修改节点凭据时。
+- **操作步骤：** 打开该项，查看保存的当前值和允许范围；按提示选择开关或输入新数值，确认前先看配置差异。网站的HTTP/2协议开关；XHTTP节点还需满足实际协议支持。
+- **操作结果：** 保存值与实际生效值可能不同；按计划应用后再核对运行状态。
+- **要求与风险：** true/false；存在启用XHTTP时仍保留HTTP/2；会修改配置或服务；无需求时可直接取消。
+- **菜单路径：** 主菜单 → 5. Nginx 高级配置 → 5. HTTP、TLS与超时参数 → 5. HTTP/2 开关
+
+</details>
+
+<details class="menu-item">
+<summary><strong>6. 请求头超时</strong> — 读取客户端请求头的超时。</summary>
+
+- **作用：** 读取客户端请求头的超时。
+- **什么时候用：** 需要调整“请求头超时”而不是修改节点凭据时。
+- **操作步骤：** 打开该项，查看保存的当前值和允许范围；按提示选择开关或输入新数值，确认前先看配置差异。等待普通客户端请求头的超时时间。
+- **操作结果：** 保存值与实际生效值可能不同；按计划应用后再核对运行状态。
+- **要求与风险：** 5–300 秒；过短会影响弱网访问；会修改配置或服务；无需求时可直接取消。
+- **菜单路径：** 主菜单 → 5. Nginx 高级配置 → 5. HTTP、TLS与超时参数 → 6. 请求头超时
+
+</details>
+
+<details class="menu-item">
+<summary><strong>7. 普通请求体超时</strong> — 读取网站请求体的空闲超时。</summary>
+
+- **作用：** 读取网站请求体的空闲超时。
+- **什么时候用：** 需要调整“普通请求体超时”而不是修改节点凭据时。
+- **操作步骤：** 打开该项，查看保存的当前值和允许范围；按提示选择开关或输入新数值，确认前先看配置差异。等待普通网页请求体的超时时间；上传大文件需按业务评估。
+- **操作结果：** 保存值与实际生效值可能不同；按计划应用后再核对运行状态。
+- **要求与风险：** 5–3600 秒；节点流量有独立超时；会修改配置或服务；无需求时可直接取消。
+- **菜单路径：** 主菜单 → 5. Nginx 高级配置 → 5. HTTP、TLS与超时参数 → 7. 普通请求体超时
+
+</details>
+
+<details class="menu-item">
+<summary><strong>8. 网站响应发送超时</strong> — 向客户端发送响应的空闲超时。</summary>
+
+- **作用：** 向客户端发送响应的空闲超时。
+- **什么时候用：** 需要调整“网站响应发送超时”而不是修改节点凭据时。
+- **操作步骤：** 打开该项，查看保存的当前值和允许范围；按提示选择开关或输入新数值，确认前先看配置差异。普通网站向客户端发送响应时的空闲等待上限。
+- **操作结果：** 保存值与实际生效值可能不同；按计划应用后再核对运行状态。
+- **要求与风险：** 5–3600 秒；不是整个文件下载总时长；会修改配置或服务；无需求时可直接取消。
+- **菜单路径：** 主菜单 → 5. Nginx 高级配置 → 5. HTTP、TLS与超时参数 → 8. 网站响应发送超时
+
+</details>
+
+<details class="menu-item">
+<summary><strong>9. 连接上游超时</strong> — 连接本机反向代理上游的等待时间。</summary>
+
+- **作用：** 连接本机反向代理上游的等待时间。
+- **什么时候用：** 需要调整“连接上游超时”而不是修改节点凭据时。
+- **操作步骤：** 打开该项，查看保存的当前值和允许范围；按提示选择开关或输入新数值，确认前先看配置差异。Nginx连接本地上游服务的等待时间；不是完整请求总时长。
+- **操作结果：** 保存值与实际生效值可能不同；按计划应用后再核对运行状态。
+- **要求与风险：** 1–60 秒；本机上游通常无需设置很大；会修改配置或服务；无需求时可直接取消。
+- **菜单路径：** 主菜单 → 5. Nginx 高级配置 → 5. HTTP、TLS与超时参数 → 9. 连接上游超时
+
+</details>
+
+<details class="menu-item">
+<summary><strong>10. 节点上游读取超时</strong> — WS/XHTTP上游读取空闲超时。</summary>
+
+- **作用：** WS/XHTTP上游读取空闲超时。
+- **什么时候用：** 需要调整“节点上游读取超时”而不是修改节点凭据时。
+- **操作步骤：** 打开该项，查看保存的当前值和允许范围；按提示选择开关或输入新数值，确认前先看配置差异。代理节点从Xray上游读取数据的空闲超时。
+- **操作结果：** 保存值与实际生效值可能不同；按计划应用后再核对运行状态。
+- **要求与风险：** 30–86400 秒；依据心跳和客户端行为设置；会修改配置或服务；无需求时可直接取消。
+- **菜单路径：** 主菜单 → 5. Nginx 高级配置 → 5. HTTP、TLS与超时参数 → 10. 节点上游读取超时
+
+</details>
+
+<details class="menu-item">
+<summary><strong>11. 节点上游写入超时</strong> — WS/XHTTP上游发送空闲超时。</summary>
+
+- **作用：** WS/XHTTP上游发送空闲超时。
+- **什么时候用：** 需要调整“节点上游写入超时”而不是修改节点凭据时。
+- **操作步骤：** 打开该项，查看保存的当前值和允许范围；按提示选择开关或输入新数值，确认前先看配置差异。代理节点向Xray上游发送数据的空闲超时。
+- **操作结果：** 保存值与实际生效值可能不同；按计划应用后再核对运行状态。
+- **要求与风险：** 30–86400 秒；保持与客户端行为协调；会修改配置或服务；无需求时可直接取消。
+- **菜单路径：** 主菜单 → 5. Nginx 高级配置 → 5. HTTP、TLS与超时参数 → 11. 节点上游写入超时
+
+</details>
+
+<details class="menu-item">
+<summary><strong>12. 普通网站反代超时</strong> — 本机应用的读写空闲超时。</summary>
+
+- **作用：** 本机应用的读写空闲超时。
+- **什么时候用：** 需要调整“普通网站反代超时”而不是修改节点凭据时。
+- **操作步骤：** 打开该项，查看保存的当前值和允许范围；按提示选择开关或输入新数值，确认前先看配置差异。普通网站反代读写超时；与WS/XHTTP节点超时分开设置。
+- **操作结果：** 保存值与实际生效值可能不同；按计划应用后再核对运行状态。
+- **要求与风险：** 5–3600 秒；与节点长连接参数分开；会修改配置或服务；无需求时可直接取消。
+- **菜单路径：** 主菜单 → 5. Nginx 高级配置 → 5. HTTP、TLS与超时参数 → 12. 普通网站反代超时
+
+</details>
+
+<details class="menu-item">
+<summary><strong>13. 普通网站上传上限</strong> — 限制普通站点单请求体大小。</summary>
+
+- **作用：** 限制普通站点单请求体大小。
+- **什么时候用：** 需要调整“普通网站上传上限”而不是修改节点凭据时。
+- **操作步骤：** 打开该项，查看保存的当前值和允许范围；按提示选择开关或输入新数值，确认前先看配置差异。普通网站请求体的最大MiB限制；不要误认为XHTTP上行的限制。
+- **操作结果：** 保存值与实际生效值可能不同；按计划应用后再核对运行状态。
+- **要求与风险：** 1–4096 MiB；XHTTP节点不套用此限制；会修改配置或服务；无需求时可直接取消。
+- **菜单路径：** 主菜单 → 5. Nginx 高级配置 → 5. HTTP、TLS与超时参数 → 13. 普通网站上传上限
+
+</details>
+
+<details class="menu-item">
+<summary><strong>14. Worker 优雅退出期限</strong> — reload后旧Worker最多等待的时间。</summary>
+
+- **作用：** reload后旧Worker最多等待的时间。
+- **什么时候用：** 需要调整“Worker 优雅退出期限”而不是修改节点凭据时。
+- **操作步骤：** 打开该项，查看保存的当前值和允许范围；按提示选择开关或输入新数值，确认前先看配置差异。旧Worker优雅退出等待上限；设置过短可能切断长连接。
+- **操作结果：** 保存值与实际生效值可能不同；按计划应用后再核对运行状态。
+- **要求与风险：** 0–3600 秒；0不强制截止，非0可能断开长连接；会修改配置或服务；无需求时可直接取消。
+- **菜单路径：** 主菜单 → 5. Nginx 高级配置 → 5. HTTP、TLS与超时参数 → 14. Worker 优雅退出期限
+
+</details>
+
+<details class="menu-item">
+<summary><strong>0. 返回上一级</strong> — 不修改配置。</summary>
+
+- **作用：** 不修改配置。
+- **什么时候用：** 看完当前菜单或想取消本次未提交输入时。
+- **操作步骤：** 输入0返回上一层；不保存当前尚未确认的输入。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 已提交的配置保留；返回上一级；已保存的设置不回退。
+- **菜单路径：** 主菜单 → 5. Nginx 高级配置 → 5. HTTP、TLS与超时参数 → 0. 返回上一级
+
+</details>
+
+</details>
+
+<details class="menu-group">
+<summary><strong>perfparams</strong>：9 个功能（逐项展开查看操作方法）</summary>
+
+> **所在目录：** 5. Nginx 高级配置 → 6. 连接复用和压缩
+
+<details class="menu-item">
+<summary><strong>1. 网站上游连接池</strong> — 每Worker保留的应用上游空闲连接数。</summary>
+
+- **作用：** 每Worker保留的应用上游空闲连接数。
+- **什么时候用：** 需要调整“网站上游连接池”而不是修改节点凭据时。
+- **操作步骤：** 打开该项，查看保存的当前值和允许范围；按提示选择开关或输入新数值，确认前先看配置差异。普通网站反向代理的上游空闲连接池大小（非总并发）。
+- **操作结果：** 保存值与实际生效值可能不同；按计划应用后再核对运行状态。
+- **要求与风险：** 0–128；0关闭；并非最大上游连接总数；会修改配置或服务；无需求时可直接取消。
+- **菜单路径：** 主菜单 → 5. Nginx 高级配置 → 6. 连接复用和压缩 → 1. 网站上游连接池
+
+</details>
+
+<details class="menu-item">
+<summary><strong>2. XHTTP上游连接池</strong> — 每Worker每入口保留少量空闲连接。</summary>
+
+- **作用：** 每Worker每入口保留少量空闲连接。
+- **什么时候用：** 需要调整“XHTTP上游连接池”而不是修改节点凭据时。
+- **操作步骤：** 打开该项，查看保存的当前值和允许范围；按提示选择开关或输入新数值，确认前先看配置差异。XHTTP本机上游空闲连接复用数量；按实际协议/版本测试。
+- **操作结果：** 保存值与实际生效值可能不同；按计划应用后再核对运行状态。
+- **要求与风险：** 0～64；不缓存代理数据，不修改传输模式；会修改配置或服务；无需求时可直接取消。
+- **菜单路径：** 主菜单 → 5. Nginx 高级配置 → 6. 连接复用和压缩 → 2. XHTTP上游连接池
+
+</details>
+
+<details class="menu-item">
+<summary><strong>3. 上游空闲连接回收</strong> — 限制网站/XHTTP连接池的空闲时间。</summary>
+
+- **作用：** 限制网站/XHTTP连接池的空闲时间。
+- **什么时候用：** 需要调整“上游空闲连接回收”而不是修改节点凭据时。
+- **操作步骤：** 打开该项，查看保存的当前值和允许范围；按提示选择开关或输入新数值，确认前先看配置差异。空闲上游连接的回收时间；过长会占用连接槽位。
+- **操作结果：** 保存值与实际生效值可能不同；按计划应用后再核对运行状态。
+- **要求与风险：** 1～60秒；旧Nginx低于1.15.3时使用模块默认；会修改配置或服务；无需求时可直接取消。
+- **菜单路径：** 主菜单 → 5. Nginx 高级配置 → 6. 连接复用和压缩 → 3. 上游空闲连接回收
+
+</details>
+
+<details class="menu-item">
+<summary><strong>4. 网站压缩级别</strong> — 轻量文本gzip强度。</summary>
+
+- **作用：** 轻量文本gzip强度。
+- **什么时候用：** 需要调整“网站压缩级别”而不是修改节点凭据时。
+- **操作步骤：** 打开该项，查看保存的当前值和允许范围；按提示选择开关或输入新数值，确认前先看配置差异。网站文本gzip压缩等级；等级越大可能消耗更多CPU。
+- **操作结果：** 保存值与实际生效值可能不同；按计划应用后再核对运行状态。
+- **要求与风险：** 1～5；仅实际启用gzip的位置生效；会修改配置或服务；无需求时可直接取消。
+- **菜单路径：** 主菜单 → 5. Nginx 高级配置 → 6. 连接复用和压缩 → 4. 网站压缩级别
+
+</details>
+
+<details class="menu-item">
+<summary><strong>5. 应用网站压缩</strong> — 独立控制普通反向代理响应gzip。</summary>
+
+- **作用：** 独立控制普通反向代理响应gzip。
+- **什么时候用：** 需要调整“应用网站压缩”而不是修改节点凭据时。
+- **操作步骤：** 打开该项，查看保存的当前值和允许范围；按提示选择开关或输入新数值，确认前先看配置差异。普通HTTP应用反向代理响应压缩，不对节点代理流量套用。
+- **操作结果：** 保存值与实际生效值可能不同；按计划应用后再核对运行状态。
+- **要求与风险：** 默认关闭；敏感动态页面需评估压缩侧信道风险；修改前建议查看配置计划；可能影响运行中的连接。
+- **菜单路径：** 主菜单 → 5. Nginx 高级配置 → 6. 连接复用和压缩 → 5. 应用网站压缩
+
+</details>
+
+<details class="menu-item">
+<summary><strong>6. 静态网站 gzip</strong> — 启停轻量文本压缩，不压缩节点代理流量。</summary>
+
+- **作用：** 启停轻量文本压缩，不压缩节点代理流量。
+- **什么时候用：** 需要执行“静态网站 gzip”而不是只查看状态时。
+- **操作步骤：** 选择全局静态站gzip开启或关闭，确认后应用；节点代理流量不会因开启网站gzip而自动压缩。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** Nginx 已安装；站点单独设置可覆盖全局值；会修改配置或服务；无需求时可直接取消。
+- **菜单路径：** 主菜单 → 5. Nginx 高级配置 → 6. 连接复用和压缩 → 6. 静态网站 gzip
+
+</details>
+
+<details class="menu-item">
+<summary><strong>7. 静态缓存与 gzip</strong> — 设置静态资源缓存头和站点压缩。</summary>
+
+- **作用：** 设置静态资源缓存头和站点压缩。
+- **什么时候用：** 需要执行“静态缓存与 gzip”而不是只查看状态时。
+- **操作步骤：** 先按编号选网站，再设置静态缓存时间和文本gzip；个性化页面、登录页和代理路径不应缓存。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 不强制缓存HTML/动态应用/节点流量；会修改配置或服务；无需求时可直接取消。
+- **菜单路径：** 主菜单 → 5. Nginx 高级配置 → 6. 连接复用和压缩 → 7. 静态缓存与 gzip
+
+</details>
+
+<details class="menu-item">
+<summary><strong>8. 普通网站上传上限</strong> — 限制普通站点单请求体大小。</summary>
+
+- **作用：** 限制普通站点单请求体大小。
+- **什么时候用：** 需要调整“普通网站上传上限”而不是修改节点凭据时。
+- **操作步骤：** 打开该项，查看保存的当前值和允许范围；按提示选择开关或输入新数值，确认前先看配置差异。普通网站请求体的最大MiB限制；不要误认为XHTTP上行的限制。
+- **操作结果：** 保存值与实际生效值可能不同；按计划应用后再核对运行状态。
+- **要求与风险：** 1–4096 MiB；XHTTP节点不套用此限制；会修改配置或服务；无需求时可直接取消。
+- **菜单路径：** 主菜单 → 5. Nginx 高级配置 → 6. 连接复用和压缩 → 8. 普通网站上传上限
+
+</details>
+
+<details class="menu-item">
+<summary><strong>0. 返回上一级</strong> — 不修改配置。</summary>
+
+- **作用：** 不修改配置。
+- **什么时候用：** 看完当前菜单或想取消本次未提交输入时。
+- **操作步骤：** 输入0返回上一层；不保存当前尚未确认的输入。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 已提交的配置保留；返回上一级；已保存的设置不回退。
+- **菜单路径：** 主菜单 → 5. Nginx 高级配置 → 6. 连接复用和压缩 → 0. 返回上一级
+
+</details>
+
+</details>
+
+</details>
+
+<details id="xray">
+<summary><strong>6. Xray 高级配置</strong> — 空闲回收 · 缓冲 · 协议</summary>
+
+### 什么参数最有用？
+
+- **空闲回收（`conn_idle`）**：双向无数据会话的回收时间，不是所有连接的总寿命。过短可能让闲置会话频繁重新建连，过长会占用更多资源。
+- **缓冲 `buffer_kb`**：连接内部缓冲预算，不能简单认为越大越快；小内存 VPS 建议先用均衡预设。
+- **文件描述符**：与进程连接容量关联；如果没有 FD 耗尽证据，单纯提高上限不会让单连接更快。
+- **协议版本**：新增扩展协议前先核对已安装 Xray 的功能和客户端支持，不要用“最新版本”代替兼容测试。
+
+```bash
+sudo vpskit node protocols
+sudo vpskit components latest-xray
+sudo vpskit advanced show
+sudo vpskit advanced set xray.conn_idle 600
+sudo vpskit config check
+sudo vpskit config plan
+```
+
+> 协议配置和策略真正发生变化时，可能重启 Xray；尽量将多处改动合并提交。
+
+### 此模块的完整菜单索引
+
+<details class="menu-group">
+<summary><strong>xray</strong>：10 个功能（逐项展开查看操作方法）</summary>
+
+> **所在目录：** 6. Xray 高级配置
+
+<details class="menu-item">
+<summary><strong>1. Xray空闲与缓冲</strong> — 编号选择缓冲，设置双向空闲上限。</summary>
+
+- **作用：** 编号选择缓冲，设置双向空闲上限。
+- **什么时候用：** 需要执行“Xray空闲与缓冲”而不是只查看状态时。
+- **操作步骤：** 查看并编辑Xray的connIdle、握手时间、缓冲预算等参数；小内存先从balanced开始，修改后可能重启同实例全部节点。
+- **操作结果：** 保存值与实际生效值可能不同；按计划应用后再核对运行状态。
+- **要求与风险：** 修改需要重启Xray；缓冲不是TCP窗口；修改前建议查看配置计划；可能影响运行中的连接。
+- **命令示例：** `sudo vpskit performance xray`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 6. Xray 高级配置 → 1. Xray空闲与缓冲
+
+</details>
+
+<details class="menu-item">
+<summary><strong>2. Xray 文件描述符上限</strong> — 调整Xray的systemd LimitNOFILE。</summary>
+
+- **作用：** 调整Xray的systemd LimitNOFILE。
+- **什么时候用：** 需要执行“Xray 文件描述符上限”而不是只查看状态时。
+- **操作步骤：** 填写Xray服务文件描述符上限，检查内核允许值；修改服务限制可能引起Xray重启。
+- **操作结果：** 保存值与实际生效值可能不同；按计划应用后再核对运行状态。
+- **要求与风险：** 变更后需重启Xray，代理连接可能中断；修改前建议查看配置计划；可能影响运行中的连接。
+- **菜单路径：** 主菜单 → 6. Xray 高级配置 → 2. Xray 文件描述符上限
+
+</details>
+
+<details class="menu-item">
+<summary><strong>3. 协议目录与核心版本</strong> — 列出协议、传输和使用要求。</summary>
+
+- **作用：** 列出协议、传输和使用要求。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 只读查看当前脚本可用协议、客户端/核心版本门槛及特殊网络要求；不要把“可生成模板”视为已验证实际互通。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只读；目录不等于端到端已验证；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit node protocols`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 6. Xray 高级配置 → 3. 协议目录与核心版本
+
+</details>
+
+<details class="menu-item">
+<summary><strong>4. 扩展节点与原生导入</strong> — 进入下级功能菜单，包含：协议目录与核心版本、创建扩展协议节点、查看原生节点、启用原生节点、停用原生节点等。</summary>
+
+- **作用：** 进入下级功能菜单，包含：协议目录与核心版本、创建扩展协议节点、查看原生节点、启用原生节点、停用原生节点等。
+- **什么时候用：** 需要集中管理“扩展节点与原生导入”相关操作时。
+- **操作步骤：** 在此项按序号进入下级菜单，先查看状态和用途，再选择具体操作；不需要输入长文本名称。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 查看当前状态后按序号选择；仅进入下级菜单；不会立刻修改系统。
+- **菜单路径：** 主菜单 → 6. Xray 高级配置 → 4. 扩展节点与原生导入
+
+</details>
+
+<details class="menu-item">
+<summary><strong>5. 候选配置检查</strong> — 生成并校验完整候选配置，不发布。</summary>
+
+- **作用：** 生成并校验完整候选配置，不发布。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 生成候选Xray与Nginx配置并执行语法/核心检查，但不发布配置；报错先修复，不要反复强制应用。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 共享模式递归检查静态include；无需重启；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit config check`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 6. Xray 高级配置 → 5. 候选配置检查
+
+</details>
+
+<details class="menu-item">
+<summary><strong>6. 脱敏差异摘要</strong> — 显示摘要与监听协议，不打印密钥。</summary>
+
+- **作用：** 显示摘要与监听协议，不打印密钥。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 查看本次配置与已应用配置的脱敏摘要及监听变化，不直接输出UUID/私钥全文。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 不直接输出原始Xray配置；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit config diff`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 6. Xray 高级配置 → 6. 脱敏差异摘要
+
+</details>
+
+<details class="menu-item">
+<summary><strong>7. 更新 Xray</strong> — 选择固定版本或显式 latest。</summary>
+
+- **作用：** 选择固定版本或显式 latest。
+- **什么时候用：** 需要执行“更新 Xray”而不是只查看状态时。
+- **操作步骤：** 查看当前及候选Xray版本、客户端兼容性，确认后更新核心；二进制替换或重启会影响全部启用节点。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 需联网；重启会中断代理连接，先核对客户端兼容性；会修改配置或服务；无需求时可直接取消。
+- **命令示例：** `sudo vpskit update xray latest`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 6. Xray 高级配置 → 7. 更新 Xray
+
+</details>
+
+<details class="menu-item">
+<summary><strong>8. Xray 日志</strong> — 显示最近代理运行错误记录。</summary>
+
+- **作用：** 显示最近代理运行错误记录。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 读取Xray错误日志末尾，核对核心启动、入站监听和客户端握手错误；不要公开含端点信息的日志。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只读；分享前脱敏；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit logs xray 100`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 6. Xray 高级配置 → 8. Xray 日志
+
+</details>
+
+<details class="menu-item">
+<summary><strong>9. Xray错误日志级别</strong> — 按编号选择warning/error/none。</summary>
+
+- **作用：** 按编号选择warning/error/none。
+- **什么时候用：** 需要执行“Xray错误日志级别”而不是只查看状态时。
+- **操作步骤：** 按编号选Xray错误日志级别，通常保持warning；调试完恢复低日志级别以减少写入。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 关闭错误日志将减少诊断线索；需要应用配置；修改前建议查看配置计划；可能影响运行中的连接。
+- **菜单路径：** 主菜单 → 6. Xray 高级配置 → 9. Xray错误日志级别
+
+</details>
+
+<details class="menu-item">
+<summary><strong>0. 返回上一级</strong> — 不修改配置。</summary>
+
+- **作用：** 不修改配置。
+- **什么时候用：** 看完当前菜单或想取消本次未提交输入时。
+- **操作步骤：** 输入0返回上一层；不保存当前尚未确认的输入。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 已提交的配置保留；返回上一级；已保存的设置不回退。
+- **菜单路径：** 主菜单 → 6. Xray 高级配置 → 0. 返回上一级
+
+</details>
+
+</details>
+
+</details>
+
+<details id="network">
+<summary><strong>7. 网络与防火墙</strong> — 端口 · BBR · UDP · SSH</summary>
+
+### 端口检测与防火墙是两回事
+
+**端口空闲**：当前没有其他进程占用该地址/协议/端口；**本地放行**：UFW 或 firewalld 允许进入；**公网可达**：还需要云服务商安全组、路由、运营商网络允许。只满足其中一项不代表可连接。
+
+新建时 `ports suggest` 会排除传统/原生/停用节点占用、TCP/UDP 绑定和 SSH 保护端口。选定后仍需正式绑定核验，不会主动杀掉其他应用。
+
+### 建议流程
+
+1. `ports show` 查看进程占用和本项目所需规则。
+2. `ports suggest` 生成候选；不确定时先用自动推荐。
+3. 节点创建成功后 `firewall status` 和 `firewall sync`，明确确认放行项目需要的端口。
+4. 在 Vultr 等云控制台核对相同 TCP/UDP 规则。Hysteria2/MASQUE H3 要确认 UDP。
+5. BBR 需要内核提供支持；开启前检查当前拥塞控制，最好同线路对比，不保证必然提速。
+
+```bash
+sudo vpskit ports show
+sudo vpskit ports suggest
+sudo vpskit firewall status
+sudo vpskit firewall sync
+sudo vpskit optimize status
+```
+
+> 脚本不会自动修改 SSH 规则、云平台安全组，不会直接接管系统所有防火墙规则。
+
+### 此模块的完整菜单索引
+
+<details class="menu-group">
+<summary><strong>network</strong>：9 个功能（逐项展开查看操作方法）</summary>
+
+> **所在目录：** 7. 网络与防火墙
+
+<details class="menu-item">
+<summary><strong>1. 资源与网络现状</strong> — 查看内存、连接、拥塞控制和网卡 MTU。</summary>
+
+- **作用：** 查看内存、连接、拥塞控制和网卡 MTU。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 查看内存、连接、拥塞控制和网卡MTU现值；这是只读测量，不会直接调高TCP缓冲或修改网卡。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只读；不会修改系统参数；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit optimize status`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 7. 网络与防火墙 → 1. 资源与网络现状
+
+</details>
+
+<details class="menu-item">
+<summary><strong>2. BBR 与MTU探测</strong> — 进入下级功能菜单，包含：资源与网络现状、启用 BBR + fq、撤销本工具 BBR 设置、MTU 路径探测、</summary>
+
+- **作用：** 进入下级功能菜单，包含：资源与网络现状、启用 BBR + fq、撤销本工具 BBR 设置、MTU 路径探测、静态网站 gzip等。
+- **什么时候用：** 需要集中管理“BBR 与MTU探测”相关操作时。
+- **操作步骤：** 在此项按序号进入下级菜单，先查看状态和用途，再选择具体操作；不需要输入长文本名称。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 查看当前状态后按序号选择；仅进入下级菜单；不会立刻修改系统。
+- **菜单路径：** 主菜单 → 7. 网络与防火墙 → 2. BBR 与MTU探测
+
+</details>
+
+<details class="menu-item">
+<summary><strong>3. 防火墙控制</strong> — 进入下级功能菜单，包含：防火墙与所需端口、开放端口、关闭端口、同步当前所需端口、撤销本版托管规则等。</summary>
+
+- **作用：** 进入下级功能菜单，包含：防火墙与所需端口、开放端口、关闭端口、同步当前所需端口、撤销本版托管规则等。
+- **什么时候用：** 需要集中管理“防火墙控制”相关操作时。
+- **操作步骤：** 在此项按序号进入下级菜单，先查看状态和用途，再选择具体操作；不需要输入长文本名称。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 查看当前状态后按序号选择；仅进入下级菜单；不会立刻修改系统。
+- **菜单路径：** 主菜单 → 7. 网络与防火墙 → 3. 防火墙控制
+
+</details>
+
+<details class="menu-item">
+<summary><strong>4. DNS 与公网 HTTPS 检查</strong> — 检查网站解析和公网响应，不修改 DNS。</summary>
+
+- **作用：** 检查网站解析和公网响应，不修改 DNS。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 对登记的网站/DNS/HTTPS执行有限联网核对，查区分DNS、防火墙、证书和应用故障；只读，不改云安全组。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 需网络；Cloudflare解析不必等于源站IP；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit network-check`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 7. 网络与防火墙 → 4. DNS 与公网 HTTPS 检查
+
+</details>
+
+<details class="menu-item">
+<summary><strong>5. 同步当前所需端口</strong> — 预览后开放网站及启用节点需要的公网端口。</summary>
+
+- **作用：** 预览后开放网站及启用节点需要的公网端口。
+- **什么时候用：** 需要执行“同步当前所需端口”而不是只查看状态时。
+- **操作步骤：** 脚本列出已启用节点及网站的公网TCP/UDP端口；选择本机防火墙后核对并明确确认新增规则。云厂商安全组需另行检查。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 不会开放本机后端端口；不会自动关闭旧端口；会修改配置或服务；无需求时可直接取消。
+- **命令示例：** `sudo vpskit firewall sync`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 7. 网络与防火墙 → 5. 同步当前所需端口
+
+</details>
+
+<details class="menu-item">
+<summary><strong>6. 网卡流量采样</strong> — 显示网卡累计流量和约1秒速率。</summary>
+
+- **作用：** 显示网卡累计流量和约1秒速率。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 只读采样网卡收发量，用于粗略判断流量变化；不是按用户、协议精确计费。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 为接口总流量，不是节点计费统计；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit edge traffic`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 7. 网络与防火墙 → 6. 网卡流量采样
+
+</details>
+
+<details class="menu-item">
+<summary><strong>7. 节点监听总览</strong> — TCP/UDP端口和启用状态分开显示。</summary>
+
+- **作用：** TCP/UDP端口和启用状态分开显示。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 读取传统及扩展节点的统一编号、协议、端口和启用状态；要批量启停时使用此表的统一编号，不能拿单独列表编号代替。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只在本机读取，不自动开放端口；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit node overview`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 7. 网络与防火墙 → 7. 节点监听总览
+
+</details>
+
+<details class="menu-item">
+<summary><strong>0. 返回上一级</strong> — 不修改配置。</summary>
+
+- **作用：** 不修改配置。
+- **什么时候用：** 看完当前菜单或想取消本次未提交输入时。
+- **操作步骤：** 输入0返回上一层；不保存当前尚未确认的输入。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 已提交的配置保留；返回上一级；已保存的设置不回退。
+- **菜单路径：** 主菜单 → 7. 网络与防火墙 → 0. 返回上一级
+
+</details>
+
+<details class="menu-item">
+<summary><strong>9. 智能端口推荐</strong> — 一次采样，排除传统/原生/停用/SSH及占用端口。</summary>
+
+- **作用：** 一次采样，排除传统/原生/停用/SSH及占用端口。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 按TCP/UDP、IPv4/IPv6及已停用配置占用情况推荐未冲突端口；最终应用时会再次验证，不能保证外部防火墙放行。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只推荐，不抢占进程，不自动开放端口；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit ports suggest`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 7. 网络与防火墙 → 9. 智能端口推荐
+
+</details>
+
+</details>
+
+<details class="menu-group">
+<summary><strong>optimize</strong>：8 个功能（逐项展开查看操作方法）</summary>
+
+> **所在目录：** 7. 网络与防火墙 → 2. BBR 与MTU探测
+
+<details class="menu-item">
+<summary><strong>1. 资源与网络现状</strong> — 查看内存、连接、拥塞控制和网卡 MTU。</summary>
+
+- **作用：** 查看内存、连接、拥塞控制和网卡 MTU。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 查看内存、连接、拥塞控制和网卡MTU现值；这是只读测量，不会直接调高TCP缓冲或修改网卡。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只读；不会修改系统参数；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit optimize status`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 7. 网络与防火墙 → 2. BBR 与MTU探测 → 1. 资源与网络现状
+
+</details>
+
+<details class="menu-item">
+<summary><strong>2. 启用 BBR + fq</strong> — 记录旧参数后启用内核拥塞控制。</summary>
+
+- **作用：** 记录旧参数后启用内核拥塞控制。
+- **什么时候用：** 需要执行“启用 BBR + fq”而不是只查看状态时。
+- **操作步骤：** 先核对内核是否支持BBR与当前qdisc，确认后记录原值并设置BBR+fq；实际效果需同线路实测。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 需内核提供 BBR；不保证提升所有链路性能；修改前建议查看配置计划；可能影响运行中的连接。
+- **命令示例：** `sudo vpskit optimize bbr`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 7. 网络与防火墙 → 2. BBR 与MTU探测 → 2. 启用 BBR + fq
+
+</details>
+
+<details class="menu-item">
+<summary><strong>3. 撤销本工具 BBR 设置</strong> — 恢复本工具记录的旧值并移除其持久化文件。</summary>
+
+- **作用：** 恢复本工具记录的旧值并移除其持久化文件。
+- **什么时候用：** 需要执行“撤销本工具 BBR 设置”而不是只查看状态时。
+- **操作步骤：** 仅撤销由VPSKit登记且可验证的BBR参数，不覆盖后来由外部程序修改的内核值。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 只撤销可验证的托管设置；不覆盖外部新改动；修改前建议查看配置计划；可能影响运行中的连接。
+- **命令示例：** `sudo vpskit optimize restore`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 7. 网络与防火墙 → 2. BBR 与MTU探测 → 3. 撤销本工具 BBR 设置
+
+</details>
+
+<details class="menu-item">
+<summary><strong>4. MTU 路径探测</strong> — 使用 tracepath 检查目标路径的 MTU。</summary>
+
+- **作用：** 使用 tracepath 检查目标路径的 MTU。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 输入要检查的目标IP/域名，用tracepath等工具探测路径MTU；只探测不直接更改网卡MTU。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 需 iputils-tracepath；只发送探测，不修改网卡；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit optimize mtu`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 7. 网络与防火墙 → 2. BBR 与MTU探测 → 4. MTU 路径探测
+
+</details>
+
+<details class="menu-item">
+<summary><strong>5. 静态网站 gzip</strong> — 启停轻量文本压缩，不压缩节点代理流量。</summary>
+
+- **作用：** 启停轻量文本压缩，不压缩节点代理流量。
+- **什么时候用：** 需要执行“静态网站 gzip”而不是只查看状态时。
+- **操作步骤：** 选择全局静态站gzip开启或关闭，确认后应用；节点代理流量不会因开启网站gzip而自动压缩。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** Nginx 已安装；站点单独设置可覆盖全局值；会修改配置或服务；无需求时可直接取消。
+- **菜单路径：** 主菜单 → 7. 网络与防火墙 → 2. BBR 与MTU探测 → 5. 静态网站 gzip
+
+</details>
+
+<details class="menu-item">
+<summary><strong>6. Worker / 连接数 / 文件数</strong> — 一起调整并发容量，防止参数互相冲突。</summary>
+
+- **作用：** 一起调整并发容量，防止参数互相冲突。
+- **什么时候用：** 需要执行“Worker / 连接数 / 文件数”而不是只查看状态时。
+- **操作步骤：** 一次调整Worker、每Worker连接数及nofile预算，避免单项临时冲突；共享模式影响其他网站的全局值需走独立授权。
+- **操作结果：** 保存值与实际生效值可能不同；按计划应用后再核对运行状态。
+- **要求与风险：** 仅独立模式；共享全局参数从单独授权入口调整；会修改配置或服务；无需求时可直接取消。
+- **菜单路径：** 主菜单 → 7. 网络与防火墙 → 2. BBR 与MTU探测 → 6. Worker / 连接数 / 文件数
+
+</details>
+
+<details class="menu-item">
+<summary><strong>7. 资源预设</strong> — 进入下级功能菜单，包含：资源预算与建议、预设差异预览、选择资源预设、当前资源策略、应用前差异预览等。</summary>
+
+- **作用：** 进入下级功能菜单，包含：资源预算与建议、预设差异预览、选择资源预设、当前资源策略、应用前差异预览等。
+- **什么时候用：** 需要集中管理“资源预设”相关操作时。
+- **操作步骤：** 在此项按序号进入下级菜单，先查看状态和用途，再选择具体操作；不需要输入长文本名称。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 查看当前状态后按序号选择；仅进入下级菜单；不会立刻修改系统。
+- **菜单路径：** 主菜单 → 7. 网络与防火墙 → 2. BBR 与MTU探测 → 7. 资源预设
+
+</details>
+
+<details class="menu-item">
+<summary><strong>0. 返回上一级</strong> — 不修改配置。</summary>
+
+- **作用：** 不修改配置。
+- **什么时候用：** 看完当前菜单或想取消本次未提交输入时。
+- **操作步骤：** 输入0返回上一层；不保存当前尚未确认的输入。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 已提交的配置保留；返回上一级；已保存的设置不回退。
+- **菜单路径：** 主菜单 → 7. 网络与防火墙 → 2. BBR 与MTU探测 → 0. 返回上一级
+
+</details>
+
+</details>
+
+<details class="menu-group">
+<summary><strong>firewall</strong>：7 个功能（逐项展开查看操作方法）</summary>
+
+> **所在目录：** 7. 网络与防火墙 → 3. 防火墙控制
+
+<details class="menu-item">
+<summary><strong>1. 防火墙与所需端口</strong> — 查看启用的管理器、规则和节点公网端口。</summary>
+
+- **作用：** 查看启用的管理器、规则和节点公网端口。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 查看UFW或firewalld的当前状态、VPSKit需要的公网端口和受保护SSH端口；本机规则不代表云安全组已放行。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只读；云安全组需另行检查；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit firewall status`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 7. 网络与防火墙 → 3. 防火墙控制 → 1. 防火墙与所需端口
+
+</details>
+
+<details class="menu-item">
+<summary><strong>2. 开放端口</strong> — 显式添加带归属记录的 TCP/UDP 放行规则。</summary>
+
+- **作用：** 显式添加带归属记录的 TCP/UDP 放行规则。
+- **什么时候用：** 需要执行“开放端口”而不是只查看状态时。
+- **操作步骤：** 从建议端口或手工端口选择TCP/UDP及防火墙区域，确认添加放行；不修改云平台规则。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 仅已启用的 UFW/firewalld；SSH 端口交给管理员；修改前建议查看配置计划；可能影响运行中的连接。
+- **命令示例：** `sudo vpskit firewall open`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 7. 网络与防火墙 → 3. 防火墙控制 → 2. 开放端口
+
+</details>
+
+<details class="menu-item">
+<summary><strong>3. 关闭端口</strong> — 添加阻止新入站连接的规则。</summary>
+
+- **作用：** 添加阻止新入站连接的规则。
+- **什么时候用：** 明确需要“关闭端口”且已确认备份和影响时。
+- **操作步骤：** 指定端口与协议并核对是否涉及SSH和其他业务后，确认添加拒绝规则；不自动关闭外部端口。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 会影响相关业务；拒绝操作检测到的 SSH 端口；高风险：确认备份、外部依赖和停机影响后执行。
+- **命令示例：** `sudo vpskit firewall close`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 7. 网络与防火墙 → 3. 防火墙控制 → 3. 关闭端口
+
+</details>
+
+<details class="menu-item">
+<summary><strong>4. 同步当前所需端口</strong> — 预览后开放网站及启用节点需要的公网端口。</summary>
+
+- **作用：** 预览后开放网站及启用节点需要的公网端口。
+- **什么时候用：** 需要执行“同步当前所需端口”而不是只查看状态时。
+- **操作步骤：** 脚本列出已启用节点及网站的公网TCP/UDP端口；选择本机防火墙后核对并明确确认新增规则。云厂商安全组需另行检查。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 不会开放本机后端端口；不会自动关闭旧端口；会修改配置或服务；无需求时可直接取消。
+- **命令示例：** `sudo vpskit firewall sync`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 7. 网络与防火墙 → 3. 防火墙控制 → 4. 同步当前所需端口
+
+</details>
+
+<details class="menu-item">
+<summary><strong>5. 撤销本版托管规则</strong> — 只撤销有本版归属记录、标识匹配的规则。</summary>
+
+- **作用：** 只撤销有本版归属记录、标识匹配的规则。
+- **什么时候用：** 明确需要“撤销本版托管规则”且已确认备份和影响时。
+- **操作步骤：** 列出本版托管的规则和归属标签，逐项确认撤销；不批量删除来源未知的系统规则。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 外部规则和旧格式记录不盲目删除；可能改变可达性；高风险：确认备份、外部依赖和停机影响后执行。
+- **命令示例：** `sudo vpskit firewall cleanup`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 7. 网络与防火墙 → 3. 防火墙控制 → 5. 撤销本版托管规则
+
+</details>
+
+<details class="menu-item">
+<summary><strong>0. 返回上一级</strong> — 不修改配置。</summary>
+
+- **作用：** 不修改配置。
+- **什么时候用：** 看完当前菜单或想取消本次未提交输入时。
+- **操作步骤：** 输入0返回上一层；不保存当前尚未确认的输入。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 已提交的配置保留；返回上一级；已保存的设置不回退。
+- **菜单路径：** 主菜单 → 7. 网络与防火墙 → 3. 防火墙控制 → 0. 返回上一级
+
+</details>
+
+<details class="menu-item">
+<summary><strong>7. 端口占用与防火墙核对</strong> — 合并查看TCP/UDP进程监听和项目规则状态。</summary>
+
+- **作用：** 合并查看TCP/UDP进程监听和项目规则状态。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 只读扫描当前TCP/UDP监听、VPSKit预期端口和本机防火墙现状；端口未被占用不代表公网已开放。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只读；本机监听不等于公网可达；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit ports show`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 7. 网络与防火墙 → 3. 防火墙控制 → 7. 端口占用与防火墙核对
+
+</details>
+
+</details>
+
+</details>
+
+<details id="edge">
+<summary><strong>8. Cloudflare 与网站防护</strong> — 回源 · AOP · 限流</summary>
+
+### 主要功能
+
+提供 Cloudflare 官方 IP 来源维护、真实访客 IP、只允许 CDN 回源、AOP 客户端证书检查、请求/并发/下载限额、爬虫 UA 规则与静态缓存。
+
+### 先后顺序
+
+1. 确认网站 DNS、Cloudflare SSL/TLS 模式和有效源站证书。
+2. `edge status` / `edge show` 查看现有状态；先读指南再选防护预设。
+3. 启用“只允许 Cloudflare 回源”或 AOP 强制前，先测试官方网段和回源证书配置，防止自己锁死源站。
+4. WS/XHTTP 代理路径不应该被当成普通网站 HTML 缓存；Hysteria2 等 UDP 直连不适用于一般橙云 HTTP 反向代理。
+
+```bash
+sudo vpskit edge status
+sudo vpskit edge guide
+sudo vpskit edge refresh
+sudo vpskit edge show
+```
+
+> 防护可以提高源站隔离性，但设置错误可能导致 403/525/526 或连接失败。先观察，再逐项启用。
+
+### 此模块的完整菜单索引
+
+<details class="menu-group">
+<summary><strong>edge</strong>：14 个功能（逐项展开查看操作方法）</summary>
+
+> **所在目录：** 8. Cloudflare 与网站防护
+
+<details class="menu-item">
+<summary><strong>1. 查看网站防护</strong> — 查看各站爬虫、限额、缓存及回源设置。</summary>
+
+- **作用：** 查看各站爬虫、限额、缓存及回源设置。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 查看已登记站点的Cloudflare来源、限流、缓存和AOP状态，选定需要进一步调整的站点。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只读；不显示节点凭据；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit edge status`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 8. Cloudflare 与网站防护 → 1. 查看网站防护
+
+</details>
+
+<details class="menu-item">
+<summary><strong>2. 应用均衡预设</strong> — AI爬虫拦截、5请求/秒、20并发、1小时缓存与gzip。</summary>
+
+- **作用：** AI爬虫拦截、5请求/秒、20并发、1小时缓存与gzip。
+- **什么时候用：** 需要执行“应用均衡预设”而不是只查看状态时。
+- **操作步骤：** 为站点选择一组均衡防护预设，预览限速与缓存影响后应用；不要把代理连接当成普通静态页面。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 仅网站内容；不主动开启源站封锁或强制AOP；会修改配置或服务；无需求时可直接取消。
+- **菜单路径：** 主菜单 → 8. Cloudflare 与网站防护 → 2. 应用均衡预设
+
+</details>
+
+<details class="menu-item">
+<summary><strong>3. 爬虫策略</strong> — 选择 off、ai、common、all 的 UA 拦截。</summary>
+
+- **作用：** 选择 off、ai、common、all 的 UA 拦截。
+- **什么时候用：** 需要执行“爬虫策略”而不是只查看状态时。
+- **操作步骤：** 选择单站并设置简单爬虫检测规则，确认允许/限制范围；误判时可以恢复预设。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** UA可伪造；all会影响搜索引擎、API及监控；修改前建议查看配置计划；可能影响运行中的连接。
+- **菜单路径：** 主菜单 → 8. Cloudflare 与网站防护 → 3. 爬虫策略
+
+</details>
+
+<details class="menu-item">
+<summary><strong>4. 请求、并发和下载限额</strong> — 调整请求频率、突发、并发及每响应速度。</summary>
+
+- **作用：** 调整请求频率、突发、并发及每响应速度。
+- **什么时候用：** 需要执行“请求、并发和下载限额”而不是只查看状态时。
+- **操作步骤：** 设置单站请求速率、并发限制与下载限额；从保守值测试，过严可能影响正常用户。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 同出口IP共享额度；不是全机或代理用户带宽配额；会修改配置或服务；无需求时可直接取消。
+- **菜单路径：** 主菜单 → 8. Cloudflare 与网站防护 → 4. 请求、并发和下载限额
+
+</details>
+
+<details class="menu-item">
+<summary><strong>5. 静态缓存与 gzip</strong> — 设置静态资源缓存头和站点压缩。</summary>
+
+- **作用：** 设置静态资源缓存头和站点压缩。
+- **什么时候用：** 需要执行“静态缓存与 gzip”而不是只查看状态时。
+- **操作步骤：** 先按编号选网站，再设置静态缓存时间和文本gzip；个性化页面、登录页和代理路径不应缓存。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 不强制缓存HTML/动态应用/节点流量；会修改配置或服务；无需求时可直接取消。
+- **菜单路径：** 主菜单 → 8. Cloudflare 与网站防护 → 5. 静态缓存与 gzip
+
+</details>
+
+<details class="menu-item">
+<summary><strong>6. 限制 Cloudflare 回源</strong> — 仅允许已验证的 Cloudflare 网段访问网站/网关。</summary>
+
+- **作用：** 仅允许已验证的 Cloudflare 网段访问网站/网关。
+- **什么时候用：** 需要执行“限制 Cloudflare 回源”而不是只查看状态时。
+- **操作步骤：** 选择站点启用或关闭Cloudflare回源网段限制；先确认DNS代理模式及备用直连管理方式。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 需要橙云；直连将被拒绝，ACME路径保留；修改前建议查看配置计划；可能影响运行中的连接。
+- **菜单路径：** 主菜单 → 8. Cloudflare 与网站防护 → 6. 限制 Cloudflare 回源
+
+</details>
+
+<details class="menu-item">
+<summary><strong>7. AOP 回源客户端证书</strong> — 切换 off、observe、enforce。</summary>
+
+- **作用：** 切换 off、observe、enforce。
+- **什么时候用：** 需要执行“AOP 回源客户端证书”而不是只查看状态时。
+- **操作步骤：** 配置Cloudflare Authenticated Origin Pulls相关CA和验证模式；建议先观察再强制，避免锁死源站访问。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 先观察并探测成功，再强制；误配会中断访问；修改前建议查看配置计划；可能影响运行中的连接。
+- **菜单路径：** 主菜单 → 8. Cloudflare 与网站防护 → 7. AOP 回源客户端证书
+
+</details>
+
+<details class="menu-item">
+<summary><strong>8. AOP 公网验证</strong> — 通过公开域名检查本次回源是否为 SUCCESS。</summary>
+
+- **作用：** 通过公开域名检查本次回源是否为 SUCCESS。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 执行受控回源验证，确认是否按预期校验客户端证书；成功不代表全部全球节点均可访问。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 域名已走橙云；源站须有有效证书且启用observe；只读操作；不主动写入运行配置。
+- **菜单路径：** 主菜单 → 8. Cloudflare 与网站防护 → 8. AOP 公网验证
+
+</details>
+
+<details class="menu-item">
+<summary><strong>9. 更新 Cloudflare 官方资料</strong> — 刷新IPv4/IPv6网段与公共AOP CA。</summary>
+
+- **作用：** 刷新IPv4/IPv6网段与公共AOP CA。
+- **什么时候用：** 需要执行“更新 Cloudflare 官方资料”而不是只查看状态时。
+- **操作步骤：** 从Cloudflare官方来源更新可识别网段资料，核对内容后应用；不会自动开启新的回源限制。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 需联网；失败保留旧资料；会修改配置或服务；无需求时可直接取消。
+- **命令示例：** `sudo vpskit edge refresh`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 8. Cloudflare 与网站防护 → 9. 更新 Cloudflare 官方资料
+
+</details>
+
+<details class="menu-item">
+<summary><strong>10. Cloudflare 配置指引</strong> — 输出控制台设置和节点路径缓存排除原则。</summary>
+
+- **作用：** 输出控制台设置和节点路径缓存排除原则。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 阅读Cloudflare橙云、严格TLS、缓存排除和AOP的分步说明，再到Cloudflare控制台完成外部设置。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只提供指引，不自动修改外部账户；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit edge guide`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 8. Cloudflare 与网站防护 → 10. Cloudflare 配置指引
+
+</details>
+
+<details class="menu-item">
+<summary><strong>11. 网卡流量采样</strong> — 显示网卡累计流量和约1秒速率。</summary>
+
+- **作用：** 显示网卡累计流量和约1秒速率。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 只读采样网卡收发量，用于粗略判断流量变化；不是按用户、协议精确计费。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 为接口总流量，不是节点计费统计；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit edge traffic`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 8. Cloudflare 与网站防护 → 11. 网卡流量采样
+
+</details>
+
+<details class="menu-item">
+<summary><strong>12. 重置单站防护</strong> — 关闭该站新增爬虫、限流、缓存及回源限制。</summary>
+
+- **作用：** 关闭该站新增爬虫、限流、缓存及回源限制。
+- **什么时候用：** 需要执行“重置单站防护”而不是只查看状态时。
+- **操作步骤：** 对选中的单个站点恢复默认防护参数，不删除网站或证书；先检查会改哪些缓存/限流设置。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 不删除网站、节点或证书；需确认；修改前建议查看配置计划；可能影响运行中的连接。
+- **菜单路径：** 主菜单 → 8. Cloudflare 与网站防护 → 12. 重置单站防护
+
+</details>
+
+<details class="menu-item">
+<summary><strong>13. 按字段编辑防护</strong> — 逐项编辑单站点防护参数。</summary>
+
+- **作用：** 逐项编辑单站点防护参数。
+- **什么时候用：** 需要执行“按字段编辑防护”而不是只查看状态时。
+- **操作步骤：** 选择站点和具体防护字段，仅编辑指定项，确认后预览配置；避免一次性全部重置。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 适用于了解参数范围的用户；保存前验证；会修改配置或服务；无需求时可直接取消。
+- **菜单路径：** 主菜单 → 8. Cloudflare 与网站防护 → 13. 按字段编辑防护
+
+</details>
+
+<details class="menu-item">
+<summary><strong>0. 返回上一级</strong> — 不修改配置。</summary>
+
+- **作用：** 不修改配置。
+- **什么时候用：** 看完当前菜单或想取消本次未提交输入时。
+- **操作步骤：** 输入0返回上一层；不保存当前尚未确认的输入。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 已提交的配置保留；返回上一级；已保存的设置不回退。
+- **菜单路径：** 主菜单 → 8. Cloudflare 与网站防护 → 0. 返回上一级
+
+</details>
+
+</details>
+
+</details>
+
+<details id="performance">
+<summary><strong>9. 性能与系统资源</strong> — 轻量预设 · Swap · 响应时间</summary>
+
+### 三种预设
+
+**eco**：小内存优先，空闲回收和连接池更保守；**balanced**：日常均衡；**throughput**：增加一些并发和缓冲预算，适用于有压测证据的场景。均不保证速度提升。
+
+先执行 `recommend` 获取建议，必须先用 `--plan` 对比参数及重启影响，再明确应用。共享模式不会擅自改系统 Nginx 的全局 Worker。
+
+```bash
+sudo vpskit performance recommend
+sudo vpskit performance profile balanced --plan
+sudo vpskit performance profile eco --plan
+sudo vpskit performance show
+sudo vpskit performance benchmark vip.moglider.com 3
+sudo vpskit swap status
+```
+
+> 有限内存的 VPS 可按需创建 Swap，但 Swap 不是新增物理内存，访问 Swap 时可能显著变慢。网站 benchmark 是少量请求耗时，不等于代理吞吐压测。
+
+### 此模块的完整菜单索引
+
+<details class="menu-group">
+<summary><strong>efficiency</strong>：12 个功能（逐项展开查看操作方法）</summary>
+
+> **所在目录：** 9. 性能与系统资源
+
+<details class="menu-item">
+<summary><strong>1. 资源预算与建议</strong> — 结合物理内存、可用量及cgroup上限给出建议。</summary>
+
+- **作用：** 结合物理内存、可用量及cgroup上限给出建议。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 读取CPU/内存/Swap与可见cgroup限制，输出eco/balanced/throughput建议；不自动修改配置。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只读；不按建议自动写配置；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit performance recommend`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 9. 性能与系统资源 → 1. 资源预算与建议
+
+</details>
+
+<details class="menu-item">
+<summary><strong>2. 预设差异预览</strong> — 显示当前值与目标值，以及预计服务动作。</summary>
+
+- **作用：** 显示当前值与目标值，以及预计服务动作。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 选择目标资源预设，只查看会变更的字段以及对应的重启/重载计划；不写入状态。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 需要可读配置；不保存、不重启；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit performance profile balanced --plan`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 9. 性能与系统资源 → 2. 预设差异预览
+
+</details>
+
+<details class="menu-item">
+<summary><strong>3. 选择资源预设</strong> — 节省资源、均衡或吞吐试验。</summary>
+
+- **作用：** 节省资源、均衡或吞吐试验。
+- **什么时候用：** 需要执行“选择资源预设”而不是只查看状态时。
+- **操作步骤：** 按编号选择eco、balanced、throughput，比较改动后确认保存；共享全局Worker不会随预设自动更改。
+- **操作结果：** 保存值与实际生效值可能不同；按计划应用后再核对运行状态。
+- **要求与风险：** 列出将覆盖的参数；确认后一次应用；修改前建议查看配置计划；可能影响运行中的连接。
+- **命令示例：** `sudo vpskit performance profile`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 9. 性能与系统资源 → 3. 选择资源预设
+
+</details>
+
+<details class="menu-item">
+<summary><strong>4. 当前资源策略</strong> — 显示保存的Nginx/Xray和日志设置。</summary>
+
+- **作用：** 显示保存的Nginx/Xray和日志设置。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 显示当前保存的资源预设、连接池、日志和缓冲值；需进一步用状态/doctor核对实际进程。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只读；不是进程内存硬上限；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit performance show`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 9. 性能与系统资源 → 4. 当前资源策略
+
+</details>
+
+<details class="menu-item">
+<summary><strong>5. 应用前差异预览</strong> — 比较配置/证书/程序和服务单元。</summary>
+
+- **作用：** 比较配置/证书/程序和服务单元。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 生成候选服务动作计划，阅读skip/reload/restart的原因；不要把计划视为已经实际应用。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 不启动测试实例，不重启/重载，不写状态；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit plan`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 9. 性能与系统资源 → 5. 应用前差异预览
+
+</details>
+
+<details class="menu-item">
+<summary><strong>6. Xray空闲与缓冲</strong> — 编号选择缓冲，设置双向空闲上限。</summary>
+
+- **作用：** 编号选择缓冲，设置双向空闲上限。
+- **什么时候用：** 需要执行“Xray空闲与缓冲”而不是只查看状态时。
+- **操作步骤：** 查看并编辑Xray的connIdle、握手时间、缓冲预算等参数；小内存先从balanced开始，修改后可能重启同实例全部节点。
+- **操作结果：** 保存值与实际生效值可能不同；按计划应用后再核对运行状态。
+- **要求与风险：** 修改需要重启Xray；缓冲不是TCP窗口；修改前建议查看配置计划；可能影响运行中的连接。
+- **命令示例：** `sudo vpskit performance xray`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 9. 性能与系统资源 → 6. Xray空闲与缓冲
+
+</details>
+
+<details class="menu-item">
+<summary><strong>7. 连接池与压缩</strong> — 进入下级功能菜单，包含：网站上游连接池、XHTTP上游连接池、上游空闲连接回收、网站压缩级别、应用网站压缩等</summary>
+
+- **作用：** 进入下级功能菜单，包含：网站上游连接池、XHTTP上游连接池、上游空闲连接回收、网站压缩级别、应用网站压缩等。
+- **什么时候用：** 需要集中管理“连接池与压缩”相关操作时。
+- **操作步骤：** 在此项按序号进入下级菜单，先查看状态和用途，再选择具体操作；不需要输入长文本名称。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 查看当前状态后按序号选择；仅进入下级菜单；不会立刻修改系统。
+- **菜单路径：** 主菜单 → 9. 性能与系统资源 → 7. 连接池与压缩
+
+</details>
+
+<details class="menu-item">
+<summary><strong>8. 轻量日志设置</strong> — 进入下级功能菜单，包含：网站轻量性能日志、日志保留阈值、立即检查日志大小、网站访问日志开关、代理路径访问日志</summary>
+
+- **作用：** 进入下级功能菜单，包含：网站轻量性能日志、日志保留阈值、立即检查日志大小、网站访问日志开关、代理路径访问日志等。
+- **什么时候用：** 需要集中管理“轻量日志设置”相关操作时。
+- **操作步骤：** 在此项按序号进入下级菜单，先查看状态和用途，再选择具体操作；不需要输入长文本名称。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 查看当前状态后按序号选择；仅进入下级菜单；不会立刻修改系统。
+- **菜单路径：** 主菜单 → 9. 性能与系统资源 → 8. 轻量日志设置
+
+</details>
+
+<details class="menu-item">
+<summary><strong>9. Swap 管理</strong> — 进入下级功能菜单，包含：Swap 状态、启用 / 恢复 1 GiB Swap、自定义容量、安全移除本工具 S</summary>
+
+- **作用：** 进入下级功能菜单，包含：Swap 状态、启用 / 恢复 1 GiB Swap、自定义容量、安全移除本工具 Swap。
+- **什么时候用：** 需要集中管理“Swap 管理”相关操作时。
+- **操作步骤：** 在此项按序号进入下级菜单，先查看状态和用途，再选择具体操作；不需要输入长文本名称。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 查看当前状态后按序号选择；仅进入下级菜单；不会立刻修改系统。
+- **菜单路径：** 主菜单 → 9. 性能与系统资源 → 9. Swap 管理
+
+</details>
+
+<details class="menu-item">
+<summary><strong>10. 网站响应分阶段检查</strong> — 按域名编号采样DNS/TCP/TLS/首字节/总时长。</summary>
+
+- **作用：** 按域名编号采样DNS/TCP/TLS/首字节/总时长。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 按项目登记域名选择首页，执行有限次HTTPS请求，比较DNS、TCP、TLS、首字节等累计时间；不会关闭证书校验。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 最多3次GET，不关闭TLS/AOP，不测速整条代理；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit performance benchmark`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 9. 性能与系统资源 → 10. 网站响应分阶段检查
+
+</details>
+
+<details class="menu-item">
+<summary><strong>11. 网卡流量采样</strong> — 显示网卡累计流量和约1秒速率。</summary>
+
+- **作用：** 显示网卡累计流量和约1秒速率。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 只读采样网卡收发量，用于粗略判断流量变化；不是按用户、协议精确计费。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 为接口总流量，不是节点计费统计；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit edge traffic`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 9. 性能与系统资源 → 11. 网卡流量采样
+
+</details>
+
+<details class="menu-item">
+<summary><strong>0. 返回上一级</strong> — 不修改配置。</summary>
+
+- **作用：** 不修改配置。
+- **什么时候用：** 看完当前菜单或想取消本次未提交输入时。
+- **操作步骤：** 输入0返回上一层；不保存当前尚未确认的输入。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 已提交的配置保留；返回上一级；已保存的设置不回退。
+- **菜单路径：** 主菜单 → 9. 性能与系统资源 → 0. 返回上一级
+
+</details>
+
+</details>
+
+<details class="menu-group">
+<summary><strong>swap</strong>：5 个功能（逐项展开查看操作方法）</summary>
+
+> **所在目录：** 9. 性能与系统资源 → 9. Swap 管理
+
+<details class="menu-item">
+<summary><strong>1. Swap 状态</strong> — 查看实际使用量、归属文件与启动配置。</summary>
+
+- **作用：** 查看实际使用量、归属文件与启动配置。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 查看系统Swap及VPSKit自有Swap占用；避免仅看磁盘文件存在就认定Swap已启用。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只读；不把磁盘交换区当成新增物理内存；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit swap status`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 9. 性能与系统资源 → 9. Swap 管理 → 1. Swap 状态
+
+</details>
+
+<details class="menu-item">
+<summary><strong>2. 启用 / 恢复 1 GiB Swap</strong> — 已有托管 Swap 则恢复，不重复分配。</summary>
+
+- **作用：** 已有托管 Swap 则恢复，不重复分配。
+- **什么时候用：** 需要执行“启用 / 恢复 1 GiB Swap”而不是只查看状态时。
+- **操作步骤：** 在确认磁盘和已有Swap状态后创建/恢复本项目1GiB Swap；小内存可缓解峰值，不等于提高CPU速度。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 新建需 ext4/XFS 等支持、足够磁盘及内核权限；修改前建议查看配置计划；可能影响运行中的连接。
+- **命令示例：** `sudo vpskit swap enable`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 9. 性能与系统资源 → 9. Swap 管理 → 2. 启用 / 恢复 1 GiB Swap
+
+</details>
+
+<details class="menu-item">
+<summary><strong>3. 自定义容量</strong> — 创建 256–8192 MiB 的托管交换文件。</summary>
+
+- **作用：** 创建 256–8192 MiB 的托管交换文件。
+- **什么时候用：** 需要执行“自定义容量”而不是只查看状态时。
+- **操作步骤：** 输入目标Swap大小，先核对可用磁盘及归属；修改时注意当前活动Swap不可直接删除。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 256 的倍数；预留至少1GiB磁盘，不覆盖现有Swap；修改前建议查看配置计划；可能影响运行中的连接。
+- **菜单路径：** 主菜单 → 9. 性能与系统资源 → 9. Swap 管理 → 3. 自定义容量
+
+</details>
+
+<details class="menu-item">
+<summary><strong>4. 安全移除本工具 Swap</strong> — 先检查可用内存，再停用并删除交换文件。</summary>
+
+- **作用：** 先检查可用内存，再停用并删除交换文件。
+- **什么时候用：** 明确需要“安全移除本工具 Swap”且已确认备份和影响时。
+- **操作步骤：** 确认当前Swap占用与其他Swap替代情况，安全停用并仅移除本工具登记的Swap文件。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 内存不足或 swapoff 失败时保留文件和启动配置；高风险：确认备份、外部依赖和停机影响后执行。
+- **命令示例：** `sudo vpskit swap remove`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 9. 性能与系统资源 → 9. Swap 管理 → 4. 安全移除本工具 Swap
+
+</details>
+
+<details class="menu-item">
+<summary><strong>0. 返回上一级</strong> — 不修改配置。</summary>
+
+- **作用：** 不修改配置。
+- **什么时候用：** 看完当前菜单或想取消本次未提交输入时。
+- **操作步骤：** 输入0返回上一层；不保存当前尚未确认的输入。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 已提交的配置保留；返回上一级；已保存的设置不回退。
+- **菜单路径：** 主菜单 → 9. 性能与系统资源 → 9. Swap 管理 → 0. 返回上一级
+
+</details>
+
+</details>
+
+</details>
+
+<details id="services">
+<summary><strong>10. 服务运行与重启</strong> — 启动 · Reload · 自启 · 系统重启</summary>
+
+### 先检查，再操作
+
+`service nginx reload` 用于经配置检查后平滑重载；`restart` 是完整重启，可能中断连接；`stop` 会停服务。共享模式操作系统 `nginx.service` 会影响其他网站。
+
+**`enable`/`disable` 仅控制开机自启，不自动等同 `start`/`stop`。** 维护定时器也有独立启停与自启设置。
+
+```bash
+sudo vpskit status
+sudo vpskit service nginx reload
+sudo vpskit service xray restart
+sudo vpskit service nginx enable
+sudo vpskit service timer disable
+sudo vpskit service all restart
+```
+
+> `service all restart` 会中断代理或网页连接；`system reboot` 会断开整个 VPS 的 SSH，只有确认维护窗口才执行。
+
+### 此模块的完整菜单索引
+
+<details class="menu-group">
+<summary><strong>services</strong>：8 个功能（逐项展开查看操作方法）</summary>
+
+> **所在目录：** 10. 服务运行与重启
+
+<details class="menu-item">
+<summary><strong>1. Nginx 服务控制</strong> — 进入下级功能菜单，包含：启动Nginx、停止Nginx、平滑重载Nginx、重启Nginx、启用开机自启Ng</summary>
+
+- **作用：** 进入下级功能菜单，包含：启动Nginx、停止Nginx、平滑重载Nginx、重启Nginx、启用开机自启Nginx等。
+- **什么时候用：** 需要集中管理“Nginx 服务控制”相关操作时。
+- **操作步骤：** 在此项按序号进入下级菜单，先查看状态和用途，再选择具体操作；不需要输入长文本名称。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 查看当前状态后按序号选择；仅进入下级菜单；不会立刻修改系统。
+- **菜单路径：** 主菜单 → 10. 服务运行与重启 → 1. Nginx 服务控制
+
+</details>
+
+<details class="menu-item">
+<summary><strong>2. Xray 服务控制</strong> — 进入下级功能菜单，包含：启动Xray、停止Xray、重启Xray、启用开机自启Xray、关闭开机自启Xray</summary>
+
+- **作用：** 进入下级功能菜单，包含：启动Xray、停止Xray、重启Xray、启用开机自启Xray、关闭开机自启Xray。
+- **什么时候用：** 需要集中管理“Xray 服务控制”相关操作时。
+- **操作步骤：** 在此项按序号进入下级菜单，先查看状态和用途，再选择具体操作；不需要输入长文本名称。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 查看当前状态后按序号选择；仅进入下级菜单；不会立刻修改系统。
+- **菜单路径：** 主菜单 → 10. 服务运行与重启 → 2. Xray 服务控制
+
+</details>
+
+<details class="menu-item">
+<summary><strong>3. 证书/日志维护调度</strong> — 进入下级功能菜单，包含：查看维护状态、启动定时器、停止定时器、启用维护自启、关闭维护自启等。</summary>
+
+- **作用：** 进入下级功能菜单，包含：查看维护状态、启动定时器、停止定时器、启用维护自启、关闭维护自启等。
+- **什么时候用：** 需要集中管理“证书/日志维护调度”相关操作时。
+- **操作步骤：** 在此项按序号进入下级菜单，先查看状态和用途，再选择具体操作；不需要输入长文本名称。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 查看当前状态后按序号选择；仅进入下级菜单；不会立刻修改系统。
+- **菜单路径：** 主菜单 → 10. 服务运行与重启 → 3. 证书/日志维护调度
+
+</details>
+
+<details class="menu-item">
+<summary><strong>4. 重启全部组件</strong> — 按顺序重启已配置Xray、Nginx和维护定时器。</summary>
+
+- **作用：** 按顺序重启已配置Xray、Nginx和维护定时器。
+- **什么时候用：** 需要执行“重启全部组件”而不是只查看状态时。
+- **操作步骤：** 先核对全部项目组件当前运行及自启状态，选择“重启”并确认；动作后重新读取服务状态。注意自启开关与当前启停不同。
+- **操作结果：** 可能立即改变服务可用性；停止/重启可能中断已有连接。
+- **要求与风险：** 先做语法检查；会中断连接；不重签证书；修改前建议查看配置计划；可能影响运行中的连接。
+- **命令示例：** `sudo vpskit service all restart`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 10. 服务运行与重启 → 4. 重启全部组件
+
+</details>
+
+<details class="menu-item">
+<summary><strong>5. 重启整台VPS系统</strong> — 正常重启操作系统及全部应用。</summary>
+
+- **作用：** 正常重启操作系统及全部应用。
+- **什么时候用：** 明确需要“重启整台VPS系统”且已确认备份和影响时。
+- **操作步骤：** 确认所有重要连接及操作已保存，输入REBOOT与二次确认重启整台VPS；SSH和全部服务将中断。
+- **操作结果：** 可能立即改变服务可用性；停止/重启可能中断已有连接。
+- **要求与风险：** 需输入REBOOT和yes；SSH将断开；先恢复未完成事务；高风险：确认备份、外部依赖和停机影响后执行。
+- **命令示例：** `sudo vpskit system reboot`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 10. 服务运行与重启 → 5. 重启整台VPS系统
+
+</details>
+
+<details class="menu-item">
+<summary><strong>6. 查看运行状态</strong> — 查看组件版本、服务状态和 Worker 身份。</summary>
+
+- **作用：** 查看组件版本、服务状态和 Worker 身份。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 查看当前Nginx、Xray、维护定时器运行/自启状态、资源、节点和网站数量；状态标签不等于真实公网可达。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只读；不显示节点凭据；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit status`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 10. 服务运行与重启 → 6. 查看运行状态
+
+</details>
+
+<details class="menu-item">
+<summary><strong>7. 近期服务变更原因</strong> — 查看按需记录的动作和前后PID。</summary>
+
+- **作用：** 查看按需记录的动作和前后PID。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 查看近期由本工具记录的服务启停/重载原因和时间，配合断流时刻排查；记录不包含全部外部操作。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只读；仅本版应用流程的服务变动；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit performance events`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 10. 服务运行与重启 → 7. 近期服务变更原因
+
+</details>
+
+<details class="menu-item">
+<summary><strong>0. 返回上一级</strong> — 不修改配置。</summary>
+
+- **作用：** 不修改配置。
+- **什么时候用：** 看完当前菜单或想取消本次未提交输入时。
+- **操作步骤：** 输入0返回上一层；不保存当前尚未确认的输入。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 已提交的配置保留；返回上一级；已保存的设置不回退。
+- **菜单路径：** 主菜单 → 10. 服务运行与重启 → 0. 返回上一级
+
+</details>
+
+</details>
+
+<details class="menu-group">
+<summary><strong>nginxservice</strong>：7 个功能（逐项展开查看操作方法）</summary>
+
+> **所在目录：** 10. 服务运行与重启 → 1. Nginx 服务控制
+
+<details class="menu-item">
+<summary><strong>1. 启动Nginx</strong> — 显式执行start；动作前确认。</summary>
+
+- **作用：** 显式执行start；动作前确认。
+- **什么时候用：** 需要执行“启动Nginx”而不是只查看状态时。
+- **操作步骤：** 先核对Nginx当前运行及自启状态，选择“启动”并确认；动作后重新读取服务状态。注意自启开关与当前启停不同。
+- **操作结果：** 可能立即改变服务可用性；停止/重启可能中断已有连接。
+- **要求与风险：** 共享Nginx影响全部网站；自启设置不立即启停；修改前建议查看配置计划；可能影响运行中的连接。
+- **命令示例：** `sudo vpskit service nginx start`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 10. 服务运行与重启 → 1. Nginx 服务控制 → 1. 启动Nginx
+
+</details>
+
+<details class="menu-item">
+<summary><strong>2. 停止Nginx</strong> — 显式执行stop；动作前确认。</summary>
+
+- **作用：** 显式执行stop；动作前确认。
+- **什么时候用：** 明确需要“停止Nginx”且已确认备份和影响时。
+- **操作步骤：** 先核对Nginx当前运行及自启状态，选择“停止”并确认；动作后重新读取服务状态。注意自启开关与当前启停不同。
+- **操作结果：** 可能立即改变服务可用性；停止/重启可能中断已有连接。
+- **要求与风险：** 共享Nginx影响全部网站；自启设置不立即启停；高风险：确认备份、外部依赖和停机影响后执行。
+- **命令示例：** `sudo vpskit service nginx stop`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 10. 服务运行与重启 → 1. Nginx 服务控制 → 2. 停止Nginx
+
+</details>
+
+<details class="menu-item">
+<summary><strong>3. 平滑重载Nginx</strong> — 显式执行reload；动作前确认。</summary>
+
+- **作用：** 显式执行reload；动作前确认。
+- **什么时候用：** 需要执行“平滑重载Nginx”而不是只查看状态时。
+- **操作步骤：** 先核对Nginx当前运行及自启状态，选择“平滑重载”并确认；动作后重新读取服务状态。注意自启开关与当前启停不同。
+- **操作结果：** 可能立即改变服务可用性；停止/重启可能中断已有连接。
+- **要求与风险：** 共享Nginx影响全部网站；自启设置不立即启停；修改前建议查看配置计划；可能影响运行中的连接。
+- **命令示例：** `sudo vpskit service nginx reload`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 10. 服务运行与重启 → 1. Nginx 服务控制 → 3. 平滑重载Nginx
+
+</details>
+
+<details class="menu-item">
+<summary><strong>4. 重启Nginx</strong> — 显式执行restart；动作前确认。</summary>
+
+- **作用：** 显式执行restart；动作前确认。
+- **什么时候用：** 需要执行“重启Nginx”而不是只查看状态时。
+- **操作步骤：** 先核对Nginx当前运行及自启状态，选择“重启”并确认；动作后重新读取服务状态。注意自启开关与当前启停不同。
+- **操作结果：** 可能立即改变服务可用性；停止/重启可能中断已有连接。
+- **要求与风险：** 共享Nginx影响全部网站；自启设置不立即启停；修改前建议查看配置计划；可能影响运行中的连接。
+- **命令示例：** `sudo vpskit service nginx restart`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 10. 服务运行与重启 → 1. Nginx 服务控制 → 4. 重启Nginx
+
+</details>
+
+<details class="menu-item">
+<summary><strong>5. 启用开机自启Nginx</strong> — 显式执行enable；动作前确认。</summary>
+
+- **作用：** 显式执行enable；动作前确认。
+- **什么时候用：** 需要执行“启用开机自启Nginx”而不是只查看状态时。
+- **操作步骤：** 先核对Nginx当前运行及自启状态，选择“开启开机自启”并确认；动作后重新读取服务状态。注意自启开关与当前启停不同。
+- **操作结果：** 可能立即改变服务可用性；停止/重启可能中断已有连接。
+- **要求与风险：** 共享Nginx影响全部网站；自启设置不立即启停；修改前建议查看配置计划；可能影响运行中的连接。
+- **命令示例：** `sudo vpskit service nginx enable`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 10. 服务运行与重启 → 1. Nginx 服务控制 → 5. 启用开机自启Nginx
+
+</details>
+
+<details class="menu-item">
+<summary><strong>6. 关闭开机自启Nginx</strong> — 显式执行disable；动作前确认。</summary>
+
+- **作用：** 显式执行disable；动作前确认。
+- **什么时候用：** 需要执行“关闭开机自启Nginx”而不是只查看状态时。
+- **操作步骤：** 先核对Nginx当前运行及自启状态，选择“关闭开机自启”并确认；动作后重新读取服务状态。注意自启开关与当前启停不同。
+- **操作结果：** 可能立即改变服务可用性；停止/重启可能中断已有连接。
+- **要求与风险：** 共享Nginx影响全部网站；自启设置不立即启停；修改前建议查看配置计划；可能影响运行中的连接。
+- **命令示例：** `sudo vpskit service nginx disable`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 10. 服务运行与重启 → 1. Nginx 服务控制 → 6. 关闭开机自启Nginx
+
+</details>
+
+<details class="menu-item">
+<summary><strong>0. 返回上一级</strong> — 不修改配置。</summary>
+
+- **作用：** 不修改配置。
+- **什么时候用：** 看完当前菜单或想取消本次未提交输入时。
+- **操作步骤：** 输入0返回上一层；不保存当前尚未确认的输入。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 已提交的配置保留；返回上一级；已保存的设置不回退。
+- **菜单路径：** 主菜单 → 10. 服务运行与重启 → 1. Nginx 服务控制 → 0. 返回上一级
+
+</details>
+
+</details>
+
+<details class="menu-group">
+<summary><strong>xrayservice</strong>：6 个功能（逐项展开查看操作方法）</summary>
+
+> **所在目录：** 10. 服务运行与重启 → 2. Xray 服务控制
+
+<details class="menu-item">
+<summary><strong>1. 启动Xray</strong> — 显式执行start；动作前确认。</summary>
+
+- **作用：** 显式执行start；动作前确认。
+- **什么时候用：** 需要执行“启动Xray”而不是只查看状态时。
+- **操作步骤：** 先核对Xray当前运行及自启状态，选择“启动”并确认；动作后重新读取服务状态。注意自启开关与当前启停不同。
+- **操作结果：** 可能立即改变服务可用性；停止/重启可能中断已有连接。
+- **要求与风险：** 实例重启影响所有代理；自启设置不立即启停；修改前建议查看配置计划；可能影响运行中的连接。
+- **命令示例：** `sudo vpskit service xray start`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 10. 服务运行与重启 → 2. Xray 服务控制 → 1. 启动Xray
+
+</details>
+
+<details class="menu-item">
+<summary><strong>2. 停止Xray</strong> — 显式执行stop；动作前确认。</summary>
+
+- **作用：** 显式执行stop；动作前确认。
+- **什么时候用：** 明确需要“停止Xray”且已确认备份和影响时。
+- **操作步骤：** 先核对Xray当前运行及自启状态，选择“停止”并确认；动作后重新读取服务状态。注意自启开关与当前启停不同。
+- **操作结果：** 可能立即改变服务可用性；停止/重启可能中断已有连接。
+- **要求与风险：** 实例重启影响所有代理；自启设置不立即启停；高风险：确认备份、外部依赖和停机影响后执行。
+- **命令示例：** `sudo vpskit service xray stop`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 10. 服务运行与重启 → 2. Xray 服务控制 → 2. 停止Xray
+
+</details>
+
+<details class="menu-item">
+<summary><strong>3. 重启Xray</strong> — 显式执行restart；动作前确认。</summary>
+
+- **作用：** 显式执行restart；动作前确认。
+- **什么时候用：** 需要执行“重启Xray”而不是只查看状态时。
+- **操作步骤：** 先核对Xray当前运行及自启状态，选择“重启”并确认；动作后重新读取服务状态。注意自启开关与当前启停不同。
+- **操作结果：** 可能立即改变服务可用性；停止/重启可能中断已有连接。
+- **要求与风险：** 实例重启影响所有代理；自启设置不立即启停；修改前建议查看配置计划；可能影响运行中的连接。
+- **命令示例：** `sudo vpskit service xray restart`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 10. 服务运行与重启 → 2. Xray 服务控制 → 3. 重启Xray
+
+</details>
+
+<details class="menu-item">
+<summary><strong>4. 启用开机自启Xray</strong> — 显式执行enable；动作前确认。</summary>
+
+- **作用：** 显式执行enable；动作前确认。
+- **什么时候用：** 需要执行“启用开机自启Xray”而不是只查看状态时。
+- **操作步骤：** 先核对Xray当前运行及自启状态，选择“开启开机自启”并确认；动作后重新读取服务状态。注意自启开关与当前启停不同。
+- **操作结果：** 可能立即改变服务可用性；停止/重启可能中断已有连接。
+- **要求与风险：** 实例重启影响所有代理；自启设置不立即启停；修改前建议查看配置计划；可能影响运行中的连接。
+- **命令示例：** `sudo vpskit service xray enable`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 10. 服务运行与重启 → 2. Xray 服务控制 → 4. 启用开机自启Xray
+
+</details>
+
+<details class="menu-item">
+<summary><strong>5. 关闭开机自启Xray</strong> — 显式执行disable；动作前确认。</summary>
+
+- **作用：** 显式执行disable；动作前确认。
+- **什么时候用：** 需要执行“关闭开机自启Xray”而不是只查看状态时。
+- **操作步骤：** 先核对Xray当前运行及自启状态，选择“关闭开机自启”并确认；动作后重新读取服务状态。注意自启开关与当前启停不同。
+- **操作结果：** 可能立即改变服务可用性；停止/重启可能中断已有连接。
+- **要求与风险：** 实例重启影响所有代理；自启设置不立即启停；修改前建议查看配置计划；可能影响运行中的连接。
+- **命令示例：** `sudo vpskit service xray disable`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 10. 服务运行与重启 → 2. Xray 服务控制 → 5. 关闭开机自启Xray
+
+</details>
+
+<details class="menu-item">
+<summary><strong>0. 返回上一级</strong> — 不修改配置。</summary>
+
+- **作用：** 不修改配置。
+- **什么时候用：** 看完当前菜单或想取消本次未提交输入时。
+- **操作步骤：** 输入0返回上一层；不保存当前尚未确认的输入。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 已提交的配置保留；返回上一级；已保存的设置不回退。
+- **菜单路径：** 主菜单 → 10. 服务运行与重启 → 2. Xray 服务控制 → 0. 返回上一级
+
+</details>
+
+</details>
+
+<details class="menu-group">
+<summary><strong>schedule</strong>：8 个功能（逐项展开查看操作方法）</summary>
+
+> **所在目录：** 4. ACME 与 SSL 证书 → 8. 维护定时器
+
+<details class="menu-item">
+<summary><strong>1. 查看维护状态</strong> — 显示本工具定时器与最近尝试/成功时间。</summary>
+
+- **作用：** 显示本工具定时器与最近尝试/成功时间。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 只读查看维护定时器当前状态和自启设置，区分已启用和当前等待。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 不查询或删除其他程序的调度；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit dashboard schedule`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 4. ACME 与 SSL 证书 → 8. 维护定时器 → 1. 查看维护状态
+
+</details>
+
+<details class="menu-item">
+<summary><strong>2. 启动定时器</strong> — 只控制vpskit-maintain.timer。</summary>
+
+- **作用：** 只控制vpskit-maintain.timer。
+- **什么时候用：** 需要执行“启动定时器”而不是只查看状态时。
+- **操作步骤：** 启动本项目维护定时器；不会在进入菜单时立即重新签发所有证书。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 关闭后本工具证书续期和日志检查停止；不改变外部ACME；修改前建议查看配置计划；可能影响运行中的连接。
+- **菜单路径：** 主菜单 → 4. ACME 与 SSL 证书 → 8. 维护定时器 → 2. 启动定时器
+
+</details>
+
+<details class="menu-item">
+<summary><strong>3. 停止定时器</strong> — 只控制vpskit-maintain.timer。</summary>
+
+- **作用：** 只控制vpskit-maintain.timer。
+- **什么时候用：** 需要执行“停止定时器”而不是只查看状态时。
+- **操作步骤：** 停止当前维护定时器，保留自启选择；到期证书将不再按计划自动检查，需另安排维护。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 关闭后本工具证书续期和日志检查停止；不改变外部ACME；修改前建议查看配置计划；可能影响运行中的连接。
+- **菜单路径：** 主菜单 → 4. ACME 与 SSL 证书 → 8. 维护定时器 → 3. 停止定时器
+
+</details>
+
+<details class="menu-item">
+<summary><strong>4. 启用维护自启</strong> — 只控制vpskit-maintain.timer。</summary>
+
+- **作用：** 只控制vpskit-maintain.timer。
+- **什么时候用：** 需要执行“启用维护自启”而不是只查看状态时。
+- **操作步骤：** 设置维护定时器开机自启，是否当前运行由start/stop单独控制。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 关闭后本工具证书续期和日志检查停止；不改变外部ACME；修改前建议查看配置计划；可能影响运行中的连接。
+- **菜单路径：** 主菜单 → 4. ACME 与 SSL 证书 → 8. 维护定时器 → 4. 启用维护自启
+
+</details>
+
+<details class="menu-item">
+<summary><strong>5. 关闭维护自启</strong> — 只控制vpskit-maintain.timer。</summary>
+
+- **作用：** 只控制vpskit-maintain.timer。
+- **什么时候用：** 需要执行“关闭维护自启”而不是只查看状态时。
+- **操作步骤：** 取消维护定时器开机自启；已运行定时器不一定立即停止，视面板显示再操作。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 关闭后本工具证书续期和日志检查停止；不改变外部ACME；修改前建议查看配置计划；可能影响运行中的连接。
+- **菜单路径：** 主菜单 → 4. ACME 与 SSL 证书 → 8. 维护定时器 → 5. 关闭维护自启
+
+</details>
+
+<details class="menu-item">
+<summary><strong>6. 证书与续期检查</strong> — 有效期、来源和常见重复cron引用。</summary>
+
+- **作用：** 有效期、来源和常见重复cron引用。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 读取证书来源/有效期及常见续期任务引用，帮助识别重复调度；这是只读检查，不会撤销证书。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 不打印DNS凭据；不能发现全部外部调度；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit cert audit`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 4. ACME 与 SSL 证书 → 8. 维护定时器 → 6. 证书与续期检查
+
+</details>
+
+<details class="menu-item">
+<summary><strong>7. 立即检查日志大小</strong> — 仅轮转达到阈值的本工具日志。</summary>
+
+- **作用：** 仅轮转达到阈值的本工具日志。
+- **什么时候用：** 需要执行“立即检查日志大小”而不是只查看状态时。
+- **操作步骤：** 按当前日志保留规则执行一次大小检查与轮转；不重启服务，但轮转期间少量写入可能丢失。
+- **操作结果：** 保存值与实际生效值可能不同；按计划应用后再核对运行状态。
+- **要求与风险：** 不压缩、不重启；并发写入可能丢少量日志；修改前建议查看配置计划；可能影响运行中的连接。
+- **命令示例：** `sudo vpskit performance rotate`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 4. ACME 与 SSL 证书 → 8. 维护定时器 → 7. 立即检查日志大小
+
+</details>
+
+<details class="menu-item">
+<summary><strong>0. 返回上一级</strong> — 不修改配置。</summary>
+
+- **作用：** 不修改配置。
+- **什么时候用：** 看完当前菜单或想取消本次未提交输入时。
+- **操作步骤：** 输入0返回上一层；不保存当前尚未确认的输入。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 已提交的配置保留；返回上一级；已保存的设置不回退。
+- **菜单路径：** 主菜单 → 4. ACME 与 SSL 证书 → 8. 维护定时器 → 0. 返回上一级
+
+</details>
+
+</details>
+
+</details>
+
+<details id="update">
+<summary><strong>11. 组件与管理脚本更新</strong> — 管理器代码 · Xray · Nginx · ACME</summary>
+
+### 区分代码更新与组件更新
+
+- **只更新 VPSKit 管理脚本**：替换 `/opt/vpskit/vpskit.sh` 对应管理入口，保留 `state.json`、节点、证书及运行服务；不会因为这步自动重启代理。
+- **更新 Xray**：替换运行核心或版本，可能重启并导致所有正在使用该实例的连接短暂中断。
+- **共享 Nginx 更新**：遵循系统软件包管理；影响所有共用的站点。独立模式只更新私有 Nginx。
+- **ACME 更新**：保留账户资料但需核对续期兼容。
+
+```bash
+bash -n ./vpskit.sh
+bash ./vpskit.sh selftest
+sudo bash ./vpskit.sh update manager ./vpskit.sh
+sudo vpskit version
+sudo vpskit components latest-xray
+sudo vpskit update xray latest
+```
+
+> **仅下载脚本**不等于更新服务器上的管理器；**更新服务器管理器**也不等于把 GitHub 仓库代码更新了。确保两处版本对应。
+
+### 此模块的完整菜单索引
+
+<details class="menu-group">
+<summary><strong>update</strong>：7 个功能（逐项展开查看操作方法）</summary>
+
+> **所在目录：** 11. 组件与管理脚本更新
+
+<details class="menu-item">
+<summary><strong>1. 更新 Nginx</strong> — 从发行版软件源更新独立二进制。</summary>
+
+- **作用：** 从发行版软件源更新独立二进制。
+- **什么时候用：** 需要执行“更新 Nginx”而不是只查看状态时。
+- **操作步骤：** 按当前安装模式检查Nginx来源并更新；共享模式使用系统包管理器，其他应用也可能受变动影响，先保存备份。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 需联网；可能重启 Nginx，网站连接可能中断；会修改配置或服务；无需求时可直接取消。
+- **命令示例：** `sudo vpskit update nginx`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 11. 组件与管理脚本更新 → 1. 更新 Nginx
+
+</details>
+
+<details class="menu-item">
+<summary><strong>2. 更新 Xray</strong> — 选择固定版本或显式 latest。</summary>
+
+- **作用：** 选择固定版本或显式 latest。
+- **什么时候用：** 需要执行“更新 Xray”而不是只查看状态时。
+- **操作步骤：** 查看当前及候选Xray版本、客户端兼容性，确认后更新核心；二进制替换或重启会影响全部启用节点。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 需联网；重启会中断代理连接，先核对客户端兼容性；会修改配置或服务；无需求时可直接取消。
+- **命令示例：** `sudo vpskit update xray latest`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 11. 组件与管理脚本更新 → 2. 更新 Xray
+
+</details>
+
+<details class="menu-item">
+<summary><strong>3. 更新 ACME</strong> — 更新证书工具，保留证书和账户资料。</summary>
+
+- **作用：** 更新证书工具，保留证书和账户资料。
+- **什么时候用：** 需要执行“更新 ACME”而不是只查看状态时。
+- **操作步骤：** 更新acme.sh程序代码前核对来源、账户目录和定时计划；不得覆盖外部程序的账户/凭据。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 需联网；不会直接重新申请所有证书；会修改配置或服务；无需求时可直接取消。
+- **命令示例：** `sudo vpskit update acme`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 11. 组件与管理脚本更新 → 3. 更新 ACME
+
+</details>
+
+<details class="menu-item">
+<summary><strong>4. 仅更新管理代码</strong> — 校验完整脚本后替换代码并备份旧版。</summary>
+
+- **作用：** 校验完整脚本后替换代码并备份旧版。
+- **什么时候用：** 需要执行“仅更新管理代码”而不是只查看状态时。
+- **操作步骤：** 从可信完整脚本文件更新VPSKit管理代码，检查版本和语法；不会立即重写当前Xray/Nginx运行配置。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 不改 state.json、不升级组件、不重启服务；会修改配置或服务；无需求时可直接取消。
+- **命令示例：** `sudo bash ./vpskit.sh update manager ./vpskit.sh`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 11. 组件与管理脚本更新 → 4. 仅更新管理代码
+
+</details>
+
+<details class="menu-item">
+<summary><strong>5. 更新全部已安装组件</strong> — 依次更新已安装的组件，再询问是否更新管理代码。</summary>
+
+- **作用：** 依次更新已安装的组件，再询问是否更新管理代码。
+- **什么时候用：** 需要执行“更新全部已安装组件”而不是只查看状态时。
+- **操作步骤：** 依次检查已安装组件可更新项并显示计划，逐项确认；不要在需要稳定连接时直接全量更新。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 逐组件提交；失败保留已完成更新，可能多次中断连接；修改前建议查看配置计划；可能影响运行中的连接。
+- **命令示例：** `sudo vpskit update all`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 11. 组件与管理脚本更新 → 5. 更新全部已安装组件
+
+</details>
+
+<details class="menu-item">
+<summary><strong>6. 查询Xray最新正式版本</strong> — 仅查询官方GitHub Release信息。</summary>
+
+- **作用：** 仅查询官方GitHub Release信息。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 联网查询Xray官方正式版本，只阅读版本及发布时间；若决定升级，返回“组件更新”显式执行。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 需联网；不下载、不升级、不重启；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit components latest-xray`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 11. 组件与管理脚本更新 → 6. 查询Xray最新正式版本
+
+</details>
+
+<details class="menu-item">
+<summary><strong>0. 返回上一级</strong> — 不修改配置。</summary>
+
+- **作用：** 不修改配置。
+- **什么时候用：** 看完当前菜单或想取消本次未提交输入时。
+- **操作步骤：** 输入0返回上一层；不保存当前尚未确认的输入。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 已提交的配置保留；返回上一级；已保存的设置不回退。
+- **菜单路径：** 主菜单 → 11. 组件与管理脚本更新 → 0. 返回上一级
+
+</details>
+
+</details>
+
+</details>
+
+<details id="recovery">
+<summary><strong>12. 备份、恢复与迁移</strong> — 历史快照 · 精确回滚 · 跨模式迁移</summary>
+
+### 配置变更前推荐这样做
+
+1. `history save` 保存当前配置、证书及有关资料，注意包含秘密信息。
+2. `config check` 验证候选 Nginx/Xray；`config plan` 查看预期服务动作；有必要再 `config diff` 查看脱敏摘要。
+3. 执行 `config apply`，完成后查看 `doctor` 与 `dashboard advanced`。
+
+### 出现故障时
+
+先查 `recovery status`：发现未完成事务则优先 `recovery repair`；最近事务若文件摘要仍匹配，可以尝试 `recovery rollback`。历史恢复可按范围选择节点、网站、证书、高级参数或完整项目状态；**共享模式不会用历史全量快照覆盖系统 `/etc/nginx` 的其他项目**。
+
+```bash
+sudo vpskit history save before-change
+sudo vpskit config check
+sudo vpskit config plan
+sudo vpskit config apply
+sudo vpskit recovery status
+sudo vpskit recovery repair
+sudo vpskit history restore
+```
+
+> 跨模式历史或旧版本原样恢复有严格限制；先使用“模式迁移”预览。项目配置备份不等于整机备份，也不包含云安全组、APT 依赖或所有网站内容。
+
+### 此模块的完整菜单索引
+
+<details class="menu-group">
+<summary><strong>history</strong>：11 个功能（逐项展开查看操作方法）</summary>
+
+> **所在目录：** 12. 备份、恢复与迁移
+
+<details class="menu-item">
+<summary><strong>1. 列出历史快照</strong> — 显示快照时间、备注和版本。</summary>
+
+- **作用：** 显示快照时间、备注和版本。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 列出可用配置快照ID、时间和范围；不会恢复或修改当前配置。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只读；快照含敏感凭据，不要公开；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit history list`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 12. 备份、恢复与迁移 → 1. 列出历史快照
+
+</details>
+
+<details class="menu-item">
+<summary><strong>2. 立即创建快照</strong> — 保存当前配置、证书及ACME资料。</summary>
+
+- **作用：** 保存当前配置、证书及ACME资料。
+- **什么时候用：** 需要执行“立即创建快照”而不是只查看状态时。
+- **操作步骤：** 给当前状态创建带时间标识的快照；可能包含UUID/密码/证书私钥，保存目录只供root访问。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 当前state.json须有效；不备份网站内容；会修改配置或服务；无需求时可直接取消。
+- **命令示例：** `sudo vpskit history save before-change`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 12. 备份、恢复与迁移 → 2. 立即创建快照
+
+</details>
+
+<details class="menu-item">
+<summary><strong>3. 按范围恢复历史</strong> — 编号选择状态、节点、网站、证书或参数。</summary>
+
+- **作用：** 编号选择状态、节点、网站、证书或参数。
+- **什么时候用：** 误修改或需要回到已知配置时。
+- **操作步骤：** 按序号选择快照，再选state/nodes/web/advanced/certs/full范围，预览后恢复；跨模式不允许直接覆盖系统共享全局。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 保留安装模式；共享全局参数不随历史覆盖；修改前建议查看配置计划；可能影响运行中的连接。
+- **命令示例：** `sudo vpskit history restore`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 12. 备份、恢复与迁移 → 3. 按范围恢复历史
+
+</details>
+
+<details class="menu-item">
+<summary><strong>4. 只恢复状态配置</strong> — 使用历史节点/网站设置及当前证书重新生成。</summary>
+
+- **作用：** 使用历史节点/网站设置及当前证书重新生成。
+- **什么时候用：** 需要执行“只恢复状态配置”而不是只查看状态时。
+- **操作步骤：** 从历史快照仅恢复项目状态，再由当前组件生成配置；不把快照当成整机镜像。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 当前证书及组件必须满足历史配置要求；修改前建议查看配置计划；可能影响运行中的连接。
+- **菜单路径：** 主菜单 → 12. 备份、恢复与迁移 → 4. 只恢复状态配置
+
+</details>
+
+<details class="menu-item">
+<summary><strong>5. 仅恢复高级参数</strong> — 取回旧的Nginx/Xray参数。</summary>
+
+- **作用：** 取回旧的Nginx/Xray参数。
+- **什么时候用：** 需要执行“仅恢复高级参数”而不是只查看状态时。
+- **操作步骤：** 只取历史Worker、超时、连接池等高级参数；保持当前节点、网站和证书不变。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 保留当前节点、证书和网站；状态文件须有效；修改前建议查看配置计划；可能影响运行中的连接。
+- **菜单路径：** 主菜单 → 12. 备份、恢复与迁移 → 5. 仅恢复高级参数
+
+</details>
+
+<details class="menu-item">
+<summary><strong>6. 未完成事务状态</strong> — 查看阶段、受影响文件及外部编辑冲突。</summary>
+
+- **作用：** 查看阶段、受影响文件及外部编辑冲突。
+- **什么时候用：** 保存配置失败或存在中断的事务时。
+- **操作步骤：** 只读检查当前是否存在未完成事务、文件变化或恢复冲突；存在异常时先查原因，不应继续覆盖配置。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只读；不自动覆盖冲突；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit recovery status`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 12. 备份、恢复与迁移 → 6. 未完成事务状态
+
+</details>
+
+<details class="menu-item">
+<summary><strong>7. 修复未完成事务</strong> — 按本次事务记录恢复。</summary>
+
+- **作用：** 按本次事务记录恢复。
+- **什么时候用：** 需要执行“修复未完成事务”而不是只查看状态时。
+- **操作步骤：** 仅在检测到未完成事务时运行；脚本按已保存事务尝试恢复，遇到第三方改动会停止并保留资料。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 不重置防火墙；冲突时保留现场；修改前建议查看配置计划；可能影响运行中的连接。
+- **命令示例：** `sudo vpskit recovery repair`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 12. 备份、恢复与迁移 → 7. 修复未完成事务
+
+</details>
+
+<details class="menu-item">
+<summary><strong>8. 撤销最近阶段2事务</strong> — 当前摘要仍匹配时精确回滚。</summary>
+
+- **作用：** 当前摘要仍匹配时精确回滚。
+- **什么时候用：** 需要执行“撤销最近阶段2事务”而不是只查看状态时。
+- **操作步骤：** 在最近提交事务的哈希仍匹配时撤销本次修改，发现后续外部编辑则拒绝覆盖。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 可能重载服务；回滚前另存当前快照；修改前建议查看配置计划；可能影响运行中的连接。
+- **命令示例：** `sudo vpskit recovery rollback`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 12. 备份、恢复与迁移 → 8. 撤销最近阶段2事务
+
+</details>
+
+<details class="menu-item">
+<summary><strong>9. 安装模式迁移</strong> — 进入下级功能菜单，包含：预览迁移到共享模式、执行迁移到共享模式、预览迁移到独立模式、执行迁移到独立模式、未完</summary>
+
+- **作用：** 进入下级功能菜单，包含：预览迁移到共享模式、执行迁移到共享模式、预览迁移到独立模式、执行迁移到独立模式、未完成事务状态等。
+- **什么时候用：** 需要集中管理“安装模式迁移”相关操作时。
+- **操作步骤：** 在此项按序号进入下级菜单，先查看状态和用途，再选择具体操作；不需要输入长文本名称。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 查看当前状态后按序号选择；仅进入下级菜单；不会立刻修改系统。
+- **菜单路径：** 主菜单 → 12. 备份、恢复与迁移 → 9. 安装模式迁移
+
+</details>
+
+<details class="menu-item">
+<summary><strong>10. 独立模式旧版本救援</strong> — 进入下级功能菜单，包含：强制恢复（原样或兼容）、回滚最近事务、简化重建 Nginx、重建范围预览。</summary>
+
+- **作用：** 进入下级功能菜单，包含：强制恢复（原样或兼容）、回滚最近事务、简化重建 Nginx、重建范围预览。
+- **什么时候用：** 需要集中管理“独立模式旧版本救援”相关操作时。
+- **操作步骤：** 在此项按序号进入下级菜单，先查看状态和用途，再选择具体操作；不需要输入长文本名称。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 查看当前状态后按序号选择；仅进入下级菜单；不会立刻修改系统。
+- **菜单路径：** 主菜单 → 12. 备份、恢复与迁移 → 10. 独立模式旧版本救援
+
+</details>
+
+<details class="menu-item">
+<summary><strong>0. 返回上一级</strong> — 不修改配置。</summary>
+
+- **作用：** 不修改配置。
+- **什么时候用：** 看完当前菜单或想取消本次未提交输入时。
+- **操作步骤：** 输入0返回上一层；不保存当前尚未确认的输入。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 已提交的配置保留；返回上一级；已保存的设置不回退。
+- **菜单路径：** 主菜单 → 12. 备份、恢复与迁移 → 0. 返回上一级
+
+</details>
+
+</details>
+
+<details class="menu-group">
+<summary><strong>legacyrecovery</strong>：5 个功能（逐项展开查看操作方法）</summary>
+
+> **所在目录：** 12. 备份、恢复与迁移 → 10. 独立模式旧版本救援
+
+<details class="menu-item">
+<summary><strong>1. 强制恢复（原样或兼容）</strong> — 按序号选择事务或快照，不重新生成代理配置。</summary>
+
+- **作用：** 按序号选择事务或快照，不重新生成代理配置。
+- **什么时候用：** 明确需要“强制恢复（原样或兼容）”且已确认备份和影响时。
+- **操作步骤：** 仅独立模式在普通恢复失败时使用；明确选择原样或兼容恢复，可能恢复旧root Worker，需特别确认。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 绕过未完成事务门禁；保留失败现场；不绕过语法检查；高风险：确认备份、外部依赖和停机影响后执行。
+- **菜单路径：** 主菜单 → 12. 备份、恢复与迁移 → 10. 独立模式旧版本救援 → 1. 强制恢复（原样或兼容）
+
+</details>
+
+<details class="menu-item">
+<summary><strong>2. 回滚最近事务</strong> — 恢复旧版本最近事务；优先使用阶段2精确撤销。</summary>
+
+- **作用：** 恢复旧版本最近事务；优先使用阶段2精确撤销。
+- **什么时候用：** 需要执行“回滚最近事务”而不是只查看状态时。
+- **操作步骤：** 选择最近独立部署事务进行回滚，核对将被恢复的组件范围；不能直接作用于共享全局Nginx。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 将重启之前运行的服务；需有最近事务备份；修改前建议查看配置计划；可能影响运行中的连接。
+- **菜单路径：** 主菜单 → 12. 备份、恢复与迁移 → 10. 独立模式旧版本救援 → 2. 回滚最近事务
+
+</details>
+
+<details class="menu-item">
+<summary><strong>3. 简化重建 Nginx</strong> — 当前备份→验证→只重建Nginx→成功后清旧历史。</summary>
+
+- **作用：** 当前备份→验证→只重建Nginx→成功后清旧历史。
+- **什么时候用：** 明确需要“简化重建 Nginx”且已确认备份和影响时。
+- **操作步骤：** 从当前Xray入口和网站资料重建独立Nginx，先创建应急备份并预检，成功后再考虑清理旧历史。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 仅独立模式；重启Nginx，成功后清旧记录并保留本次备份；高风险：确认备份、外部依赖和停机影响后执行。
+- **菜单路径：** 主菜单 → 12. 备份、恢复与迁移 → 10. 独立模式旧版本救援 → 3. 简化重建 Nginx
+
+</details>
+
+<details class="menu-item">
+<summary><strong>4. 重建范围预览</strong> — 查看仅重建Nginx的影响。</summary>
+
+- **作用：** 查看仅重建Nginx的影响。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 只读查看重建所需文件、节点映射、证书以及潜在重启影响，不切换正式服务。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只适用于独立模式，不切换服务；只读操作；不主动写入运行配置。
+- **菜单路径：** 主菜单 → 12. 备份、恢复与迁移 → 10. 独立模式旧版本救援 → 4. 重建范围预览
+
+</details>
+
+<details class="menu-item">
+<summary><strong>0. 返回上一级</strong> — 不修改配置。</summary>
+
+- **作用：** 不修改配置。
+- **什么时候用：** 看完当前菜单或想取消本次未提交输入时。
+- **操作步骤：** 输入0返回上一层；不保存当前尚未确认的输入。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 已提交的配置保留；返回上一级；已保存的设置不回退。
+- **菜单路径：** 主菜单 → 12. 备份、恢复与迁移 → 10. 独立模式旧版本救援 → 0. 返回上一级
+
+</details>
+
+</details>
+
+<details class="menu-group">
+<summary><strong>configsafe</strong>：10 个功能（逐项展开查看操作方法）</summary>
+
+> **所在目录：** 3. 网站与反向代理 → 11. 配置计划与发布
+
+<details class="menu-item">
+<summary><strong>1. 候选配置检查</strong> — 生成并校验完整候选配置，不发布。</summary>
+
+- **作用：** 生成并校验完整候选配置，不发布。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 生成候选Xray与Nginx配置并执行语法/核心检查，但不发布配置；报错先修复，不要反复强制应用。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 共享模式递归检查静态include；无需重启；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit config check`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 3. 网站与反向代理 → 11. 配置计划与发布 → 1. 候选配置检查
+
+</details>
+
+<details class="menu-item">
+<summary><strong>2. 服务动作计划</strong> — 查看无需动作、重载、重启和启动原因。</summary>
+
+- **作用：** 查看无需动作、重载、重启和启动原因。
+- **什么时候用：** 不确定修改是否会重启代理时。
+- **操作步骤：** 只读列出Xray/Nginx预计执行skip/reload/restart及原因；配置文件尚未发布。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只在临时目录生成；计划不是运行验收；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit config plan`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 3. 网站与反向代理 → 11. 配置计划与发布 → 2. 服务动作计划
+
+</details>
+
+<details class="menu-item">
+<summary><strong>3. 脱敏差异摘要</strong> — 显示摘要与监听协议，不打印密钥。</summary>
+
+- **作用：** 显示摘要与监听协议，不打印密钥。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 查看本次配置与已应用配置的脱敏摘要及监听变化，不直接输出UUID/私钥全文。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 不直接输出原始Xray配置；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit config diff`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 3. 网站与反向代理 → 11. 配置计划与发布 → 3. 脱敏差异摘要
+
+</details>
+
+<details class="menu-item">
+<summary><strong>4. 应用保存配置</strong> — 校验后原子发布本项目配置。</summary>
+
+- **作用：** 校验后原子发布本项目配置。
+- **什么时候用：** 需要执行“应用保存配置”而不是只查看状态时。
+- **操作步骤：** 先确认语法和计划，按事务发布配置；只操作必要的组件，真正重启可能中断代理或网站。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 可能重启涉及组件；先确认动作计划；修改前建议查看配置计划；可能影响运行中的连接。
+- **命令示例：** `sudo vpskit config apply`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 3. 网站与反向代理 → 11. 配置计划与发布 → 4. 应用保存配置
+
+</details>
+
+<details class="menu-item">
+<summary><strong>5. 未完成事务状态</strong> — 查看阶段、受影响文件及外部编辑冲突。</summary>
+
+- **作用：** 查看阶段、受影响文件及外部编辑冲突。
+- **什么时候用：** 保存配置失败或存在中断的事务时。
+- **操作步骤：** 只读检查当前是否存在未完成事务、文件变化或恢复冲突；存在异常时先查原因，不应继续覆盖配置。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只读；不自动覆盖冲突；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit recovery status`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 3. 网站与反向代理 → 11. 配置计划与发布 → 5. 未完成事务状态
+
+</details>
+
+<details class="menu-item">
+<summary><strong>6. 修复未完成事务</strong> — 按本次事务记录恢复。</summary>
+
+- **作用：** 按本次事务记录恢复。
+- **什么时候用：** 需要执行“修复未完成事务”而不是只查看状态时。
+- **操作步骤：** 仅在检测到未完成事务时运行；脚本按已保存事务尝试恢复，遇到第三方改动会停止并保留资料。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 不重置防火墙；冲突时保留现场；修改前建议查看配置计划；可能影响运行中的连接。
+- **命令示例：** `sudo vpskit recovery repair`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 3. 网站与反向代理 → 11. 配置计划与发布 → 6. 修复未完成事务
+
+</details>
+
+<details class="menu-item">
+<summary><strong>7. 撤销最近阶段2事务</strong> — 当前摘要仍匹配时精确回滚。</summary>
+
+- **作用：** 当前摘要仍匹配时精确回滚。
+- **什么时候用：** 需要执行“撤销最近阶段2事务”而不是只查看状态时。
+- **操作步骤：** 在最近提交事务的哈希仍匹配时撤销本次修改，发现后续外部编辑则拒绝覆盖。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 可能重载服务；回滚前另存当前快照；修改前建议查看配置计划；可能影响运行中的连接。
+- **命令示例：** `sudo vpskit recovery rollback`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 3. 网站与反向代理 → 11. 配置计划与发布 → 7. 撤销最近阶段2事务
+
+</details>
+
+<details class="menu-item">
+<summary><strong>8. 按范围恢复历史</strong> — 编号选择状态、节点、网站、证书或参数。</summary>
+
+- **作用：** 编号选择状态、节点、网站、证书或参数。
+- **什么时候用：** 误修改或需要回到已知配置时。
+- **操作步骤：** 按序号选择快照，再选state/nodes/web/advanced/certs/full范围，预览后恢复；跨模式不允许直接覆盖系统共享全局。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 保留安装模式；共享全局参数不随历史覆盖；修改前建议查看配置计划；可能影响运行中的连接。
+- **命令示例：** `sudo vpskit history restore`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 3. 网站与反向代理 → 11. 配置计划与发布 → 8. 按范围恢复历史
+
+</details>
+
+<details class="menu-item">
+<summary><strong>9. 证书与续期检查</strong> — 有效期、来源和常见重复cron引用。</summary>
+
+- **作用：** 有效期、来源和常见重复cron引用。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 读取证书来源/有效期及常见续期任务引用，帮助识别重复调度；这是只读检查，不会撤销证书。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 不打印DNS凭据；不能发现全部外部调度；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit cert audit`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 3. 网站与反向代理 → 11. 配置计划与发布 → 9. 证书与续期检查
+
+</details>
+
+<details class="menu-item">
+<summary><strong>0. 返回上一级</strong> — 不修改配置。</summary>
+
+- **作用：** 不修改配置。
+- **什么时候用：** 看完当前菜单或想取消本次未提交输入时。
+- **操作步骤：** 输入0返回上一层；不保存当前尚未确认的输入。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 已提交的配置保留；返回上一级；已保存的设置不回退。
+- **菜单路径：** 主菜单 → 3. 网站与反向代理 → 11. 配置计划与发布 → 0. 返回上一级
+
+</details>
+
+</details>
+
+</details>
+
+<details id="status">
+<summary><strong>13. 运行状态与日志</strong> — 诊断 · 轻量日志 · 脱敏导出</summary>
+
+### 正常使用的排查顺序
+
+1. `dashboard` 读服务状态与资源；`doctor` 检查进程、实际 Worker 身份、端口和配置。
+2. `logs nginx 100`、`logs xray 100` 查看有限行错误，不必打开全量访问日志。
+3. 出现重启或断连，看 `performance events` 与系统 journal，判断是否由配置应用触发。
+4. 需要分享诊断时使用白名单摘要导出；原始 `state.json` 和客户端链接含秘密，不要贴到公开论坛。
+
+```bash
+sudo vpskit dashboard
+sudo vpskit doctor
+sudo vpskit logs nginx 100
+sudo vpskit logs xray 100
+sudo vpskit logs preflight 120
+sudo vpskit performance events
+sudo vpskit diagnostics summary
+```
+
+> 默认日志策略偏低开销。按需开启“故障/抽样/全量”时务必考虑 CPU、磁盘与隐私成本，并在排查结束后关闭全量。
+
+### 此模块的完整菜单索引
+
+<details class="menu-group">
+<summary><strong>status</strong>：11 个功能（逐项展开查看操作方法）</summary>
+
+> **所在目录：** 13. 运行状态与日志
+
+<details class="menu-item">
+<summary><strong>1. 查看运行状态</strong> — 查看组件版本、服务状态和 Worker 身份。</summary>
+
+- **作用：** 查看组件版本、服务状态和 Worker 身份。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 查看当前Nginx、Xray、维护定时器运行/自启状态、资源、节点和网站数量；状态标签不等于真实公网可达。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只读；不显示节点凭据；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit status`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 13. 运行状态与日志 → 1. 查看运行状态
+
+</details>
+
+<details class="menu-item">
+<summary><strong>2. 本机诊断</strong> — 检查配置语法、权限、监听和服务进程。</summary>
+
+- **作用：** 检查配置语法、权限、监听和服务进程。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 检查进程身份、配置语法、监听与服务状态，看到错误后再选择对应修复；不是一键强行修复一切。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 不能代替公网、CDN 或吞吐验收；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit doctor`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 13. 运行状态与日志 → 2. 本机诊断
+
+</details>
+
+<details class="menu-item">
+<summary><strong>3. 运行摘要与问题提示</strong> — 读取服务/端口/资源与内核计数，保留边界说明。</summary>
+
+- **作用：** 读取服务/端口/资源与内核计数，保留边界说明。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 按需汇总运行状态、有限错误计数与资源数据，不导出私钥/UUID。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 不自动修复，不扫整个journal；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit diagnostics summary`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 13. 运行状态与日志 → 3. 运行摘要与问题提示
+
+</details>
+
+<details class="menu-item">
+<summary><strong>4. 导出默认脱敏诊断</strong> — 只导出白名单结构化状态，不含配置/原始日志。</summary>
+
+- **作用：** 只导出白名单结构化状态，不含配置/原始日志。
+- **什么时候用：** 需要执行“导出默认脱敏诊断”而不是只查看状态时。
+- **操作步骤：** 生成有限脱敏诊断文件到root私有目录，分享前复核IP、路径和可能遗漏的敏感信息。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 仍需分享前核对；不包含域名/IP/UUID/token；会修改配置或服务；无需求时可直接取消。
+- **命令示例：** `sudo vpskit diagnostics export`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 13. 运行状态与日志 → 4. 导出默认脱敏诊断
+
+</details>
+
+<details class="menu-item">
+<summary><strong>5. 日志查看</strong> — 进入下级功能菜单，包含：Nginx 错误日志、Xray 日志、网站访问日志、证书与维护日志、Nginx 服务</summary>
+
+- **作用：** 进入下级功能菜单，包含：Nginx 错误日志、Xray 日志、网站访问日志、证书与维护日志、Nginx 服务日志等。
+- **什么时候用：** 需要集中管理“日志查看”相关操作时。
+- **操作步骤：** 在此项按序号进入下级菜单，先查看状态和用途，再选择具体操作；不需要输入长文本名称。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 查看当前状态后按序号选择；仅进入下级菜单；不会立刻修改系统。
+- **菜单路径：** 主菜单 → 13. 运行状态与日志 → 5. 日志查看
+
+</details>
+
+<details class="menu-item">
+<summary><strong>6. 低开销日志设置</strong> — 进入下级功能菜单，包含：网站轻量性能日志、日志保留阈值、立即检查日志大小、网站访问日志开关、代理路径访问日志</summary>
+
+- **作用：** 进入下级功能菜单，包含：网站轻量性能日志、日志保留阈值、立即检查日志大小、网站访问日志开关、代理路径访问日志等。
+- **什么时候用：** 需要集中管理“低开销日志设置”相关操作时。
+- **操作步骤：** 在此项按序号进入下级菜单，先查看状态和用途，再选择具体操作；不需要输入长文本名称。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 查看当前状态后按序号选择；仅进入下级菜单；不会立刻修改系统。
+- **菜单路径：** 主菜单 → 13. 运行状态与日志 → 6. 低开销日志设置
+
+</details>
+
+<details class="menu-item">
+<summary><strong>7. 近期服务变更原因</strong> — 查看按需记录的动作和前后PID。</summary>
+
+- **作用：** 查看按需记录的动作和前后PID。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 查看近期由本工具记录的服务启停/重载原因和时间，配合断流时刻排查；记录不包含全部外部操作。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只读；仅本版应用流程的服务变动；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit performance events`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 13. 运行状态与日志 → 7. 近期服务变更原因
+
+</details>
+
+<details class="menu-item">
+<summary><strong>8. DNS 与公网 HTTPS 检查</strong> — 检查网站解析和公网响应，不修改 DNS。</summary>
+
+- **作用：** 检查网站解析和公网响应，不修改 DNS。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 对登记的网站/DNS/HTTPS执行有限联网核对，查区分DNS、防火墙、证书和应用故障；只读，不改云安全组。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 需网络；Cloudflare解析不必等于源站IP；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit network-check`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 13. 运行状态与日志 → 8. DNS 与公网 HTTPS 检查
+
+</details>
+
+<details class="menu-item">
+<summary><strong>9. 证书与续期检查</strong> — 有效期、来源和常见重复cron引用。</summary>
+
+- **作用：** 有效期、来源和常见重复cron引用。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 读取证书来源/有效期及常见续期任务引用，帮助识别重复调度；这是只读检查，不会撤销证书。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 不打印DNS凭据；不能发现全部外部调度；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit cert audit`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 13. 运行状态与日志 → 9. 证书与续期检查
+
+</details>
+
+<details class="menu-item">
+<summary><strong>10. 配置文件与目录</strong> — 显示配置与资料保存位置。</summary>
+
+- **作用：** 显示配置与资料保存位置。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 直接查看程序、配置、证书、网站、日志和备份目录；遇到错误时根据目录定位文件，但不要把包含私钥的文件贴到公开渠道。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只显示路径；不要公开包含密钥的目录；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit paths`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 13. 运行状态与日志 → 10. 配置文件与目录
+
+</details>
+
+<details class="menu-item">
+<summary><strong>0. 返回上一级</strong> — 不修改配置。</summary>
+
+- **作用：** 不修改配置。
+- **什么时候用：** 看完当前菜单或想取消本次未提交输入时。
+- **操作步骤：** 输入0返回上一层；不保存当前尚未确认的输入。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 已提交的配置保留；返回上一级；已保存的设置不回退。
+- **菜单路径：** 主菜单 → 13. 运行状态与日志 → 0. 返回上一级
+
+</details>
+
+</details>
+
+<details class="menu-group">
+<summary><strong>logview</strong>：9 个功能（逐项展开查看操作方法）</summary>
+
+> **所在目录：** 13. 运行状态与日志 → 5. 日志查看
+
+<details class="menu-item">
+<summary><strong>1. Nginx 错误日志</strong> — 显示最近 Nginx 错误记录。</summary>
+
+- **作用：** 显示最近 Nginx 错误记录。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 读取Nginx错误日志末尾，查看证书、权限、upstream连接、Worker等错误；先对齐断线时刻。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只读；分享前删除敏感地址与路径；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit logs nginx 100`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 13. 运行状态与日志 → 5. 日志查看 → 1. Nginx 错误日志
+
+</details>
+
+<details class="menu-item">
+<summary><strong>2. Xray 日志</strong> — 显示最近代理运行错误记录。</summary>
+
+- **作用：** 显示最近代理运行错误记录。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 读取Xray错误日志末尾，核对核心启动、入站监听和客户端握手错误；不要公开含端点信息的日志。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只读；分享前脱敏；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit logs xray 100`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 13. 运行状态与日志 → 5. 日志查看 → 2. Xray 日志
+
+</details>
+
+<details class="menu-item">
+<summary><strong>3. 网站访问日志</strong> — 显示高级配置中启用的访问日志。</summary>
+
+- **作用：** 显示高级配置中启用的访问日志。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 读取可选网站访问日志，确认状态码与请求耗时；默认可关闭以降低日常写入。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 默认关闭；日志包含访客 IP 和访问路径；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit logs access 100`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 13. 运行状态与日志 → 5. 日志查看 → 3. 网站访问日志
+
+</details>
+
+<details class="menu-item">
+<summary><strong>4. 证书与维护日志</strong> — 查看定时续期服务的近期 journal 记录。</summary>
+
+- **作用：** 查看定时续期服务的近期 journal 记录。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 读取证书签发与维护记录，判断续期是正常跳过还是验证失败。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 需要 systemd journal；分享前脱敏；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit logs cert 100`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 13. 运行状态与日志 → 5. 日志查看 → 4. 证书与维护日志
+
+</details>
+
+<details class="menu-item">
+<summary><strong>5. Nginx 服务日志</strong> — 查看启动服务的标准输出和错误。</summary>
+
+- **作用：** 查看启动服务的标准输出和错误。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 读取systemd服务日志，查启动失败、重载退出码、进程重启原因；与Nginx/Xray文件日志对照。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 日志尚不存在时只提示，不新建文件；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit logs service 100`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 13. 运行状态与日志 → 5. 日志查看 → 5. Nginx 服务日志
+
+</details>
+
+<details class="menu-item">
+<summary><strong>6. 启动失败诊断记录</strong> — 查看最近一次预检或运行校验失败日志。</summary>
+
+- **作用：** 查看最近一次预检或运行校验失败日志。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 查看最近的失败诊断文件，结合服务时间查权限/启动/恢复问题；日志默认只供root读取。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只读；日志仅root可读；分享前脱敏；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit logs diagnostics 100`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 13. 运行状态与日志 → 5. 日志查看 → 6. 启动失败诊断记录
+
+</details>
+
+<details class="menu-item">
+<summary><strong>7. 最近预检错误</strong> — 读取有限行本工具预检诊断。</summary>
+
+- **作用：** 读取有限行本工具预检诊断。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 读取最近非root Worker预检错误，例如setuid/权限/FD不足；不要直接放宽到root Worker。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 可能含地址/路径；分享前脱敏；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit logs preflight 100`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 13. 运行状态与日志 → 5. 日志查看 → 7. 最近预检错误
+
+</details>
+
+<details class="menu-item">
+<summary><strong>8. 近期服务变更原因</strong> — 查看按需记录的动作和前后PID。</summary>
+
+- **作用：** 查看按需记录的动作和前后PID。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 查看近期由本工具记录的服务启停/重载原因和时间，配合断流时刻排查；记录不包含全部外部操作。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只读；仅本版应用流程的服务变动；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit performance events`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 13. 运行状态与日志 → 5. 日志查看 → 8. 近期服务变更原因
+
+</details>
+
+<details class="menu-item">
+<summary><strong>0. 返回上一级</strong> — 不修改配置。</summary>
+
+- **作用：** 不修改配置。
+- **什么时候用：** 看完当前菜单或想取消本次未提交输入时。
+- **操作步骤：** 输入0返回上一层；不保存当前尚未确认的输入。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 已提交的配置保留；返回上一级；已保存的设置不回退。
+- **菜单路径：** 主菜单 → 13. 运行状态与日志 → 5. 日志查看 → 0. 返回上一级
+
+</details>
+
+</details>
+
+<details class="menu-group">
+<summary><strong>logging</strong>：8 个功能（逐项展开查看操作方法）</summary>
+
+> **所在目录：** 9. 性能与系统资源 → 8. 轻量日志设置
+
+<details class="menu-item">
+<summary><strong>1. 网站轻量性能日志</strong> — 关闭、故障、抽样或全部网站请求。</summary>
+
+- **作用：** 关闭、故障、抽样或全部网站请求。
+- **什么时候用：** 需要执行“网站轻量性能日志”而不是只查看状态时。
+- **操作步骤：** 选择网站日志关闭/仅故障/抽样/全量模式，确认是否记代理路径；日常低资源优先关闭或故障级别。
+- **操作结果：** 保存值与实际生效值可能不同；按计划应用后再核对运行状态。
+- **要求与风险：** 代理路径默认不记录；无URL/IP/查询串，非完整审计日志；会修改配置或服务；无需求时可直接取消。
+- **命令示例：** `sudo vpskit performance logging`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 9. 性能与系统资源 → 8. 轻量日志设置 → 1. 网站轻量性能日志
+
+</details>
+
+<details class="menu-item">
+<summary><strong>2. 日志保留阈值</strong> — 设置触发值、保留尾部和份数。</summary>
+
+- **作用：** 设置触发值、保留尾部和份数。
+- **什么时候用：** 需要执行“日志保留阈值”而不是只查看状态时。
+- **操作步骤：** 设置单日志大小、保留末尾字节及轮转份数；此方案不保证完整审计追溯。
+- **操作结果：** 保存值与实际生效值可能不同；按计划应用后再核对运行状态。
+- **要求与风险：** 小时检查不是实时硬上限；旧字节会被丢弃；会修改配置或服务；无需求时可直接取消。
+- **命令示例：** `sudo vpskit performance retention`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 9. 性能与系统资源 → 8. 轻量日志设置 → 2. 日志保留阈值
+
+</details>
+
+<details class="menu-item">
+<summary><strong>3. 立即检查日志大小</strong> — 仅轮转达到阈值的本工具日志。</summary>
+
+- **作用：** 仅轮转达到阈值的本工具日志。
+- **什么时候用：** 需要执行“立即检查日志大小”而不是只查看状态时。
+- **操作步骤：** 按当前日志保留规则执行一次大小检查与轮转；不重启服务，但轮转期间少量写入可能丢失。
+- **操作结果：** 保存值与实际生效值可能不同；按计划应用后再核对运行状态。
+- **要求与风险：** 不压缩、不重启；并发写入可能丢少量日志；修改前建议查看配置计划；可能影响运行中的连接。
+- **命令示例：** `sudo vpskit performance rotate`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 9. 性能与系统资源 → 8. 轻量日志设置 → 3. 立即检查日志大小
+
+</details>
+
+<details class="menu-item">
+<summary><strong>4. 网站访问日志开关</strong> — 开启或关闭低开销性能访问日志。</summary>
+
+- **作用：** 开启或关闭低开销性能访问日志。
+- **什么时候用：** 需要调整“网站访问日志开关”而不是修改节点凭据时。
+- **操作步骤：** 打开该项，查看保存的当前值和允许范围；按提示选择开关或输入新数值，确认前先看配置差异。是否记录网站访问日志；开启会增加IO并可能包含访问信息。
+- **操作结果：** 保存值与实际生效值可能不同；按计划应用后再核对运行状态。
+- **要求与风险：** true/false；按所选模式记录耗时，不记录IP和路径；会修改配置或服务；无需求时可直接取消。
+- **菜单路径：** 主菜单 → 9. 性能与系统资源 → 8. 轻量日志设置 → 4. 网站访问日志开关
+
+</details>
+
+<details class="menu-item">
+<summary><strong>5. 代理路径访问日志</strong> — 默认关闭；按编号启停。</summary>
+
+- **作用：** 默认关闭；按编号启停。
+- **什么时候用：** 需要执行“代理路径访问日志”而不是只查看状态时。
+- **操作步骤：** 显式开关代理路径访问日志；平时建议关闭，临时排查时启用后记得恢复。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 全量代理日志可能产生额外写入，显式确认；修改前建议查看配置计划；可能影响运行中的连接。
+- **菜单路径：** 主菜单 → 9. 性能与系统资源 → 8. 轻量日志设置 → 5. 代理路径访问日志
+
+</details>
+
+<details class="menu-item">
+<summary><strong>6. 日志缓冲和抽样参数</strong> — 设置缓冲、刷新间隔与正常请求抽样率。</summary>
+
+- **作用：** 设置缓冲、刷新间隔与正常请求抽样率。
+- **什么时候用：** 需要执行“日志缓冲和抽样参数”而不是只查看状态时。
+- **操作步骤：** 设置网站日志抽样比例、缓冲与刷新间隔；小内存机器先保持低量默认值。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 有界参数；缓冲未刷盘记录可能丢失；会修改配置或服务；无需求时可直接取消。
+- **菜单路径：** 主菜单 → 9. 性能与系统资源 → 8. 轻量日志设置 → 6. 日志缓冲和抽样参数
+
+</details>
+
+<details class="menu-item">
+<summary><strong>7. 组件错误日志级别</strong> — 保留warn/error等，不提供常驻debug。</summary>
+
+- **作用：** 保留warn/error等，不提供常驻debug。
+- **什么时候用：** 需要执行“组件错误日志级别”而不是只查看状态时。
+- **操作步骤：** 调节Nginx/Xray错误日志级别，平时保持warning，排错临时升级，结束后降低。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 错误日志关闭会减少故障依据；修改前建议查看配置计划；可能影响运行中的连接。
+- **菜单路径：** 主菜单 → 9. 性能与系统资源 → 8. 轻量日志设置 → 7. 组件错误日志级别
+
+</details>
+
+<details class="menu-item">
+<summary><strong>0. 返回上一级</strong> — 不修改配置。</summary>
+
+- **作用：** 不修改配置。
+- **什么时候用：** 看完当前菜单或想取消本次未提交输入时。
+- **操作步骤：** 输入0返回上一层；不保存当前尚未确认的输入。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 已提交的配置保留；返回上一级；已保存的设置不回退。
+- **菜单路径：** 主菜单 → 9. 性能与系统资源 → 8. 轻量日志设置 → 0. 返回上一级
+
+</details>
+
+</details>
+
+</details>
+
+<details id="cleanup">
+<summary><strong>14. 系统维护与垃圾清理</strong> — 扫描 · 预览 · 有界轮转</summary>
+
+### 日常清理顺序
+
+先 `cleanup scan` 看占用与过期候选，再 `cleanup run` 按编号选清理类别并确认。脚本主要清理过期临时任务、历史诊断、旧快照和旧管理代码副本；不默认删除当前节点、证书、网站内容或事务恢复现场。
+
+```bash
+sudo vpskit cleanup scan
+sudo vpskit cleanup run
+sudo vpskit performance rotate
+sudo vpskit recovery status
+```
+
+> 有未完成事务或外部更改冲突时，应该先修复，再清理。不要手动 `rm -rf /opt/vpskit` 来代替恢复。
+
+### 此模块的完整菜单索引
+
+<details class="menu-group">
+<summary><strong>housekeeping</strong>：8 个功能（逐项展开查看操作方法）</summary>
+
+> **所在目录：** 14. 系统维护与垃圾清理
+
+<details class="menu-item">
+<summary><strong>1. 扫描可清理项目</strong> — 显示过期任务、旧诊断和可裁剪历史的大小。</summary>
+
+- **作用：** 显示过期任务、旧诊断和可裁剪历史的大小。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 只读列出已识别过期临时任务、诊断、旧备份和预估空间；有未完成事务时先修复。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 按需扫描；不自动删除，不跟随链接；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit cleanup scan`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 14. 系统维护与垃圾清理 → 1. 扫描可清理项目
+
+</details>
+
+<details class="menu-item">
+<summary><strong>2. 按类别清理过期文件</strong> — 先列出具体候选，确认后删除。</summary>
+
+- **作用：** 先列出具体候选，确认后删除。
+- **什么时候用：** 明确需要“按类别清理过期文件”且已确认备份和影响时。
+- **操作步骤：** 根据扫描清单按编号选择清理类别，确认后仅删除符合条件的已归属文件；保留运行配置、证书、恢复现场。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 保留至少最近2份快照；有事务时禁止；高风险：确认备份、外部依赖和停机影响后执行。
+- **命令示例：** `sudo vpskit cleanup run`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 14. 系统维护与垃圾清理 → 2. 按类别清理过期文件
+
+</details>
+
+<details class="menu-item">
+<summary><strong>3. 立即检查日志大小</strong> — 仅轮转达到阈值的本工具日志。</summary>
+
+- **作用：** 仅轮转达到阈值的本工具日志。
+- **什么时候用：** 需要执行“立即检查日志大小”而不是只查看状态时。
+- **操作步骤：** 按当前日志保留规则执行一次大小检查与轮转；不重启服务，但轮转期间少量写入可能丢失。
+- **操作结果：** 保存值与实际生效值可能不同；按计划应用后再核对运行状态。
+- **要求与风险：** 不压缩、不重启；并发写入可能丢少量日志；修改前建议查看配置计划；可能影响运行中的连接。
+- **命令示例：** `sudo vpskit performance rotate`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 14. 系统维护与垃圾清理 → 3. 立即检查日志大小
+
+</details>
+
+<details class="menu-item">
+<summary><strong>4. 日志保留阈值</strong> — 设置触发值、保留尾部和份数。</summary>
+
+- **作用：** 设置触发值、保留尾部和份数。
+- **什么时候用：** 需要执行“日志保留阈值”而不是只查看状态时。
+- **操作步骤：** 设置单日志大小、保留末尾字节及轮转份数；此方案不保证完整审计追溯。
+- **操作结果：** 保存值与实际生效值可能不同；按计划应用后再核对运行状态。
+- **要求与风险：** 小时检查不是实时硬上限；旧字节会被丢弃；会修改配置或服务；无需求时可直接取消。
+- **命令示例：** `sudo vpskit performance retention`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 14. 系统维护与垃圾清理 → 4. 日志保留阈值
+
+</details>
+
+<details class="menu-item">
+<summary><strong>5. 未完成事务状态</strong> — 查看阶段、受影响文件及外部编辑冲突。</summary>
+
+- **作用：** 查看阶段、受影响文件及外部编辑冲突。
+- **什么时候用：** 保存配置失败或存在中断的事务时。
+- **操作步骤：** 只读检查当前是否存在未完成事务、文件变化或恢复冲突；存在异常时先查原因，不应继续覆盖配置。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只读；不自动覆盖冲突；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit recovery status`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 14. 系统维护与垃圾清理 → 5. 未完成事务状态
+
+</details>
+
+<details class="menu-item">
+<summary><strong>6. 维护定时器</strong> — 进入下级功能菜单，包含：查看维护状态、启动定时器、停止定时器、启用维护自启、关闭维护自启等。</summary>
+
+- **作用：** 进入下级功能菜单，包含：查看维护状态、启动定时器、停止定时器、启用维护自启、关闭维护自启等。
+- **什么时候用：** 需要集中管理“维护定时器”相关操作时。
+- **操作步骤：** 在此项按序号进入下级菜单，先查看状态和用途，再选择具体操作；不需要输入长文本名称。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 查看当前状态后按序号选择；仅进入下级菜单；不会立刻修改系统。
+- **菜单路径：** 主菜单 → 14. 系统维护与垃圾清理 → 6. 维护定时器
+
+</details>
+
+<details class="menu-item">
+<summary><strong>7. 配置文件与目录</strong> — 显示配置与资料保存位置。</summary>
+
+- **作用：** 显示配置与资料保存位置。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 直接查看程序、配置、证书、网站、日志和备份目录；遇到错误时根据目录定位文件，但不要把包含私钥的文件贴到公开渠道。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只显示路径；不要公开包含密钥的目录；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit paths`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 14. 系统维护与垃圾清理 → 7. 配置文件与目录
+
+</details>
+
+<details class="menu-item">
+<summary><strong>0. 返回上一级</strong> — 不修改配置。</summary>
+
+- **作用：** 不修改配置。
+- **什么时候用：** 看完当前菜单或想取消本次未提交输入时。
+- **操作步骤：** 输入0返回上一层；不保存当前尚未确认的输入。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 已提交的配置保留；返回上一级；已保存的设置不回退。
+- **菜单路径：** 主菜单 → 14. 系统维护与垃圾清理 → 0. 返回上一级
+
+</details>
+
+</details>
+
+</details>
+
+<details id="uninstall">
+<summary><strong>15. 卸载与组件移除</strong> — 范围预览 · 共享保护 · 强力卸载</summary>
+
+### 先区分三种行为
+
+**停用并撤配置**：停止 VPSKit 自身节点/续期并撤下管理片段，保留网站/证书/程序等数据；
+**项目卸载**：移除 VPSKit 管理入口与自有组件，可选择保留配置数据；
+**共享程序移除**：额外尝试移除系统级 Nginx / 共享 ACME，可能影响其他项目，必须单独确认并检查依赖。
+
+### 正常卸载（推荐）
+
+1. `uninstall plan` 查看范围、外部站点、系统包依赖和备份计划。
+2. `uninstall wizard` 编号选择撤配置、删除项目、可选共享程序、可选数据。
+3. 确认备份保存到项目外 `/var/backups/vpskit-uninstall/`，核对卸载收据与余留文件。
+4. 出错使用 `uninstall status`、`resume`、`restore`，不要直接清空卸载标记。
+
+### 强力清理及全新重装（破坏性！）
+
+```bash
+# 只读预览，先看将删除什么
+sudo bash ./vpskit.sh uninstall force --plan
+
+# 仅在确认丢弃旧节点/密钥/证书/网站后执行
+sudo bash ./vpskit.sh uninstall force
+
+# 一次性清旧项目，再新装共享模式（会丢失旧UUID和密码）
+sudo bash ./vpskit.sh install shared --clean
+```
+
+> `--stop-shared` 可能停止所有共享网站，`--remove-shared=nginx,acme` 可能删除其他程序也使用的共享组件。**不要把强力卸载当作更新或性能优化。** 清理不会重置云安全组、SSH、防火墙和系统日志，也无法保证磁盘故障/只读文件系统下全部完成。
+
+### 此模块的完整菜单索引
+
+<details class="menu-group">
+<summary><strong>uninstall</strong>：15 个功能（逐项展开查看操作方法）</summary>
+
+> **所在目录：** 15. 卸载与组件移除
+
+<details class="menu-item">
+<summary><strong>1. 卸载范围与依赖预览</strong> — 只列出目标、共享引用、软件包影响和保留项。</summary>
+
+- **作用：** 只列出目标、共享引用、软件包影响和保留项。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 查看拟移除的项目文件、共享依赖、软件包影响及保留项目；只读，不停服务或删文件。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 不停止服务，不删除文件，不创建正式备份；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit uninstall plan`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 15. 卸载与组件移除 → 1. 卸载范围与依赖预览
+
+</details>
+
+<details class="menu-item">
+<summary><strong>2. 分步卸载向导</strong> — 编号选择仅撤配置或删除项目，再选择共享程序和数据。</summary>
+
+- **作用：** 编号选择仅撤配置或删除项目，再选择共享程序和数据。
+- **什么时候用：** 明确需要“分步卸载向导”且已确认备份和影响时。
+- **操作步骤：** 分步选择仅撤配置/删除项目、是否卸载共享组件、是否保留网站证书和备份；执行前生成项目外备份并要求逐项确认。
+- **操作结果：** 可能停止节点或删除项目资料；部分系统程序移除不能靠配置快照自动撤销。
+- **要求与风险：** 默认保留共享程序和数据；删除前外部备份与口令确认；高风险：确认备份、外部依赖和停机影响后执行。
+- **命令示例：** `sudo vpskit uninstall wizard`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 15. 卸载与组件移除 → 2. 分步卸载向导
+
+</details>
+
+<details class="menu-item">
+<summary><strong>3. 仅停用并撤下项目配置</strong> — 停止本项目节点和续期，保留程序/数据/共享网站。</summary>
+
+- **作用：** 停止本项目节点和续期，保留程序/数据/共享网站。
+- **什么时候用：** 需要执行“仅停用并撤下项目配置”而不是只查看状态时。
+- **操作步骤：** 选择仅停用并撤下本项目的服务与配置，保留共享程序及网站/证书/状态数据；直连节点也会停用。
+- **操作结果：** 可能停止节点或删除项目资料；部分系统程序移除不能靠配置快照自动撤销。
+- **要求与风险：** 不只撤网站；使用卸载收据restore重新启用；修改前建议查看配置计划；可能影响运行中的连接。
+- **菜单路径：** 主菜单 → 15. 卸载与组件移除 → 3. 仅停用并撤下项目配置
+
+</details>
+
+<details class="menu-item">
+<summary><strong>4. 卸载收据与状态</strong> — 按编号查看完整/部分失败的执行记录。</summary>
+
+- **作用：** 按编号查看完整/部分失败的执行记录。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 按编号查看卸载收据的完成、部分失败及保留路径；后续继续/恢复使用同一收据ID。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** root私有，可能含路径，不含终端明文密钥；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit uninstall status`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 15. 卸载与组件移除 → 4. 卸载收据与状态
+
+</details>
+
+<details class="menu-item">
+<summary><strong>5. 继续未完成卸载</strong> — 沿用原确认范围，不扩大删除对象。</summary>
+
+- **作用：** 沿用原确认范围，不扩大删除对象。
+- **什么时候用：** 明确需要“继续未完成卸载”且已确认备份和影响时。
+- **操作步骤：** 针对未完成卸载按收据编号继续原确认范围，不会扩展到新的删除对象；执行前再核对外部变更。
+- **操作结果：** 可能停止节点或删除项目资料；部分系统程序移除不能靠配置快照自动撤销。
+- **要求与风险：** 重新核对；失败保留备份，不强杀外部进程；高风险：确认备份、外部依赖和停机影响后执行。
+- **命令示例：** `sudo vpskit uninstall resume`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 15. 卸载与组件移除 → 5. 继续未完成卸载
+
+</details>
+
+<details class="menu-item">
+<summary><strong>6. 按收据恢复项目</strong> — 恢复本次被改动文件与服务，拒绝覆盖后续编辑。</summary>
+
+- **作用：** 恢复本次被改动文件与服务，拒绝覆盖后续编辑。
+- **什么时候用：** 需要执行“按收据恢复项目”而不是只查看状态时。
+- **操作步骤：** 按卸载收据找回本次删除前备份并恢复项目文件/服务；系统APT已经移除的包可能需先补装。
+- **操作结果：** 可能停止节点或删除项目资料；部分系统程序移除不能靠配置快照自动撤销。
+- **要求与风险：** APT软件包需先补装；不回滚CA、外部服务或云资源；修改前建议查看配置计划；可能影响运行中的连接。
+- **命令示例：** `sudo vpskit uninstall restore`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 15. 卸载与组件移除 → 6. 按收据恢复项目
+
+</details>
+
+<details class="menu-item">
+<summary><strong>7. 卸载残留核对</strong> — 区分待处理目标和刻意保留的数据/系统记录。</summary>
+
+- **作用：** 区分待处理目标和刻意保留的数据/系统记录。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 只读核对卸载后残留属于当前项目还是有意保留的共享资源；不自动删除系统日志/其他网站。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只读；不自动清日志、证书或云快照；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit uninstall audit`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 15. 卸载与组件移除 → 7. 卸载残留核对
+
+</details>
+
+<details class="menu-item">
+<summary><strong>8. 仅撤共享网站片段</strong> — 继续保留Xray直连节点和其他项目服务。</summary>
+
+- **作用：** 继续保留Xray直连节点和其他项目服务。
+- **什么时候用：** 明确需要“仅撤共享网站片段”且已确认备份和影响时。
+- **操作步骤：** 仅撤下VPSKit的共享Nginx网站片段，系统Nginx与其他站点仍运行；Xray直连节点可能继续工作，不等于卸载全部项目。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 不是完整停用；候选检查后reload共享Nginx；高风险：确认备份、外部依赖和停机影响后执行。
+- **命令示例：** `sudo vpskit components detach`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 15. 卸载与组件移除 → 8. 仅撤共享网站片段
+
+</details>
+
+<details class="menu-item">
+<summary><strong>9. 共享组件移除</strong> — 进入下级功能菜单，包含：共享组件归属、共享卸载完整向导、仅撤项目网站配置。</summary>
+
+- **作用：** 进入下级功能菜单，包含：共享组件归属、共享卸载完整向导、仅撤项目网站配置。
+- **什么时候用：** 需要集中管理“共享组件移除”相关操作时。
+- **操作步骤：** 在此项按序号进入下级菜单，先查看状态和用途，再选择具体操作；不需要输入长文本名称。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 未知外部依赖不会被强制删除；仅进入下级菜单；不会立刻修改系统。
+- **菜单路径：** 主菜单 → 15. 卸载与组件移除 → 9. 共享组件移除
+
+</details>
+
+<details class="menu-item">
+<summary><strong>10. 独立单组件移除</strong> — 进入下级功能菜单，包含：单独卸载 Xray、单独卸载 Nginx、单独卸载 ACME、完整卸载 VPSKit</summary>
+
+- **作用：** 进入下级功能菜单，包含：单独卸载 Xray、单独卸载 Nginx、单独卸载 ACME、完整卸载 VPSKit。
+- **什么时候用：** 需要集中管理“独立单组件移除”相关操作时。
+- **操作步骤：** 在此项按序号进入下级菜单，先查看状态和用途，再选择具体操作；不需要输入长文本名称。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 完整项目卸载请使用本页向导；仅进入下级菜单；不会立刻修改系统。
+- **菜单路径：** 主菜单 → 15. 卸载与组件移除 → 10. 独立单组件移除
+
+</details>
+
+<details class="menu-item">
+<summary><strong>11. 系统资源保留与清理</strong> — 进入下级功能菜单，包含：资源与网络现状、BBR 与MTU探测、防火墙控制、DNS 与公网 HTTPS 检查、</summary>
+
+- **作用：** 进入下级功能菜单，包含：资源与网络现状、BBR 与MTU探测、防火墙控制、DNS 与公网 HTTPS 检查、同步当前所需端口等。
+- **什么时候用：** 需要集中管理“系统资源保留与清理”相关操作时。
+- **操作步骤：** 在此项按序号进入下级菜单，先查看状态和用途，再选择具体操作；不需要输入长文本名称。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 卸载默认保留，避免断开SSH或删除活跃Swap；仅进入下级菜单；不会立刻修改系统。
+- **菜单路径：** 主菜单 → 15. 卸载与组件移除 → 11. 系统资源保留与清理
+
+</details>
+
+<details class="menu-item">
+<summary><strong>13. 准备全新安装</strong> — 完整删除六类数据后解除卸载标记。</summary>
+
+- **作用：** 完整删除六类数据后解除卸载标记。
+- **什么时候用：** 需要执行“准备全新安装”而不是只查看状态时。
+- **操作步骤：** 仅完整卸载并删除六类项目数据后，输入专用口令解除旧安装标记，允许重新从空状态安装；不自动恢复UUID。
+- **操作结果：** 可能停止节点或删除项目资料；部分系统程序移除不能靠配置快照自动撤销。
+- **要求与风险：** 需NEW VPSKIT INSTALL；不删除独立备份或系统规则；修改前建议查看配置计划；可能影响运行中的连接。
+- **菜单路径：** 主菜单 → 15. 卸载与组件移除 → 13. 准备全新安装
+
+</details>
+
+<details class="menu-item">
+<summary><strong>12. 卸载操作说明</strong> — 解释备份、删除、恢复与无法保证的外部依赖。</summary>
+
+- **作用：** 解释备份、删除、恢复与无法保证的外部依赖。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 阅读共享程序删除影响、项目数据保留与恢复边界，再决定是否用普通向导或应急清理。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 不提供强制清空/etc或APT autoremove；只读操作；不主动写入运行配置。
+- **菜单路径：** 主菜单 → 15. 卸载与组件移除 → 12. 卸载操作说明
+
+</details>
+
+<details class="menu-item">
+<summary><strong>0. 返回上一级</strong> — 不修改配置。</summary>
+
+- **作用：** 不修改配置。
+- **什么时候用：** 看完当前菜单或想取消本次未提交输入时。
+- **操作步骤：** 输入0返回上一层；不保存当前尚未确认的输入。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 已提交的配置保留；返回上一级；已保存的设置不回退。
+- **菜单路径：** 主菜单 → 15. 卸载与组件移除 → 0. 返回上一级
+
+</details>
+
+<details class="menu-item">
+<summary><strong>14. 强力卸载：忽略损坏登记</strong> — 独立清理入口，不要求旧state/模式/事务校验通过。</summary>
+
+- **作用：** 独立清理入口，不要求旧state/模式/事务校验通过。
+- **什么时候用：** 项目状态文件损坏、普通卸载无法运行，且确认要丢弃项目时。
+- **操作步骤：** 项目已损坏且确实不再保留时，先执行强制卸载预览，确认独立备份和范围，再输入项目路径执行；共享程序默认保留。
+- **操作结果：** 可能停止节点或删除项目资料；部分系统程序移除不能靠配置快照自动撤销。
+- **要求与风险：** 先预览和确认项目路径；默认外部备份；不删除外部项目；高风险：确认备份、外部依赖和停机影响后执行。
+- **命令示例：** `sudo bash ./vpskit.sh uninstall force --plan`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 15. 卸载与组件移除 → 14. 强力卸载：忽略损坏登记
+
+</details>
+
+</details>
+
+<details class="menu-group">
+<summary><strong>sharedremove</strong>：4 个功能（逐项展开查看操作方法）</summary>
+
+> **所在目录：** 15. 卸载与组件移除 → 9. 共享组件移除
+
+<details class="menu-item">
+<summary><strong>1. 共享组件归属</strong> — 查看安装来源及程序路径。</summary>
+
+- **作用：** 查看安装来源及程序路径。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 查看每个组件的来源、服务名、程序路径及托管文件范围；尤其在迁移、共享卸载之前先确认是否属于外部程序。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只读，程序共享不等于公开私钥；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit components show`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 15. 卸载与组件移除 → 9. 共享组件移除 → 1. 共享组件归属
+
+</details>
+
+<details class="menu-item">
+<summary><strong>2. 共享卸载完整向导</strong> — 先撤项目再选择共享Nginx/ACME。</summary>
+
+- **作用：** 先撤项目再选择共享Nginx/ACME。
+- **什么时候用：** 明确需要“共享卸载完整向导”且已确认备份和影响时。
+- **操作步骤：** 分步选择仅撤配置/删除项目、是否卸载共享组件、是否保留网站证书和备份；执行前生成项目外备份并要求逐项确认。
+- **操作结果：** 可能停止节点或删除项目资料；部分系统程序移除不能靠配置快照自动撤销。
+- **要求与风险：** 发现外部依赖时阻止；程序与数据独立确认；高风险：确认备份、外部依赖和停机影响后执行。
+- **命令示例：** `sudo vpskit uninstall wizard`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 15. 卸载与组件移除 → 9. 共享组件移除 → 2. 共享卸载完整向导
+
+</details>
+
+<details class="menu-item">
+<summary><strong>3. 仅撤项目网站配置</strong> — 不删除系统程序和其他网站。</summary>
+
+- **作用：** 不删除系统程序和其他网站。
+- **什么时候用：** 明确需要“仅撤项目网站配置”且已确认备份和影响时。
+- **操作步骤：** 仅撤下VPSKit的共享Nginx网站片段，系统Nginx与其他站点仍运行；Xray直连节点可能继续工作，不等于卸载全部项目。
+- **操作结果：** 按实际配置差异决定是否重载或重启；重要操作前可创建快照。
+- **要求与风险：** 项目Xray直连节点仍可能运行；高风险：确认备份、外部依赖和停机影响后执行。
+- **命令示例：** `sudo vpskit components detach`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 15. 卸载与组件移除 → 9. 共享组件移除 → 3. 仅撤项目网站配置
+
+</details>
+
+<details class="menu-item">
+<summary><strong>0. 返回上一级</strong> — 不修改配置。</summary>
+
+- **作用：** 不修改配置。
+- **什么时候用：** 看完当前菜单或想取消本次未提交输入时。
+- **操作步骤：** 输入0返回上一层；不保存当前尚未确认的输入。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 已提交的配置保留；返回上一级；已保存的设置不回退。
+- **菜单路径：** 主菜单 → 15. 卸载与组件移除 → 9. 共享组件移除 → 0. 返回上一级
+
+</details>
+
+</details>
+
+<details class="menu-group">
+<summary><strong>isolatedremove</strong>：5 个功能（逐项展开查看操作方法）</summary>
+
+> **所在目录：** 15. 卸载与组件移除 → 10. 独立单组件移除
+
+<details class="menu-item">
+<summary><strong>1. 单独卸载 Xray</strong> — 删除代理节点和 Xray 程序，保留网站。</summary>
+
+- **作用：** 删除代理节点和 Xray 程序，保留网站。
+- **什么时候用：** 明确需要“单独卸载 Xray”且已确认备份和影响时。
+- **操作步骤：** 独立模式下先核对全部代理用户已备份，选择卸载Xray；执行后所有依赖它的节点停止使用。
+- **操作结果：** 可能停止节点或删除项目资料；部分系统程序移除不能靠配置快照自动撤销。
+- **要求与风险：** 所有代理用户断开；先导出需要保留的资料；高风险：确认备份、外部依赖和停机影响后执行。
+- **菜单路径：** 主菜单 → 15. 卸载与组件移除 → 10. 独立单组件移除 → 1. 单独卸载 Xray
+
+</details>
+
+<details class="menu-item">
+<summary><strong>2. 单独卸载 Nginx</strong> — 移除独立 Nginx，保留其他资料。</summary>
+
+- **作用：** 移除独立 Nginx，保留其他资料。
+- **什么时候用：** 明确需要“单独卸载 Nginx”且已确认备份和影响时。
+- **操作步骤：** 独立模式下检查站点/代理入口依赖，确认后移除私有Nginx；共享系统Nginx不能按此方式删除。
+- **操作结果：** 可能停止节点或删除项目资料；部分系统程序移除不能靠配置快照自动撤销。
+- **要求与风险：** 存在网站或 TLS 网关节点依赖时拒绝执行；高风险：确认备份、外部依赖和停机影响后执行。
+- **菜单路径：** 主菜单 → 15. 卸载与组件移除 → 10. 独立单组件移除 → 2. 单独卸载 Nginx
+
+</details>
+
+<details class="menu-item">
+<summary><strong>3. 单独卸载 ACME</strong> — 删除自动证书工具及其账户资料。</summary>
+
+- **作用：** 删除自动证书工具及其账户资料。
+- **什么时候用：** 明确需要“单独卸载 ACME”且已确认备份和影响时。
+- **操作步骤：** 独立模式下核对续期依赖和账户备份，确认后移除ACME；已有证书到期后将无法自动续期。
+- **操作结果：** 可能停止节点或删除项目资料；部分系统程序移除不能靠配置快照自动撤销。
+- **要求与风险：** 存在自动续期证书依赖时拒绝执行；高风险：确认备份、外部依赖和停机影响后执行。
+- **菜单路径：** 主菜单 → 15. 卸载与组件移除 → 10. 独立单组件移除 → 3. 单独卸载 ACME
+
+</details>
+
+<details class="menu-item">
+<summary><strong>4. 完整卸载 VPSKit</strong> — 清理本工具资料、服务、已识别规则与 Swap。</summary>
+
+- **作用：** 清理本工具资料、服务、已识别规则与 Swap。
+- **什么时候用：** 明确需要“完整卸载 VPSKit”且已确认备份和影响时。
+- **操作步骤：** 独立模式的旧完整卸载入口，先核对网站/证书/节点和数据保留；共享模式请使用卸载向导。
+- **操作结果：** 可能停止节点或删除项目资料；部分系统程序移除不能靠配置快照自动撤销。
+- **要求与风险：** 需输入删除口令；备份也会删除，未知外部资料不接管；高风险：确认备份、外部依赖和停机影响后执行。
+- **菜单路径：** 主菜单 → 15. 卸载与组件移除 → 10. 独立单组件移除 → 4. 完整卸载 VPSKit
+
+</details>
+
+<details class="menu-item">
+<summary><strong>0. 返回上一级</strong> — 不修改配置。</summary>
+
+- **作用：** 不修改配置。
+- **什么时候用：** 看完当前菜单或想取消本次未提交输入时。
+- **操作步骤：** 输入0返回上一层；不保存当前尚未确认的输入。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 已提交的配置保留；返回上一级；已保存的设置不回退。
+- **菜单路径：** 主菜单 → 15. 卸载与组件移除 → 10. 独立单组件移除 → 0. 返回上一级
+
+</details>
+
+</details>
+
+</details>
+
+<details id="help">
+<summary><strong>16. 帮助与使用说明</strong> — 命令速查 · 路径 · 注意事项</summary>
+
+### 面板导航
+
+输入**数字**选择操作；`0` 返回，`H` 回主页，`R` 刷新状态，`D` 展开/隐藏解释，`N/P` 翻页，`/关键词` 在菜单中查找，例如 `/BBR`、`/证书`。输入 `:q` 可取消当前输入。选项右侧的“启用 X/总数”是项目状态摘要，不是该功能自己的独立计数。
+
+### 色彩规则
+
+蓝色表示可选菜单；绿色表示只读或正常；黄色表示需注意或修改；红色表示危险/错误；灰色表示用途、要求或未开启。脚本颜色和文字是提示，真正的权限/风险检查由命令后端执行。
+
+### 常用路径
+
+```text
+/opt/vpskit/data/state.json             # 当前节点/网站/参数（含秘密）
+/opt/vpskit/data/installation.json      # 安装模式和组件归属
+/opt/vpskit/config/xray.json           # Xray 生成配置
+/opt/vpskit/www/                       # VPSKit 网站内容
+/opt/vpskit/certs/                     # 项目证书和私钥
+/opt/vpskit/backup/                    # 部分配置历史/事务
+/etc/nginx/conf.d/vpskit-managed.conf  # 共享模式的项目片段
+/opt/vpskit/config/nginx.conf          # 独立模式完整 Nginx 配置
+```
+
+```bash
+vpskit version
+vpskit help
+vpskit panel tree
+vpskit panel search 证书
+vpskit paths
+```
+
+> 不要公开 `state.json`、`xray.json`、证书私钥、ACME 账户、节点分享链接、包含完整原始日志的诊断包。
+
+### 此模块的完整菜单索引
+
+<details class="menu-group">
+<summary><strong>help</strong>：10 个功能（逐项展开查看操作方法）</summary>
+
+> **所在目录：** 16. 帮助与使用说明
+
+<details class="menu-item">
+<summary><strong>1. 完整命令帮助</strong> — 查看命令、兼容别名及调用示例。</summary>
+
+- **作用：** 查看命令、兼容别名及调用示例。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 输出CLI命令用法和参数示例；如果子菜单标号改变，优先采用具名命令。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只读；命令行与面板共用后端；只读操作；不主动写入运行配置。
+- **命令示例：** `vpskit help`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 16. 帮助与使用说明 → 1. 完整命令帮助
+
+</details>
+
+<details class="menu-item">
+<summary><strong>2. 升级、恢复与安全说明</strong> — 说明代码更新、配置应用、备份和权限边界。</summary>
+
+- **作用：** 说明代码更新、配置应用、备份和权限边界。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 阅读安装、升级、快照、配置应用和故障修复的先后顺序，防止在未完成事务时反复apply。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只读；历史快照不含网站内容和系统资源变更；只读操作；不主动写入运行配置。
+- **菜单路径：** 主菜单 → 16. 帮助与使用说明 → 2. 升级、恢复与安全说明
+
+</details>
+
+<details class="menu-item">
+<summary><strong>3. 面板颜色与操作提示</strong> — 查看颜色含义、返回/取消及无颜色模式。</summary>
+
+- **作用：** 查看颜色含义、返回/取消及无颜色模式。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 了解蓝色导航、绿色只读/正常、黄色注意、红色危险、灰色说明，以及H/R/D/N/P等快捷键。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 支持 NO_COLOR 和 --no-color；日志不带颜色控制符；只读操作；不主动写入运行配置。
+- **菜单路径：** 主菜单 → 16. 帮助与使用说明 → 3. 面板颜色与操作提示
+
+</details>
+
+<details class="menu-item">
+<summary><strong>4. 方案 A / B 说明</strong> — 对比 REALITY 直连与网站 TLS/XHTTP。</summary>
+
+- **作用：** 对比 REALITY 直连与网站 TLS/XHTTP。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 对比方案A（偏REALITY直连）与方案B（网站TLS/HTTP代理入口）所需域名、证书和端口。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只读；帮助选择部署模式；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit explain`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 16. 帮助与使用说明 → 4. 方案 A / B 说明
+
+</details>
+
+<details class="menu-item">
+<summary><strong>5. 配置文件与目录</strong> — 显示配置与资料保存位置。</summary>
+
+- **作用：** 显示配置与资料保存位置。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 直接查看程序、配置、证书、网站、日志和备份目录；遇到错误时根据目录定位文件，但不要把包含私钥的文件贴到公开渠道。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只显示路径；不要公开包含密钥的目录；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit paths`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 16. 帮助与使用说明 → 5. 配置文件与目录
+
+</details>
+
+<details class="menu-item">
+<summary><strong>6. 完整功能目录</strong> — 显示16模块与子菜单树。</summary>
+
+- **作用：** 显示16模块与子菜单树。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 只读列出完整功能分组和多级菜单树，帮助定位不常用的操作。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 只读；未实现项不作为可执行按钮；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit panel tree`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 16. 帮助与使用说明 → 6. 完整功能目录
+
+</details>
+
+<details class="menu-item">
+<summary><strong>7. 搜索菜单功能</strong> — 只检索本地菜单名称/用途/要求。</summary>
+
+- **作用：** 只检索本地菜单名称/用途/要求。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 输入关键词（例如证书、UUID、BBR）搜索菜单并查看所在模块，不会自动执行结果。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 不联网，不搜索凭据或配置内容；只读操作；不主动写入运行配置。
+- **命令示例：** `sudo vpskit panel search 证书`（也可按下方“菜单路径”操作）
+- **菜单路径：** 主菜单 → 16. 帮助与使用说明 → 7. 搜索菜单功能
+
+</details>
+
+<details class="menu-item">
+<summary><strong>8. 共享模式操作边界</strong> — 说明站点设置与系统全局设置。</summary>
+
+- **作用：** 说明站点设置与系统全局设置。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 查看共享Nginx全局/项目范围、第三方站点保护、ACME账户隔离和卸载保护说明。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 共享卸载检查已发现依赖，但不能证明所有外部应用均未使用；只读操作；不主动写入运行配置。
+- **菜单路径：** 主菜单 → 16. 帮助与使用说明 → 8. 共享模式操作边界
+
+</details>
+
+<details class="menu-item">
+<summary><strong>9. 性能和日志说明</strong> — 说明节省资源与传输速度的取舍。</summary>
+
+- **作用：** 说明节省资源与传输速度的取舍。
+- **什么时候用：** 排查问题、确认现状或操作前核对条件时。
+- **操作步骤：** 查看性能预设、日志缓冲、连接池和内存限制的取舍，再选择适合VPS规格的设置。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 不把监听/参数当成公网性能保证；只读操作；不主动写入运行配置。
+- **菜单路径：** 主菜单 → 16. 帮助与使用说明 → 9. 性能和日志说明
+
+</details>
+
+<details class="menu-item">
+<summary><strong>0. 返回上一级</strong> — 不修改配置。</summary>
+
+- **作用：** 不修改配置。
+- **什么时候用：** 看完当前菜单或想取消本次未提交输入时。
+- **操作步骤：** 输入0返回上一层；不保存当前尚未确认的输入。
+- **操作结果：** 不更改运行中的节点、服务或网站。
+- **要求与风险：** 已提交的配置保留；返回上一级；已保存的设置不回退。
+- **菜单路径：** 主菜单 → 16. 帮助与使用说明 → 0. 返回上一级
+
+</details>
+
+</details>
+
+</details>
+
+---
+
+## 版本与安全提示
+
+教程已和本地 `vpskit.sh` 头部版本 `2.0.7-node-ux` 对照。
+完整脚本中菜单可能有阶段性的重复入口或旧版别名，实际可用命令以 `vpskit help` 和 `vpskit panel tree` 为准。
+公网 DNS、Cloudflare、Vultr 安全组以及真实 Xray 客户端连通性需要在真实 VPS 单独验证。
+
+
+## 官方参考资料
+
+- [Xray 协议与传输配置](https://xtls.github.io/config/transport.html)
+- [Xray Hysteria 传输](https://xtls.github.io/en/config/transports/hysteria.html)
+- [Nginx 标准命令与 reload](https://nginx.org/en/docs/switches.html)
+
